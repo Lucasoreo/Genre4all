@@ -547,16 +547,29 @@ const Genre4allTransport = (() => {
 /* Native extra-column view. All genre data and request caching belong to genre-service.js. */
 const Genre4allColumn = (() => {
   'use strict';
-  const PALETTE = Object.freeze(['#f2b8d5', '#d6baf5', '#e9c5f2', '#c9bdf2', '#f4c4e1', '#dfb8df', '#e1ccf5', '#f6c9d4']);
-  const INK = '#291c35';
+  const PALETTE = Object.freeze([
+    '#ff7eb6', '#6895ff', '#2ee6a8', '#c996ff', '#00e5d4', '#2ec4ff',
+    '#ff9f43', '#ffd166', '#a3e635', '#ff6b6b', '#38bdf8', '#f472b6',
+    '#4ade80', '#fb7185', '#7c3aed', '#2563eb', '#db2777', '#059669',
+    '#dc2626', '#4f46e5', '#0891b2', '#9333ea', '#ea580c', '#c026d3'
+  ]);
+  const INK = '#121212';
+  const LIGHT_INK = '#ffffff';
   const normalize = value => String(value || '').normalize('NFKC').trim().replace(/\s+/gu, ' ').toLocaleLowerCase('en-US');
   function colorFor(key, colors = true) {
     let hash = 2166136261;
     for (const char of normalize(key)) { hash ^= char.codePointAt(0); hash = Math.imul(hash, 16777619); }
     return colors ? PALETTE[(hash >>> 0) % PALETTE.length] : '#ddd5e5';
   }
-  const NAMES = { spotify: 'Spotify' };
-  const SCOPES = { recording: 'Gravação / faixa (Spotify Metadata)' };
+  function textColorFor(hex) {
+    const clean = String(hex || '').replace('#', '');
+    if (clean.length !== 6) return INK;
+    const [r, g, b] = [0, 2, 4].map(i => {
+      const c = parseInt(clean.slice(i, i + 2), 16) / 255;
+      return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+    });
+    return (0.2126 * r + 0.7152 * g + 0.0722 * b) < 0.30 ? LIGHT_INK : INK;
+  }
   const STATES = { queued: 'Aguardando', loading: 'Carregando…', success: 'Gêneros', empty: 'Sem gêneros', no_match: 'Sem correspondência', not_configured: 'Configurar gêneros', unsupported: 'Indisponível', rate_limited: 'Limite da fonte', error: 'Falha nos gêneros', cancelled: 'Cancelado', expired: 'Gêneros expirados' };
   const stateLabel = r => r.result?.reason === 'SOURCES_DISABLED' ? 'Fontes desativadas' : STATES[r.state] || STATES.error;
   function trackFromRow(row, uri, legacy) {
@@ -605,28 +618,38 @@ const Genre4allColumn = (() => {
   }
   const CSS = `
     .g4a-genre-gridcell { min-width:0 !important; overflow:hidden; }
-    .g4a-genre-host { display:flex !important; align-items:center; gap:4px; width:100%; min-width:0; max-width:100%; height:32px; max-height:32px; overflow:hidden; font:12px/1.2 sans-serif; }
-    .g4a-genre-scroll { display:flex; align-items:center; gap:4px; flex:1 1 0; min-width:0; height:32px; overflow-x:auto; overflow-y:hidden; white-space:nowrap; scrollbar-width:thin; scrollbar-color:#bfa7d0 transparent; overscroll-behavior-x:contain; }
-    .g4a-genre-scroll::-webkit-scrollbar { height:5px; }
-    .g4a-genre-scroll::-webkit-scrollbar-thumb { background:#bfa7d0; border-radius:4px; }
-    .g4a-genre-chip { display:inline-flex; align-items:center; flex:none; height:22px; box-sizing:border-box; border-radius:4px; padding:2px 6px; font:500 12px/18px sans-serif; white-space:nowrap; color:${INK} !important; background:var(--g4a-genre-color,#ddd5e5); text-shadow:none; }
-    .g4a-genre-state { color:var(--spice-subtext,#ddd); white-space:nowrap; font-size:12px; }
-    .g4a-genre-host .g4a-genre-detail { flex:none; width:24px; height:26px; min-height:0; padding:0; border:1px solid currentColor; border-radius:4px; color:var(--spice-text,#fff); background:var(--spice-main,#181818); cursor:pointer; font:700 16px/20px sans-serif; }
-    .g4a-genre-host :focus-visible, .g4a-genre-dialog :focus-visible { outline:2px solid #7850a0; outline-offset:-2px; box-shadow:inset 0 0 0 4px #fff; }
-    .g4a-genre-dialog { position:fixed; inset:0; margin:auto; width:min(520px,calc(100vw - 32px)); max-height:80vh; overflow:auto; padding:20px; border:1px solid #867292; border-radius:8px; background:var(--spice-main,#181818); color:var(--spice-text,#fff); font:14px/1.5 sans-serif; box-sizing:border-box; overflow-wrap:anywhere; }
-    .g4a-genre-dialog::backdrop { background:#0009; }
-    .g4a-genre-dialog h2 { font:700 19px/1.3 sans-serif; margin:0 0 12px; }
-    .g4a-genre-dialog p { margin:8px 0; }
-    .g4a-genre-dialog ul { display:flex; flex-wrap:wrap; gap:6px; padding:0; list-style:none; }
-    .g4a-genre-dialog .g4a-genre-chip { height:auto; white-space:normal; overflow-wrap:anywhere; }
-    .g4a-genre-dialog button { font:inherit; padding:5px 10px; margin:6px 8px 0 0; border:1px solid currentColor; border-radius:4px; color:inherit; background:transparent; cursor:pointer; }
-    .g4a-genre-dialog a { color:var(--spice-text,#fff); text-decoration:underline; }
-    @media (forced-colors:active) { .g4a-genre-chip { forced-color-adjust:none; background:Canvas; color:CanvasText !important; border:1px solid CanvasText; } .g4a-genre-host :focus-visible, .g4a-genre-dialog :focus-visible { outline:2px solid Highlight; box-shadow:none; } }
+    .g4a-genre-host { display:flex !important; align-items:center; justify-content:flex-start; width:100%; min-width:0; max-width:100%; height:100%; overflow:hidden; font:12px/1.2 var(--font-family,CircularSp,sans-serif); }
+    .g4a-genre-chip { display:inline-block; flex:0 1 auto; min-width:0; max-width:100%; height:22px; box-sizing:border-box; border-radius:var(--encore-corner-radius-base,4px); padding:0 8px; font:700 12px/22px var(--font-family,CircularSp,sans-serif); letter-spacing:0.01em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; vertical-align:middle; color:var(--g4a-genre-ink,${INK}) !important; background:var(--g4a-genre-color,#ddd5e5); text-shadow:none; user-select:none; transition:transform .18s cubic-bezier(.22,1,.36,1),filter .18s ease; }
+    .g4a-genre-chip[data-contrast="light"] { text-shadow:0 1px 1px rgba(0,0,0,.25); }
+    .g4a-genre-primary[data-has-more="true"] { cursor:pointer; }
+    .g4a-genre-primary:hover { filter:brightness(1.06); }
+    .g4a-genre-state { color:var(--spice-subtext,#ddd); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:12px; }
+    .g4a-genre-host :focus-visible { outline:2px solid #7850a0; outline-offset:-2px; box-shadow:inset 0 0 0 2px #fff; }
+    .g4a-genre-fan { position:fixed; z-index:9999; display:flex; flex-direction:column; align-items:flex-start; gap:5px; margin:0; padding:2px 0; list-style:none; pointer-events:auto; perspective:600px; }
+    .g4a-genre-fan[data-direction="up"] { flex-direction:column-reverse; }
+    .g4a-genre-fan .g4a-genre-chip { flex:none; width:max-content; max-width:min(320px,calc(100vw - 24px)); box-shadow:0 8px 20px rgba(0,0,0,.48),0 2px 6px rgba(0,0,0,.32),inset 0 0 0 1px rgba(255,255,255,.14); transform-origin:top left; will-change:transform,opacity; animation:g4a-domino-down 300ms cubic-bezier(.22,1,.36,1) both; animation-delay:calc(var(--g4a-i,0) * 42ms); }
+    .g4a-genre-fan[data-direction="up"] .g4a-genre-chip { transform-origin:bottom left; animation-name:g4a-domino-up; }
+    .g4a-genre-fan.g4a-genre-fan-closing .g4a-genre-chip { animation:g4a-domino-out 130ms cubic-bezier(.4,0,1,1) both; }
+    @keyframes g4a-domino-down {
+      0% { opacity:0; transform:translateY(-14px) scale(.92) rotateX(-12deg); }
+      60% { opacity:1; }
+      100% { opacity:1; transform:translateY(0) scale(1) rotateX(0deg); }
+    }
+    @keyframes g4a-domino-up {
+      0% { opacity:0; transform:translateY(14px) scale(.92) rotateX(12deg); }
+      60% { opacity:1; }
+      100% { opacity:1; transform:translateY(0) scale(1) rotateX(0deg); }
+    }
+    @keyframes g4a-domino-out {
+      0% { opacity:1; transform:translateY(0) scale(1); }
+      100% { opacity:0; transform:translateY(-8px) scale(.94); }
+    }
+    @media (forced-colors:active) { .g4a-genre-chip { forced-color-adjust:none; background:Canvas; color:CanvasText !important; border:1px solid CanvasText; } .g4a-genre-host :focus-visible { outline:2px solid Highlight; box-shadow:none; } }
   `;
   function createController(service, options) {
     const doc = options.document || document, win = doc.defaultView;
     const records = new Map(), lifecycle = new AbortController();
-    let active = 0, frame = null, closed = false, dialog = null;
+    let active = 0, frame = null, closed = false, activeFan = null, fanTimer = null, closeTimer = null;
     const style = doc.createElement('style'); style.id = 'genre4all-column-style'; style.textContent = CSS; doc.head.append(style);
     function node(tag, text, attrs = {}) {
       const n = doc.createElement(tag); if (text != null) n.textContent = text;
@@ -643,78 +666,101 @@ const Genre4allColumn = (() => {
       if (['success', 'empty', 'no_match'].includes(r.state) && r.result?.expiresAt && r.result.expiresAt <= Date.now()) r.state = 'expired';
     }
     function chip(label, tag = 'span') {
-      const n = node(tag, label.label, tag === 'li' ? {} : { role: 'listitem' }); n.className = 'g4a-genre-chip';
-      n.style.setProperty('--g4a-genre-color', colorFor(label.key, service.getConfig().colors));
-      n.title = (label.kinds || [label.kind]).includes('style') ? 'Estilo' : 'Gênero'; return n;
+      const bg = colorFor(label.key, service.getConfig().colors);
+      const fg = textColorFor(bg);
+      const n = node(tag, label.label, tag === 'li' ? {} : { role: 'listitem' });
+      n.className = 'g4a-genre-chip';
+      n.style.setProperty('--g4a-genre-color', bg);
+      n.style.setProperty('--g4a-genre-ink', fg);
+      if (fg === LIGHT_INK) n.dataset.contrast = 'light';
+      n.title = (label.kinds || [label.kind]).includes('style') ? 'Subgênero / estilo' : 'Gênero';
+      return n;
+    }
+    function closeFan(immediate = false) {
+      clearTimeout(fanTimer); fanTimer = null;
+      clearTimeout(closeTimer); closeTimer = null;
+      if (!activeFan) return;
+      const current = activeFan;
+      if (immediate) {
+        activeFan = null;
+        current.element.remove();
+        return;
+      }
+      current.closing = true;
+      current.element.classList.add('g4a-genre-fan-closing');
+      closeTimer = setTimeout(() => {
+        if (activeFan === current) activeFan = null;
+        current.element.remove();
+      }, 130);
+    }
+    function scheduleCloseFan(r) {
+      clearTimeout(fanTimer);
+      fanTimer = setTimeout(() => {
+        if (activeFan?.record === r) closeFan(false);
+      }, 70);
+    }
+    function openFan(r, anchor) {
+      if (!valid(r) || r.state !== 'success') return;
+      const extra = (r.result?.labels || []).slice(1);
+      if (!extra.length) return;
+      clearTimeout(fanTimer); fanTimer = null;
+      if (activeFan?.record === r && activeFan.element.isConnected && !activeFan.closing) return;
+      closeFan(true);
+      const fan = node('ul', null, { class: 'g4a-genre-fan', role: 'list', 'aria-label': 'Gêneros e subgêneros associados' });
+      extra.forEach((label, i) => {
+        const item = chip(label, 'li');
+        item.classList.add('g4a-genre-fan-chip');
+        item.style.setProperty('--g4a-i', String(i));
+        fan.append(item);
+      });
+      const rect = anchor.getBoundingClientRect();
+      const estHeight = extra.length * 27 + 8;
+      const vh = win.innerHeight || 800;
+      const spaceBelow = vh - rect.bottom - 12;
+      const spaceAbove = rect.top - 12;
+      const dir = spaceBelow < estHeight && spaceAbove > spaceBelow ? 'up' : 'down';
+      fan.dataset.direction = dir;
+      fan.style.left = `${Math.max(8, Math.round(rect.left))}px`;
+      if (dir === 'down') fan.style.top = `${Math.round(rect.bottom + 5)}px`;
+      else fan.style.bottom = `${Math.round(vh - rect.top + 5)}px`;
+      fan.addEventListener('mouseenter', () => { clearTimeout(fanTimer); fanTimer = null; });
+      fan.addEventListener('mouseleave', () => scheduleCloseFan(r));
+      for (const type of ['click', 'dblclick', 'pointerdown', 'pointerup', 'contextmenu']) fan.addEventListener(type, e => e.stopPropagation());
+      doc.body.append(fan);
+      activeFan = { element: fan, record: r, anchor, closing: false };
     }
     function render(r) {
       if (!valid(r)) return;
       expire(r);
-      const focused = doc.activeElement, restore = r.cell.contains(focused) ? focused?.className : null;
+      const focused = doc.activeElement, restore = r.cell.contains(focused);
+      if (activeFan?.record === r) closeFan(true);
       r.cell.replaceChildren(); r.cell.classList.add('g4a-genre-host'); r.cell.dataset.genreState = r.state;
       r.cell.setAttribute('aria-busy', String(r.state === 'loading'));
-      const viewport = node('div', null, { class: 'g4a-genre-scroll', tabindex: '0', role: r.state === 'success' ? 'list' : 'group', 'aria-label': r.state === 'success' ? 'Gêneros e estilos; setas esquerda/direita para rolar, Enter para detalhes' : stateLabel(r) });
-      if (r.state === 'success') for (const label of r.result.labels) viewport.append(chip(label));
-      else viewport.append(node('span', stateLabel(r), { class: 'g4a-genre-state' }));
-      viewport.addEventListener('keydown', e => {
-        if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) {
-          e.preventDefault(); e.stopPropagation();
-          if (e.key === 'Home' || e.key === 'End') viewport.scrollLeft = e.key === 'Home' ? 0 : viewport.scrollWidth;
-          else viewport.scrollLeft += e.key === 'ArrowLeft' ? -80 : 80;
-        } else if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); showDetails(r); }
-      });
-      viewport.addEventListener('wheel', e => {
-        if (e.deltaX || e.shiftKey) {
-          e.stopPropagation();
-          if (e.shiftKey && !e.deltaX && viewport.scrollWidth > viewport.clientWidth) { viewport.scrollLeft += e.deltaY; e.preventDefault(); }
-        }
-      }, { passive: false });
-      const detail = node('button', '⋯', { type: 'button', class: 'g4a-genre-detail', 'aria-label': `Detalhes dos gêneros: ${stateLabel(r)}` });
-      detail.addEventListener('click', () => showDetails(r));
-      detail.addEventListener('keydown', e => { if (e.key !== 'Tab') e.stopPropagation(); });
-      r.cell.append(viewport, detail);
-      if (restore) r.cell.querySelector(restore.includes('g4a-genre-detail') ? 'button' : '.g4a-genre-scroll')?.focus({ preventScroll: true });
-    }
-    function closeDetails(restore = true) {
-      if (!dialog) return;
-      const current = dialog; dialog = null; current.element.close(); current.element.remove();
-      if (restore && valid(current.record)) current.record.cell.querySelector('button')?.focus({ preventScroll: true });
-    }
-    function showDetails(r) {
-      if (!valid(r)) return;
-      expire(r);
-      closeDetails(false);
-      const d = node('dialog', null, { class: 'g4a-genre-dialog', 'aria-label': 'Detalhes dos gêneros' });
-      const result = r.result, identity = service.identityFor(r.track);
-      const headingText = identity.title ? `${identity.title}${identity.artists.length ? ' — ' + identity.artists.join(', ') : ''}` : identity.uri;
-      d.append(node('h2', 'Detalhes dos gêneros'), node('p', headingText), node('p', stateLabel(r)));
-      if (result) {
-        d.append(node('p', `Fonte: ${NAMES[result.selectedProvider || result.provider] || 'Nenhuma fonte selecionada'}`));
-        d.append(node('p', `Registro: ${result.entityType || '—'} · ${result.entityId || '—'}`));
-        d.append(node('p', `Escopo: ${SCOPES[result.entityType] || 'Não determinado'}`));
-        d.append(node('p', `Versão: ${identity.version}. ${result.match?.explanation || 'Correspondência confirmada por URI do Spotify.'}`));
-        if (r.state === 'success') { const list = node('ul', null, { 'aria-label': 'Lista completa de gêneros e estilos' }); for (const label of result.labels) list.append(chip(label, 'li')); d.append(list); }
-        const url = sourceLink(result); if (url) d.append(node('a', 'Abrir registro na fonte', { href: url, target: '_blank', rel: 'noopener noreferrer' }));
-        if (r.state !== 'success') d.append(node('p', options.describe?.(result) || result.errorCode || result.reason || 'Nenhum gênero retornado.'));
-        if (result.retryAt) d.append(node('p', `Nova tentativa após: ${new Date(result.retryAt).toLocaleString()}`));
+      if (r.state === 'success' && r.result?.labels?.length) {
+        const primary = chip(r.result.labels[0]);
+        primary.classList.add('g4a-genre-primary');
+        primary.tabIndex = 0;
+        const hasMore = r.result.labels.length > 1;
+        primary.dataset.hasMore = String(hasMore);
+        primary.setAttribute('aria-label', hasMore ? `${r.result.labels[0].label} (+${r.result.labels.length - 1} gêneros associados)` : r.result.labels[0].label);
+        primary.addEventListener('mouseenter', () => openFan(r, primary));
+        primary.addEventListener('mouseleave', () => scheduleCloseFan(r));
+        primary.addEventListener('focus', () => openFan(r, primary));
+        primary.addEventListener('blur', () => scheduleCloseFan(r));
+        primary.addEventListener('keydown', e => {
+          if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeFan(true); }
+          else if (e.key === 'Enter' || e.key === ' ' || e.key === 'ArrowDown') { e.preventDefault(); e.stopPropagation(); openFan(r, primary); }
+        });
+        r.cell.append(primary);
+      } else {
+        r.cell.append(node('span', stateLabel(r), { class: 'g4a-genre-state' }));
       }
-      const close = node('button', 'Fechar', { type: 'button' }); close.addEventListener('click', () => closeDetails()); d.append(close);
-      const refresh = node('button', 'Atualizar gêneros desta faixa', { type: 'button' });
-      refresh.disabled = r.state === 'loading' || (result?.retryAt > Date.now());
-      refresh.addEventListener('click', () => {
-        closeDetails();
-        if (valid(r)) service.refresh(r.track, { signal: r.events.signal }).catch(() => {});
-      }); d.append(refresh);
-      const configure = node('button', 'Aparência dos gêneros', { type: 'button' });
-      configure.addEventListener('click', () => { closeDetails(false); if (valid(r)) options.onConfigure?.(r.track); }); d.append(configure);
-      d.addEventListener('cancel', e => { e.preventDefault(); closeDetails(); });
-      for (const type of ['keydown', 'keyup', 'click', 'dblclick', 'pointerdown', 'pointerup', 'contextmenu']) d.addEventListener(type, e => e.stopPropagation());
-      doc.body.append(d); dialog = { element: d, record: r }; d.showModal(); close.focus();
+      if (restore) r.cell.querySelector('.g4a-genre-primary')?.focus({ preventScroll: true });
     }
     function release(cell) {
       const r = records.get(cell); if (!r) return;
       records.delete(cell); r.events?.abort(); r.task?.abort(); clearTimeout(r.expiry);
-      if (dialog?.record === r) closeDetails(false);
+      if (activeFan?.record === r) closeFan(true);
       if (![...records.values()].some(other => other.row === r.row)) observer?.unobserve(r.row);
       cell.replaceChildren(); cell.classList.remove('g4a-genre-host'); delete cell.dataset.genreState; cell.removeAttribute('aria-busy');
       if (r.gridcell && ![...records.values()].some(other => other.gridcell === r.gridcell)) r.gridcell.classList.remove('g4a-genre-gridcell');
@@ -738,10 +784,9 @@ const Genre4allColumn = (() => {
         const expirable = ['success', 'empty', 'no_match'].includes(result.status);
         if (expirable && result.expiresAt && result.expiresAt <= Date.now()) r.state = 'expired';
         render(r);
-        if (dialog?.record === r) showDetails(r);
         if (expirable && result.expiresAt > Date.now()) r.expiry = setTimeout(() => {
           if (!valid(r)) return;
-          r.state = 'expired'; render(r); if (dialog?.record === r) closeDetails(false);
+          r.state = 'expired'; render(r);
         }, Math.min(result.expiresAt - Date.now(), 2147483647));
       } catch { if (valid(r) && !task.signal.aborted) { r.result = { status: 'error', errorCode: 'GENRE_VIEW_FAILED' }; r.state = 'error'; render(r); } }
       finally { if (r.task === task) r.task = null; active--; if (valid(r) && r.state === 'loading' && task.signal.aborted) r.state = 'queued'; schedule(); }
@@ -775,7 +820,7 @@ const Genre4allColumn = (() => {
           for (const type of ['click', 'dblclick', 'pointerdown', 'pointerup', 'mousedown', 'mouseup', 'contextmenu']) {
             const stop = e => e.stopPropagation(); cell.addEventListener(type, stop, { signal: r.events.signal });
           }
-          cell.addEventListener('keyup', e => { if ([' ', 'Enter', 'ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) e.stopPropagation(); }, { signal: r.events.signal });
+          cell.addEventListener('keyup', e => { if ([' ', 'Enter', 'Escape', 'ArrowDown'].includes(e.key)) e.stopPropagation(); }, { signal: r.events.signal });
           render(r); observer?.observe(row);
         }
       }
@@ -786,7 +831,6 @@ const Genre4allColumn = (() => {
       for (const r of [...records.values()]) {
         if (r.revision !== service.revision) {
           r.task?.abort(); clearTimeout(r.expiry); r.revision = service.revision; r.state = 'queued'; r.result = null;
-          if (dialog?.record === r) closeDetails(false);
         }
         render(r);
       }
@@ -797,22 +841,20 @@ const Genre4allColumn = (() => {
       for (const r of records.values()) { const rect = r.row.getBoundingClientRect(); r.visible = rect.height > 0 && rect.bottom > 0 && rect.top < win.innerHeight; }
       schedule();
     }
-    if (!observer) { doc.addEventListener('scroll', fallbackVisibility, { capture: true, passive: true, signal: lifecycle.signal }); win.addEventListener('resize', fallbackVisibility, { signal: lifecycle.signal }); }
+    doc.addEventListener('scroll', () => { closeFan(true); fallbackVisibility(); }, { capture: true, passive: true, signal: lifecycle.signal });
+    win.addEventListener('resize', () => { closeFan(true); fallbackVisibility(); }, { signal: lifecycle.signal });
     function recheckExpiry() {
       if (doc.hidden || closed) return;
-      for (const r of records.values()) if (r.result) {
-        render(r);
-        if (r.state === 'expired' && dialog?.record === r) closeDetails(false);
-      }
+      for (const r of records.values()) if (r.result) render(r);
       prune();
     }
     doc.addEventListener('visibilitychange', recheckExpiry, { signal: lifecycle.signal });
     win.addEventListener('focus', recheckExpiry, { signal: lifecycle.signal });
-    function reset() { for (const cell of [...records.keys()]) release(cell); }
+    function reset() { closeFan(true); for (const cell of [...records.keys()]) release(cell); }
     function close() { reset(); closed = true; unsubscribe(); observer?.disconnect(); lifecycle.abort(); if (frame !== null) win.cancelAnimationFrame(frame); style.remove(); }
     return { sync, prune, reset, release, close, stats: () => ({ cells: records.size, active, observers: observer && !closed ? 1 : 0 }) };
   }
-  return { PALETTE, INK, colorFor, sourceLink, trackFromRow, createController };
+  return { PALETTE, INK, LIGHT_INK, colorFor, textColorFor, sourceLink, trackFromRow, createController };
 })();
 
 /* Genre aliases, families and validation copied/adapted from Sort-Play-2, MIT. */
@@ -2304,15 +2346,30 @@ const Genre4allCatalog = (() => {
 async function startGenre4all() {
   'use strict';
   const KEY = 'genre4all-visible-v1';
+  const ORDER_KEY = 'genre4all-order-offset-v1';
   const ROW = '.main-trackList-trackListHeaderRow,.main-trackList-trackListRow,[role="row"]';
   const ROOT = '.main-trackList-trackList,[data-testid="tracklist"],[role="grid"]';
   const CELL = '[role="columnheader"],[role="gridcell"],[class*="main-trackList-rowSection"]';
+  const CONFIG_ICON = '<svg height="16" width="16" viewBox="0 0 16 16" fill="currentColor"><path d="M14 2v9.5a2.5 2.5 0 1 1-1.5-2.3V4.3L6 5.9v7.6a2.5 2.5 0 1 1-1.5-2.3V2.7L14 1v1zm-9.5 9.5a1 1 0 1 0 0 2 1 1 0 0 0 0-2zm8-2a1 1 0 1 0 0 2 1 1 0 0 0 0-2z"/></svg>';
   const lifecycle = new AbortController(), roots = new Map(), layouts = new Map();
-  let closed = false, frame = null, preferences = null, view = null, service = null;
-  let visible = true, metadataClient = null, lastDiscovery = 0, unlisten = null;
-  try { visible = localStorage.getItem(KEY) !== 'false'; } catch { /* Session preference still works. */ }
+  let closed = false, frame = null, preferences = null, view = null, service = null, profileMenuItem = null;
+  let visible = true, orderOffset = 0, metadataClient = null, lastDiscovery = 0, unlisten = null;
+  try {
+    visible = localStorage.getItem(KEY) !== 'false';
+    orderOffset = Math.max(0, parseInt(localStorage.getItem(ORDER_KEY) || '0', 10) || 0);
+  } catch { /* Session preference still works. */ }
   const context = () => globalThis.Spicetify?.Platform?.History?.location?.pathname || location.pathname;
-  const api = { version: '0.1.0-test', get visible() { return visible; }, setVisible, sync: schedule, close, diagnostics: () => ({ version: api.version, visible, context: context(), roots: roots.size, rows: layouts.size, service: service?.stats(), view: view?.stats(), metadataAvailable: !!metadataClient }) };
+  const api = {
+    version: '0.1.0-test',
+    get visible() { return visible; },
+    get orderOffset() { return orderOffset; },
+    setVisible,
+    setOrderOffset,
+    openConfig: showPreferences,
+    sync: schedule,
+    close,
+    diagnostics: () => ({ version: api.version, visible, orderOffset, context: context(), roots: roots.size, rows: layouts.size, service: service?.stats(), view: view?.stats(), metadataAvailable: !!metadataClient })
+  };
   // One instance even if Marketplace and a manual installation both load the file.
   globalThis.Genre4all?.close?.();
   globalThis.Genre4all = api;
@@ -2335,13 +2392,15 @@ async function startGenre4all() {
     .g4a-root .g4a-row:not([data-g4a-measure]) { grid-template-columns:var(--g4a-tracks) !important; min-width:var(--g4a-total) !important; }
     .g4a-root .g4a-row:not([data-g4a-measure]) > [data-g4a-position] { grid-column:var(--g4a-position) !important; min-width:0; }
     genre4all-column { display:flex; align-items:center; min-width:0; overflow:hidden; box-sizing:border-box; }
-    genre4all-column[data-kind=header] { position:relative; justify-content:flex-start; justify-self:stretch; width:100%; height:100%; color:var(--text-subdued,var(--spice-subtext,#b3b3b3)); font-size:0.875rem; font-weight:400; line-height:normal; user-select:none; }
+    genre4all-column[data-kind=header] { position:relative; justify-content:flex-start; justify-self:stretch; width:100%; height:100%; color:var(--text-subdued,var(--spice-subtext,#b3b3b3)); font-size:0.875rem; font-weight:400; line-height:normal; cursor:grab; user-select:none; }
+    genre4all-column[data-kind=header].g4a-header-dragging { cursor:grabbing; opacity:.75; z-index:3; }
     genre4all-column .g4a-genre-host { width:100%; }
     .g4a-header-label { min-width:0; margin-inline-end:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     [data-g4a-prev-sep] { display:flex; align-items:center; }
     .g4a-header-sep { cursor:col-resize; flex:0 0 8px; width:8px; height:50%; margin-inline-start:auto; user-select:none; touch-action:none; }
     .g4a-row:hover .g4a-header-sep,.g4a-row:focus-within .g4a-header-sep,html.g4a-resizing .g4a-header-sep { background:linear-gradient(rgba(var(--spice-rgb-text,255,255,255),.302),rgba(var(--spice-rgb-text,255,255,255),.302)) 50%/1px 100% no-repeat; }
     html.g4a-resizing,html.g4a-resizing * { cursor:col-resize !important; user-select:none !important; }
+    html.g4a-reordering,html.g4a-reordering * { cursor:grabbing !important; user-select:none !important; }
     [data-g4a-measure] > genre4all-column,[data-g4a-measure] [data-g4a-sep] { display:none !important; }
     .g4a-root[data-g4a-overflow].g4a-root { overflow-x:auto !important; }
     .g4a-root[data-g4a-overflow] > div:has([role="columnheader"]),.g4a-root[data-sp-native-layout] > div:has([role="columnheader"]) { margin-inline:0 !important; padding-inline:0 !important; }
@@ -2349,15 +2408,19 @@ async function startGenre4all() {
     .g4a-root[data-sp-native-layout] .sp-layout-resize::after { top:25% !important; bottom:25% !important; left:5.5px !important; width:1px !important; border-radius:0 !important; background:rgba(var(--spice-rgb-text,255,255,255),.302) !important; opacity:0 !important; }
     .g4a-root[data-sp-native-layout] .g4a-row:hover .sp-layout-resize::after,.g4a-root[data-sp-native-layout] .g4a-row:focus-within .sp-layout-resize::after,.g4a-root[data-sp-native-layout] .sp-layout-resize:hover::after,.g4a-root[data-sp-native-layout] .sp-layout-resize:focus-visible::after { opacity:1 !important; }
     .g4a-root[data-sp-native-layout] .sort-play-column-header { justify-content:flex-start !important; text-align:left !important; font-size:0.875rem !important; font-weight:400 !important; }
-    .g4a-menu-button { display:flex; align-items:center; justify-content:space-between; gap:20px; width:100%; min-height:40px; padding:12px 16px; border:0; border-radius:2px; color:var(--text-base,#eee); background:transparent; text-align:left; font:inherit; cursor:pointer; }
-    .g4a-menu-button:hover,.g4a-menu-button:focus-visible { background:#ffffff1a; outline-offset:-2px; }
+    .g4a-menu-button,.g4a-profile-button { display:flex; align-items:center; justify-content:space-between; gap:12px; width:100%; min-height:40px; padding:12px 16px; border:0; border-radius:2px; color:var(--text-base,#eee); background:transparent; text-align:left; font:inherit; cursor:pointer; }
+    .g4a-profile-button { justify-content:flex-start; }
+    .g4a-menu-button:hover,.g4a-menu-button:focus-visible,.g4a-profile-button:hover,.g4a-profile-button:focus-visible { background:#ffffff1a; outline-offset:-2px; }
     .g4a-menu-button[aria-checked=true] { color:var(--text-positive,#1ed760); }
-    .g4a-menu-button svg { width:16px; height:16px; flex:none; fill:currentColor; }
+    .g4a-menu-button svg,.g4a-profile-button svg { width:16px; height:16px; flex:none; fill:currentColor; }
     .g4a-preferences { position:fixed; inset:0; margin:auto; padding:24px; max-width:420px; width:calc(100vw - 40px); box-sizing:border-box; border:1px solid #777; border-radius:8px; color:var(--spice-text,#fff); background:var(--spice-main,#181818); font:14px/1.5 sans-serif; }
     .g4a-preferences::backdrop { background:#0009; }
-    .g4a-preferences label { display:flex; gap:10px; margin:14px 0; align-items:center; }
+    .g4a-preferences h2 { margin:0 0 12px; font:700 18px/1.3 sans-serif; }
+    .g4a-preferences label { display:flex; gap:10px; margin:14px 0; align-items:center; cursor:pointer; }
     .g4a-preferences input { accent-color:#1ed760; }
-    .g4a-preferences button { padding:8px 14px; color:inherit; background:transparent; border:1px solid #aaa; border-radius:4px; cursor:pointer; }
+    .g4a-preferences-actions { display:flex; flex-wrap:wrap; gap:10px; margin-top:18px; }
+    .g4a-preferences button { padding:8px 14px; color:inherit; background:transparent; border:1px solid #aaa; border-radius:4px; cursor:pointer; font:inherit; }
+    .g4a-preferences button:hover { background:#ffffff14; }
   `;
   document.head.append(style);
 
@@ -2379,6 +2442,14 @@ async function startGenre4all() {
       for (const root of roots.keys()) { root.classList.remove('g4a-root'); root.removeAttribute('data-g4a-overflow'); }
     }
     updateMenus(); schedule();
+  }
+  function setOrderOffset(value) {
+    const next = Math.max(0, Math.floor(Number(value) || 0));
+    if (next === orderOffset) return;
+    orderOffset = next;
+    try { localStorage.setItem(ORDER_KEY, String(orderOffset)); } catch { /* Keep the current session usable. */ }
+    for (const rootState of roots.values()) rootState.weights = null;
+    sync();
   }
 
   // Adapted from Sort-Play-2 getWebpackService/getMetadataClient; scoped to this extension.
@@ -2459,18 +2530,28 @@ async function startGenre4all() {
   const storage = makeStorage();
   function showPreferences() {
     preferences?.remove();
-    const d = node('dialog', null, { class: 'g4a-preferences', 'aria-label': 'Genre4all — aparência' });
-    d.append(node('h2', 'Genre4all'));
+    const d = node('dialog', null, { class: 'g4a-preferences', 'aria-label': 'Genre4all config' });
+    d.append(node('h2', 'Genre4all config'));
     for (const [key, label] of [['colors','Cores nos gêneros'],['showGenres','Mostrar gêneros principais'],['showStyles','Mostrar subgêneros e estilos']]) {
       const row = node('label', label), input = node('input', null, { type: 'checkbox' });
-      input.checked = service.getConfig()[key];
-      input.addEventListener('change', () => service.configure({ [key]: input.checked }).catch(() => Spicetify.showNotification?.('Genre4all: não foi possível salvar a preferência.', true)));
+      input.checked = !!service?.getConfig()?.[key];
+      input.addEventListener('change', () => service?.configure({ [key]: input.checked }).catch(() => Spicetify.showNotification?.('Genre4all: não foi possível salvar a preferência.', true)));
       row.prepend(input); d.append(row);
     }
+    const actions = node('div', null, { class: 'g4a-preferences-actions' });
+    const refresh = node('button', 'Atualizar gêneros', { type: 'button' });
     const done = node('button', 'Fechar', { type: 'button' });
     const dismiss = () => { d.close(); d.remove(); if (preferences === d) preferences = null; };
-    done.addEventListener('click', dismiss); d.addEventListener('cancel', e => { e.preventDefault(); dismiss(); });
-    d.append(done); document.body.append(d); preferences = d; d.showModal();
+    refresh.addEventListener('click', () => {
+      dismiss();
+      service?.clearCache().catch(() => {});
+    });
+    done.addEventListener('click', dismiss);
+    d.addEventListener('cancel', e => { e.preventDefault(); dismiss(); });
+    for (const type of ['keydown', 'keyup', 'click', 'dblclick', 'pointerdown', 'pointerup', 'contextmenu']) d.addEventListener(type, e => e.stopPropagation());
+    actions.append(refresh, done);
+    d.append(actions);
+    document.body.append(d); preferences = d; d.showModal(); done.focus();
   }
 
   function cells(container) { return [...container.children].filter(c => c.matches(CELL) && getComputedStyle(c).display !== 'none'); }
@@ -2505,20 +2586,84 @@ async function startGenre4all() {
     root.addEventListener('mousedown', e => {
       if (!visible || root.hasAttribute('data-sp-native-layout') || e.button !== 0) return;
       const sep = e.target.closest?.('[role="separator"]:not(.sp-layout-resize)');
-      if (!sep || !root.contains(sep)) return;
-      const pair = resolvePair(sep); if (!pair) return;
-      e.preventDefault(); e.stopImmediatePropagation();
-      const startWidths = pair.flexCells.map(c => c.getBoundingClientRect().width || 120);
-      const startX = e.clientX;
-      document.documentElement.classList.add('g4a-resizing');
-      const move = ev => { rootState.weights = adjust(startWidths, pair.k, ev.clientX - startX); schedule(); };
-      const up = () => {
-        document.documentElement.classList.remove('g4a-resizing');
-        window.removeEventListener('mousemove', move, true);
-        window.removeEventListener('mouseup', up, true);
+      if (sep && root.contains(sep)) {
+        const pair = resolvePair(sep); if (!pair) return;
+        e.preventDefault(); e.stopImmediatePropagation();
+        const startWidths = pair.flexCells.map(c => c.getBoundingClientRect().width || 120);
+        const startX = e.clientX;
+        document.documentElement.classList.add('g4a-resizing');
+        const move = ev => { rootState.weights = adjust(startWidths, pair.k, ev.clientX - startX); schedule(); };
+        const up = () => {
+          document.documentElement.classList.remove('g4a-resizing');
+          window.removeEventListener('mousemove', move, true);
+          window.removeEventListener('mouseup', up, true);
+        };
+        window.addEventListener('mousemove', move, true);
+        window.addEventListener('mouseup', up, true);
+        return;
+      }
+      const genreHeader = e.target.closest?.('genre4all-column[data-kind="header"]');
+      if (genreHeader && root.contains(genreHeader)) {
+        const container = genreHeader.parentElement;
+        if (!container || !layouts.has(container)) return;
+        const startX = e.clientX;
+        let dragging = false;
+        const move = ev => {
+          if (!dragging && Math.abs(ev.clientX - startX) > 5) {
+            dragging = true;
+            genreHeader.classList.add('g4a-header-dragging');
+            document.documentElement.classList.add('g4a-reordering');
+          }
+          if (!dragging) return;
+          const all = [...container.children].filter(c => (c.matches(CELL) || c.tagName === 'GENRE4ALL-COLUMN') && getComputedStyle(c).display !== 'none');
+          const end = all.find(c => c.matches('.main-trackList-rowSectionEnd,[data-sp-layout-position="native:end"]')) || all[all.length - 1];
+          const allEnd = all.indexOf(end);
+          const minSlot = Math.min(2, Math.max(0, allEnd - 1));
+          let bestSlot = all.indexOf(genreHeader), bestDist = Infinity;
+          for (let s = minSlot; s < allEnd; s++) {
+            const rect = all[s].getBoundingClientRect();
+            const dist = Math.abs(ev.clientX - (rect.left + rect.right) / 2);
+            if (dist < bestDist) { bestDist = dist; bestSlot = s; }
+          }
+          const nextOffset = Math.max(0, (allEnd - 1) - bestSlot);
+          if (nextOffset !== orderOffset) setOrderOffset(nextOffset);
+        };
+        const up = () => {
+          genreHeader.classList.remove('g4a-header-dragging');
+          document.documentElement.classList.remove('g4a-reordering');
+          window.removeEventListener('mousemove', move, true);
+          window.removeEventListener('mouseup', up, true);
+        };
+        window.addEventListener('mousemove', move, true);
+        window.addEventListener('mouseup', up, true);
+      }
+    }, { capture: true, signal: rootState.events.signal });
+    root.addEventListener('pointerdown', e => {
+      if (!visible || root.hasAttribute('data-sp-native-layout') || e.button !== 0) return;
+      if (e.target.closest?.('[role="separator"],genre4all-column')) return;
+      const draggable = e.target.closest?.('[data-tracklist-draggable-column],[role="columnheader"]');
+      if (!draggable || !root.contains(draggable)) return;
+      const headerCell = draggable.closest('[role="columnheader"]');
+      const container = headerCell?.parentElement;
+      const genreHeader = container?.querySelector('genre4all-column[data-kind="header"]');
+      if (!genreHeader) return;
+      const all = [...container.children].filter(c => (c.matches(CELL) || c.tagName === 'GENRE4ALL-COLUMN') && getComputedStyle(c).display !== 'none');
+      const end = all.find(c => c.matches('.main-trackList-rowSectionEnd,[data-sp-layout-position="native:end"]')) || all[all.length - 1];
+      const allEnd = all.indexOf(end);
+      const nativeIdx = all.indexOf(headerCell), genreIdx = all.indexOf(genreHeader);
+      if (nativeIdx < 2 || nativeIdx >= allEnd || genreIdx < 0) return;
+      const up = ev => {
+        window.removeEventListener('pointerup', up, true);
+        window.removeEventListener('pointercancel', up, true);
+        const gRect = genreHeader.getBoundingClientRect();
+        if (nativeIdx < genreIdx && ev.clientX > gRect.left + gRect.width * 0.4) {
+          setOrderOffset(Math.min(allEnd - 3, orderOffset + 1));
+        } else if (nativeIdx > genreIdx && ev.clientX < gRect.right - gRect.width * 0.4) {
+          setOrderOffset(Math.max(0, orderOffset - 1));
+        }
       };
-      window.addEventListener('mousemove', move, true);
-      window.addEventListener('mouseup', up, true);
+      window.addEventListener('pointerup', up, true);
+      window.addEventListener('pointercancel', up, true);
     }, { capture: true, signal: rootState.events.signal });
     root.addEventListener('keydown', e => {
       if (!visible || root.hasAttribute('data-sp-native-layout') || !['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(e.key)) return;
@@ -2544,7 +2689,7 @@ async function startGenre4all() {
     const container = rowContainer(row); if (!container || getComputedStyle(container).display !== 'grid') return;
     let state = layouts.get(container);
     if (!state) {
-      const shell = node('genre4all-column', null, { 'data-kind': header ? 'header' : 'data', title: 'Genre4all' });
+      const shell = node('genre4all-column', null, { 'data-kind': header ? 'header' : 'data', title: header ? 'Gênero — arraste para mover a coluna' : 'Genre4all' });
       const label = header ? node('span', 'Gênero', { class: 'g4a-header-label standalone-ellipsis-one-line', 'data-encore-id': 'text' }) : null;
       const sep = header ? node('div', null, { role: 'separator', 'aria-orientation': 'horizontal', 'aria-hidden': 'true', 'data-skip-in-keyboard-nav': 'true', class: 'g4a-header-sep' }) : null;
       const host = header ? null : node('div', null, { class: 'g4a-data' });
@@ -2554,8 +2699,11 @@ async function startGenre4all() {
     }
     const foreign = cells(container); if (!foreign.length) return;
     const end = foreign.find(c => c.matches('.main-trackList-rowSectionEnd,[data-sp-layout-position="native:end"]')) || foreign[foreign.length - 1];
-    if (state.shell.parentElement !== container || state.shell.nextElementSibling !== end) container.insertBefore(state.shell, end);
-    const insert = foreign.indexOf(end);
+    const endIndex = foreign.indexOf(end);
+    const minInsert = Math.min(2, endIndex);
+    const insert = root.hasAttribute('data-sp-native-layout') ? endIndex : Math.max(minInsert, Math.min(endIndex, endIndex - orderOffset));
+    const refNode = foreign[insert] || end;
+    if (state.shell.parentElement !== container || state.shell.nextElementSibling !== refNode) container.insertBefore(state.shell, refNode);
     if (header) {
       const sampleText = container.querySelector('[role="columnheader"] [data-encore-id="text"]');
       if (sampleText && state.label) {
@@ -2565,7 +2713,7 @@ async function startGenre4all() {
       const sampleSep = container.querySelector('[role="columnheader"] [role="separator"]:not(.sp-layout-resize):not([data-g4a-sep])');
       const sepClass = `${sampleSep?.className || ''} g4a-header-sep`.trim();
       if (state.sep && state.sep.className !== sepClass) state.sep.className = sepClass;
-      const prev = insert >= 2 && !root.hasAttribute('data-sp-native-layout') ? foreign[insert - 1] : null;
+      const prev = endIndex >= 2 && !root.hasAttribute('data-sp-native-layout') ? foreign[endIndex - 1] : null;
       const prevHost = prev ? (prev.querySelector('[data-tracklist-draggable-column]') || prev) : null;
       if (state.prevHost && state.prevHost !== prevHost) {
         state.prevSep?.remove(); state.prevSep = null;
@@ -2590,16 +2738,18 @@ async function startGenre4all() {
     const raw = computed.gridTemplateColumns.replace(/\[[^\]]*\]/g, '').trim().split(/\s+/).map(parseFloat);
     let widths = raw.length === foreign.length && raw.every(Number.isFinite) ? raw : foreign.map(c => c.getBoundingClientRect().width || 120);
     // Preserve named line positions by assigning our own numeric positions via separate properties.
-    let width = 176;
+    const width = 176;
     if (!root.hasAttribute('data-sp-native-layout')) {
-      const flexStart = insert > 1 ? 1 : 0;
-      const flexCount = Math.max(1, insert - flexStart);
+      const flexStart = endIndex > 1 ? 1 : 0;
+      const flexCount = Math.max(1, endIndex - flexStart);
       const flexWidths = widths.slice(flexStart, flexStart + flexCount);
       const flexSum = flexWidths.reduce((a, b) => a + b, 0);
       const avail = Math.max(0, flexSum - gap);
       const rootState = roots.get(root);
       const baseGenre = Math.min(176, Math.max(110, flexSum / (flexCount + 1)));
-      const weights = rootState?.weights?.length === flexCount + 1 ? rootState.weights : [...flexWidths, baseGenre];
+      const defaultWeights = [...flexWidths];
+      defaultWeights.splice(Math.max(0, insert - flexStart), 0, baseGenre);
+      const weights = rootState?.weights?.length === flexCount + 1 && rootState.insert === insert ? rootState.weights : defaultWeights;
       const weightSum = weights.reduce((a, b) => a + b, 0) || 1;
       const mins = weights.map((_, k) => k === 0 ? 120 : 80);
       const minSum = mins.reduce((a, b) => a + b, 0);
@@ -2609,10 +2759,12 @@ async function startGenre4all() {
         const extra = alloc.reduce((s, v, k) => s + Math.max(0, v - mins[k]), 0);
         if (extra > 0) alloc = alloc.map((v, k) => v > mins[k] ? mins[k] + (v - mins[k]) * ((extra - (allocSum - avail)) / extra) : v);
       }
-      for (let k = 0; k < flexCount; k++) widths[flexStart + k] = alloc[k];
-      width = alloc[flexCount];
+      widths.splice(insert, 0, baseGenre);
+      for (let k = 0; k <= flexCount; k++) widths[flexStart + k] = alloc[k];
+      if (rootState) rootState.insert = insert;
+    } else {
+      widths.splice(insert, 0, width);
     }
-    widths.splice(insert, 0, width);
     const all = [...foreign]; all.splice(insert, 0, state.shell);
     const total = Math.ceil(widths.reduce((a,b) => a + b, 0) + gap * Math.max(0, widths.length - 1) + padding);
     const template = widths.map(w => `${Math.max(0,w)}px`).join(' ');
@@ -2640,6 +2792,13 @@ async function startGenre4all() {
       || (known.length >= 2 && /(colunas|columns)/.test(text))
       || (known.length >= 3 && labels.some(label => /^(duration|duracao|waveform|forma de onda)$/.test(label)));
   }
+  function profileMenu(menu) {
+    if (!menu.isConnected || menu.closest('.g4a-preferences,.g4a-genre-dialog') || columnMenu(menu)) return false;
+    const labels = [...menu.querySelectorAll('button,a,[role="menuitem"],[role="menuitemcheckbox"]')].filter(n => !n.closest('[data-g4a-profile-item]')).map(n => normalize(n.textContent || '').trim());
+    if (labels.some(l => l.includes('genre4all config'))) return false;
+    const known = labels.filter(l => /^(conta|account|perfil|profile|configuracoes|settings|sair|log out|experimental features|home config|spicy lyrics settings|private session|sessao particular|suporte|support)$/.test(l));
+    return known.length >= 2;
+  }
   function updateMenus() {
     for (const item of document.querySelectorAll('[data-g4a-menu-item]')) {
       const button = item.querySelector('button'); if (!button) continue;
@@ -2649,24 +2808,42 @@ async function startGenre4all() {
   }
   function injectMenus() {
     for (const menu of document.querySelectorAll('[role="menu"],.main-contextMenu-menu')) {
-      if (!columnMenu(menu) || menu.querySelector('[data-g4a-menu-item]')) continue;
-      const item = node(menu.tagName === 'UL' || menu.tagName === 'OL' ? 'li' : 'div', null, { 'data-g4a-menu-item': '', role: 'presentation' });
-      const sample = menu.querySelector('button[role="menuitemcheckbox"],button[aria-checked],button');
-      const button = node('button', null, { type: 'button', class: `${sample?.className || ''} g4a-menu-button`, role: 'menuitemcheckbox', 'aria-checked': String(visible), tabindex: '0', title: 'Genre4all — mostrar ou ocultar a coluna de gênero' });
-      button.append(node('span', 'Gênero'));
-      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-      svg.setAttribute('viewBox', '0 0 16 16'); svg.setAttribute('aria-hidden', 'true');
-      const path = document.createElementNS(svg.namespaceURI, 'path'); path.setAttribute('d', 'M13.78 4.22a.75.75 0 0 1 0 1.06l-7 7a.75.75 0 0 1-1.06 0l-3.5-3.5a.75.75 0 1 1 1.06-1.06L6.25 10.69l6.47-6.47a.75.75 0 0 1 1.06 0z'); svg.append(path); button.append(svg);
-      button.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); setVisible(!visible); });
-      button.addEventListener('keydown', e => {
-        if (!['ArrowUp','ArrowDown','Home','End'].includes(e.key)) return;
-        e.preventDefault(); e.stopPropagation();
-        const options = [...menu.querySelectorAll('button,[role="menuitem"],[role="menuitemcheckbox"]')].filter(n => !n.disabled && n.getBoundingClientRect().height > 0);
-        const index = options.indexOf(button);
-        const next = e.key === 'Home' ? 0 : e.key === 'End' ? options.length - 1 : (index + (e.key === 'ArrowUp' ? -1 : 1) + options.length) % options.length;
-        options[next]?.focus();
-      });
-      item.append(button); menu.append(item);
+      if (columnMenu(menu) && !menu.querySelector('[data-g4a-menu-item]')) {
+        const item = node(menu.tagName === 'UL' || menu.tagName === 'OL' ? 'li' : 'div', null, { 'data-g4a-menu-item': '', role: 'presentation' });
+        const sample = menu.querySelector('button[role="menuitemcheckbox"],button[aria-checked],button');
+        const button = node('button', null, { type: 'button', class: `${sample?.className || ''} g4a-menu-button`, role: 'menuitemcheckbox', 'aria-checked': String(visible), tabindex: '0', title: 'Genre4all — mostrar ou ocultar a coluna de gênero' });
+        button.append(node('span', 'Gênero'));
+        const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        svg.setAttribute('viewBox', '0 0 16 16'); svg.setAttribute('aria-hidden', 'true');
+        const path = document.createElementNS(svg.namespaceURI, 'path'); path.setAttribute('d', 'M13.78 4.22a.75.75 0 0 1 0 1.06l-7 7a.75.75 0 0 1-1.06 0l-3.5-3.5a.75.75 0 1 1 1.06-1.06L6.25 10.69l6.47-6.47a.75.75 0 0 1 1.06 0z'); svg.append(path); button.append(svg);
+        button.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); setVisible(!visible); });
+        button.addEventListener('keydown', e => {
+          if (!['ArrowUp','ArrowDown','Home','End'].includes(e.key)) return;
+          e.preventDefault(); e.stopPropagation();
+          const options = [...menu.querySelectorAll('button,[role="menuitem"],[role="menuitemcheckbox"]')].filter(n => !n.disabled && n.getBoundingClientRect().height > 0);
+          const index = options.indexOf(button);
+          const next = e.key === 'Home' ? 0 : e.key === 'End' ? options.length - 1 : (index + (e.key === 'ArrowUp' ? -1 : 1) + options.length) % options.length;
+          options[next]?.focus();
+        });
+        item.append(button); menu.append(item);
+      } else if (profileMenu(menu) && !menu.querySelector('[data-g4a-profile-item]')) {
+        const item = node(menu.tagName === 'UL' || menu.tagName === 'OL' ? 'li' : 'div', null, { 'data-g4a-profile-item': '', role: 'presentation' });
+        const sample = menu.querySelector('button[role="menuitem"],button');
+        const button = node('button', null, { type: 'button', class: `${sample?.className || ''} g4a-profile-button`, role: 'menuitem', tabindex: '-1' });
+        const iconHolder = node('span'); iconHolder.innerHTML = CONFIG_ICON;
+        if (iconHolder.firstElementChild) button.append(iconHolder.firstElementChild);
+        button.append(node('span', 'Genre4all config'));
+        button.addEventListener('click', e => {
+          e.preventDefault(); e.stopPropagation();
+          menu.remove();
+          showPreferences();
+        });
+        item.append(button);
+        const anchor = [...menu.children].find(c => /spicy lyrics|home config|experimental/i.test(c.textContent || ''));
+        if (anchor?.nextSibling) menu.insertBefore(item, anchor.nextSibling);
+        else if (menu.firstElementChild) menu.insertBefore(item, menu.firstElementChild);
+        else menu.append(item);
+      }
     }
     updateMenus();
   }
@@ -2674,8 +2851,8 @@ async function startGenre4all() {
   // Observe native changes and virtualization; ignore our rendering and menu writes.
   const observer = new MutationObserver(records => {
     if (records.some(m => {
-      if (m.target.closest?.('genre4all-column,[data-g4a-menu-item],[data-g4a-sep],.g4a-genre-dialog,.g4a-preferences')) return false;
-      return m.type !== 'childList' || [...m.addedNodes, ...m.removedNodes].some(n => n.nodeType === 1 && !n.matches('genre4all-column,[data-g4a-menu-item],[data-g4a-sep]'));
+      if (m.target.closest?.('genre4all-column,[data-g4a-menu-item],[data-g4a-profile-item],[data-g4a-sep],.g4a-genre-fan,.g4a-preferences')) return false;
+      return m.type !== 'childList' || [...m.addedNodes, ...m.removedNodes].some(n => n.nodeType === 1 && !n.matches('genre4all-column,[data-g4a-menu-item],[data-g4a-profile-item],[data-g4a-sep],.g4a-genre-fan'));
     })) schedule();
   });
   observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['aria-rowindex','data-uri','href','style','class'], characterData: true });
@@ -2694,7 +2871,7 @@ async function startGenre4all() {
         found.add(root);
         let rootState = roots.get(root);
         if (!rootState) {
-          rootState = { events: new AbortController(), weights: null, maxTotal: 0 };
+          rootState = { events: new AbortController(), weights: null, insert: null, maxTotal: 0 };
           roots.set(root, rootState);
           attachResize(root, rootState);
           resize?.observe(root);
@@ -2730,6 +2907,7 @@ async function startGenre4all() {
   function close() {
     if (closed) return;
     closed = true; lifecycle.abort(); observer.disconnect(); resize?.disconnect(); unlisten?.();
+    try { profileMenuItem?.deregister?.(); } catch { /* Ignore menu cleanup errors. */ }
     if (frame !== null) cancelAnimationFrame(frame);
     for (const row of [...layouts.keys()]) releaseRow(row);
     for (const [root, rootState] of roots) {
@@ -2738,7 +2916,7 @@ async function startGenre4all() {
     }
     roots.clear();
     view?.close(); service?.close(); storage.close(); preferences?.remove();
-    document.querySelectorAll('[data-g4a-menu-item]').forEach(n => n.remove()); style.remove();
+    document.querySelectorAll('[data-g4a-menu-item],[data-g4a-profile-item]').forEach(n => n.remove()); style.remove();
     if (globalThis.Genre4all === api) delete globalThis.Genre4all;
   }
   window.addEventListener('pagehide', close, { once: true, signal: lifecycle.signal });
@@ -2748,11 +2926,17 @@ async function startGenre4all() {
   lifecycle.signal.addEventListener('abort', () => clearInterval(recheck), { once: true });
   while (!closed && !globalThis.Spicetify?.Platform) await new Promise(resolve => setTimeout(resolve, 250));
   if (closed) return;
+  try {
+    if (globalThis.Spicetify?.Menu?.Item) {
+      profileMenuItem = new Spicetify.Menu.Item('Genre4all config', false, () => showPreferences(), CONFIG_ICON);
+      profileMenuItem.register();
+    }
+  } catch { /* Fallback DOM injection handles profile menu. */ }
   service = Genre4allGenres.createService({ storage, spotify: Genre4allTransport.createSpotifyAdapter(Genre4allGenres, getMetadataClient), validateSpotifyGenre: Genre4allCatalog.validate, formatSpotifyGenres: Genre4allCatalog.format });
   view = Genre4allColumn.createController(service, {
     getUri, getTrack: track, getContext: context, isEnabled: cell => visible && cell.matches('.g4a-data'),
     onConfigure: showPreferences,
-    describe: result => ({ SPOTIFY_METADATA_UNAVAILABLE: 'O serviço de metadados está indisponível nesta versão do Spotify. Atualize Spicetify/Spotify e tente novamente.', SPOTIFY_TIMEOUT: 'O Spotify não respondeu a tempo. Use Atualizar gêneros desta faixa.', SPOTIFY_TRACK_REQUIRED: 'Gêneros disponíveis para faixas do catálogo do Spotify.', SPOTIFY_EXTENSION_MISSING: 'Esta versão do Spotify não disponibilizou os metadados de gênero.' }[result.errorCode] || result.errorCode || 'O Spotify não retornou gêneros para esta faixa.')
+    describe: result => ({ SPOTIFY_METADATA_UNAVAILABLE: 'O serviço de metadados está indisponível nesta versão do Spotify. Atualize Spicetify/Spotify e tente novamente.', SPOTIFY_TIMEOUT: 'O Spotify não respondeu a tempo. Use Atualizar gêneros.', SPOTIFY_TRACK_REQUIRED: 'Gêneros disponíveis para faixas do catálogo do Spotify.', SPOTIFY_EXTENSION_MISSING: 'Esta versão do Spotify não disponibilizou os metadados de gênero.' }[result.errorCode] || result.errorCode || 'O Spotify não retornou gêneros para esta faixa.')
   });
   service.ready.catch(error => console.warn('[Genre4all] Falha ao iniciar cache.', error));
   unlisten = Spicetify.Platform.History?.listen?.(() => { view.reset(); schedule(); });

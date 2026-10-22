@@ -61,6 +61,9 @@ body{background:#121212;color:#eee;font:14px sans-serif;margin:20px}main{width:1
       window.openMenu=()=>{
         document.querySelector('[role=menu]')?.remove();const menu=document.createElement('ul');menu.setAttribute('role','menu');menu.innerHTML='<li>Colunas</li>'+['Forma de onda','Álbum','Adicionada em','Data de lançamento','Duração'].map(t=>'<li><button role="menuitemcheckbox" aria-checked="true">'+t+'</button></li>').join('');document.body.append(menu);
       };
+      window.openProfileMenu=()=>{
+        document.querySelector('[role=menu]')?.remove();const menu=document.createElement('ul');menu.setAttribute('role','menu');menu.innerHTML=['Experimental features','Home config','Conta','Perfil','Configurações','Sair'].map(t=>'<li><button role="menuitem">'+t+'</button></li>').join('');document.body.append(menu);
+      };
       build();
     });
     await page.addScriptTag({path:path.join(root,'Genre4all.js')});
@@ -78,9 +81,10 @@ body{background:#121212;color:#eee;font:14px sans-serif;margin:20px}main{width:1
     await toggle.click();await page.locator('.g4a-data[data-genre-state=success]').waitFor();
     assert.equal(await page.evaluate(()=>calls.length),1,'toggling reuses the independent cache');
     await page.evaluate(()=>document.querySelector('[role=menu]').remove());
-    await page.getByRole('button',{name:/Detalhes dos gêneros/}).click();await page.getByRole('dialog').waitFor();
-    assert.match(await page.getByRole('dialog').textContent(),/Spotify/);
-    await page.getByRole('button',{name:'Atualizar gêneros desta faixa'}).click();await page.locator('.g4a-data[data-genre-state=success]').waitFor();
+    await page.locator('.g4a-genre-primary').hover();await page.locator('.g4a-genre-fan').waitFor();
+    await page.evaluate(()=>openProfileMenu());
+    await page.getByRole('menuitem',{name:'Genre4all config',exact:true}).click();await page.getByRole('dialog').waitFor();
+    await page.getByRole('button',{name:'Atualizar gêneros'}).click();await page.locator('.g4a-data[data-genre-state=success]').waitFor();
     assert.ok(await page.evaluate(()=>calls.length)>=2,'refresh performs a fresh request');
     // Exact original Sort-Play-2 native functions, isolated from all unrelated features.
     {
