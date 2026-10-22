@@ -1,0 +1,14 @@
+{
+  "name": "genre4all",
+  "version": "0.1.0-test",
+  "private": true,
+  "description": "Standalone Spicetify genre column",
+  "license": "MIT",
+  "scripts": {
+    "build": "node scripts/build.cjs",
+    "check": "node scripts/build.cjs --check && node --check Genre4all.js",
+    "test:provenance": "node scripts/verify-provenance.cjs",
+    "test": "npm run test:provenance && node --test tests/*.test.cjs && node tests/integration.browser.cjs"
+  },
+  "devDependencies": { "playwright": "^1.58.2" }
+}

@@ -1,0 +1,67 @@
+{
+  "repository": "https://github.com/Lucasoreo/Sort-Play-2",
+  "commit": "c1fc205bccfd4200ad0660c75e55e8d138155936",
+  "license": "MIT",
+  "copyright": "Copyright (c) 2026 hoeci",
+  "purpose": "Original source fixtures used only in compatibility tests; excluded from Genre4all.js.",
+  "files": [
+    {
+      "path": "tests/fixtures/sort-play-2/src/genre-service.js",
+      "source_path": "src/genre-service.js",
+      "kind": "verbatim",
+      "sha256": "1dd211bb22aa94f5c1a8adfb2377984df638d7d24589c903b020aed32ccc9ae4"
+    },
+    {
+      "path": "tests/fixtures/sort-play-2/src/genre-column.js",
+      "source_path": "src/genre-column.js",
+      "kind": "verbatim",
+      "sha256": "1d110604ee6815c0183567a55549a2fa1b36782d5d4b53613c0d733673ac2b6b"
+    },
+    {
+      "path": "tests/fixtures/sort-play-2/src/native-layout.js",
+      "source_path": "src/native-layout.js",
+      "kind": "verbatim",
+      "sha256": "b2755af476842c8b83a038b87b43ace505cbb61843041477e34e3d2daff3f17d"
+    },
+    {
+      "path": "tests/fixtures/sort-play-2/LICENSE",
+      "source_path": "LICENSE",
+      "kind": "verbatim",
+      "sha256": "30010a7f94b83431ac21bf96d6747dbfecf39a53099a2eca8e9c7b2d23b8d4fe"
+    },
+    {
+      "path": "tests/fixtures/sort-play-2/tracklist-structure.js",
+      "source_path": "sort-play.js",
+      "source_symbol": "updateTracklistStructure",
+      "kind": "verbatim-function-extract",
+      "sha256": "d4a31116f70597b69945adb225288beb6dbfc1e557be9deecc6127545be88eb7"
+    }
+  ],
+  "adapted_sources": [
+    {
+      "genre4all_path": "src/genre-service.js",
+      "source_path": "src/genre-service.js",
+      "source_sha256": "1dd211bb22aa94f5c1a8adfb2377984df638d7d24589c903b020aed32ccc9ae4"
+    },
+    {
+      "genre4all_path": "src/genre-transport.js",
+      "source_path": "src/genre-transport.js",
+      "source_sha256": "f0160979609fbf873e9820ec2c23ae799b424114e817fe8af2ed905e20d8347a"
+    },
+    {
+      "genre4all_path": "src/genre-column.js",
+      "source_path": "src/genre-column.js",
+      "source_sha256": "1d110604ee6815c0183567a55549a2fa1b36782d5d4b53613c0d733673ac2b6b"
+    }
+  ],
+  "catalog_inputs": [
+    {
+      "source_path": "sort-play.js",
+      "source_sha256": "3cffc4a799bd6974e9df90bbf7e65a52ba350acc0fc0e2fc48a5272276e17ba4"
+    },
+    {
+      "source_path": "assets/genre_playlist_ids.json",
+      "source_sha256": "d5311ef39f5b5647b4f1fd223e7c063bd977a0d3febb14cd6c6be582b3e66eaa"
+    }
+  ]
+}
