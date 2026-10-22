@@ -20,7 +20,7 @@ const Genre4allColumn = (() => {
       || titleCell?.querySelector('[data-encore-id="text"][dir="auto"]'))?.textContent?.trim();
     const artists = [...row.querySelectorAll('a[href*="/artist/"]')].map(a => ({ name: a.textContent.trim() })).filter(a => a.name);
     const album = row.querySelector('a[href*="/album/"]')?.textContent?.trim();
-    const duration = row.querySelector('.main-trackList-rowSectionEnd, [data-sp-layout-position="native:end"]')?.textContent?.match(/\b(\d{1,2}):(\d{2})\b/u);
+    const duration = row.querySelector('.main-trackList-rowSectionEnd, [data-sp-layout-position="native:end"], [role="gridcell"]:last-of-type')?.textContent?.match(/\b(\d{1,2}):(\d{2})\b/u);
     const fromDOM = { uri, ...(title ? { name: title } : {}), artists: [...new Map(artists.map(a => [a.name, a])).values()], ...(album ? { album: { name: album } } : {}),
       ...(duration ? { duration_ms: (Number(duration[1]) * 60 + Number(duration[2])) * 1000 } : {}) };
     if (title && artists.length) return fromDOM;

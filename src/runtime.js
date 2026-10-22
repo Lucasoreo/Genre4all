@@ -33,10 +33,20 @@ async function startGenre4all() {
     .g4a-root .g4a-row:not([data-g4a-measure]) { grid-template-columns:var(--g4a-tracks) !important; min-width:var(--g4a-total) !important; }
     .g4a-root .g4a-row:not([data-g4a-measure]) > [data-g4a-position] { grid-column:var(--g4a-position) !important; min-width:0; }
     genre4all-column { display:flex; align-items:center; min-width:0; overflow:hidden; box-sizing:border-box; }
-    genre4all-column[data-kind=header] { height:100%; color:var(--text-subdued,var(--spice-subtext,#b3b3b3)); font-size:14px; }
+    genre4all-column[data-kind=header] { position:relative; justify-content:flex-start; justify-self:stretch; width:100%; height:100%; color:var(--text-subdued,var(--spice-subtext,#b3b3b3)); font-size:0.875rem; font-weight:400; line-height:normal; user-select:none; }
     genre4all-column .g4a-genre-host { width:100%; }
-    [data-g4a-measure] > genre4all-column { display:none !important; }
-    .g4a-root.g4a-root { overflow-x:auto !important; }
+    .g4a-header-label { min-width:0; margin-inline-end:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    [data-g4a-prev-sep] { display:flex; align-items:center; }
+    .g4a-header-sep { cursor:col-resize; flex:0 0 8px; width:8px; height:50%; margin-inline-start:auto; user-select:none; touch-action:none; }
+    .g4a-row:hover .g4a-header-sep,.g4a-row:focus-within .g4a-header-sep,html.g4a-resizing .g4a-header-sep { background:linear-gradient(rgba(var(--spice-rgb-text,255,255,255),.302),rgba(var(--spice-rgb-text,255,255,255),.302)) 50%/1px 100% no-repeat; }
+    html.g4a-resizing,html.g4a-resizing * { cursor:col-resize !important; user-select:none !important; }
+    [data-g4a-measure] > genre4all-column,[data-g4a-measure] [data-g4a-sep] { display:none !important; }
+    .g4a-root[data-g4a-overflow].g4a-root { overflow-x:auto !important; }
+    .g4a-root[data-g4a-overflow] > div:has([role="columnheader"]),.g4a-root[data-sp-native-layout] > div:has([role="columnheader"]) { margin-inline:0 !important; padding-inline:0 !important; }
+    .g4a-root[data-sp-native-layout] [data-sp-layout-position="native:end"] > .sp-layout-resize { display:none !important; }
+    .g4a-root[data-sp-native-layout] .sp-layout-resize::after { top:25% !important; bottom:25% !important; left:5.5px !important; width:1px !important; border-radius:0 !important; background:rgba(var(--spice-rgb-text,255,255,255),.302) !important; opacity:0 !important; }
+    .g4a-root[data-sp-native-layout] .g4a-row:hover .sp-layout-resize::after,.g4a-root[data-sp-native-layout] .g4a-row:focus-within .sp-layout-resize::after,.g4a-root[data-sp-native-layout] .sp-layout-resize:hover::after,.g4a-root[data-sp-native-layout] .sp-layout-resize:focus-visible::after { opacity:1 !important; }
+    .g4a-root[data-sp-native-layout] .sort-play-column-header { justify-content:flex-start !important; text-align:left !important; font-size:0.875rem !important; font-weight:400 !important; }
     .g4a-menu-button { display:flex; align-items:center; justify-content:space-between; gap:20px; width:100%; min-height:40px; padding:12px 16px; border:0; border-radius:2px; color:var(--text-base,#eee); background:transparent; text-align:left; font:inherit; cursor:pointer; }
     .g4a-menu-button:hover,.g4a-menu-button:focus-visible { background:#ffffff1a; outline-offset:-2px; }
     .g4a-menu-button[aria-checked=true] { color:var(--text-positive,#1ed760); }
@@ -61,7 +71,11 @@ async function startGenre4all() {
   function setVisible(value) {
     visible = !!value;
     try { localStorage.setItem(KEY, String(visible)); } catch { /* Keep the current session usable. */ }
-    if (!visible) { view?.reset(); for (const row of [...layouts.keys()]) releaseRow(row); }
+    if (!visible) {
+      view?.reset();
+      for (const row of [...layouts.keys()]) releaseRow(row);
+      for (const root of roots.keys()) { root.classList.remove('g4a-root'); root.removeAttribute('data-g4a-overflow'); }
+    }
     updateMenus(); schedule();
   }
 
@@ -163,9 +177,63 @@ async function startGenre4all() {
     if (row.children.length === 1 && cells(row.firstElementChild).length) return row.firstElementChild;
     return null;
   }
+  function attachResize(root, rootState) {
+    const resolvePair = sep => {
+      const headerCell = sep.closest('[role="columnheader"],genre4all-column[data-kind="header"]');
+      const container = headerCell?.parentElement;
+      if (!container || !layouts.has(container)) return null;
+      const all = [...container.children].filter(c => (c.matches(CELL) || c.tagName === 'GENRE4ALL-COLUMN') && getComputedStyle(c).display !== 'none');
+      const end = all.find(c => c.matches('.main-trackList-rowSectionEnd,[data-sp-layout-position="native:end"]')) || all[all.length - 1];
+      const endIndex = all.indexOf(end);
+      const flexStart = endIndex > 2 ? 1 : 0;
+      const flexCells = all.slice(flexStart, endIndex);
+      const k = flexCells.indexOf(headerCell);
+      return k >= 0 && flexCells.length >= 2 ? { flexCells, k } : null;
+    };
+    const adjust = (startWidths, k, dx) => {
+      const next = [...startWidths];
+      const a = k < next.length - 1 ? k : k - 1, b = a + 1;
+      const sign = k < next.length - 1 ? 1 : -1;
+      const minA = a === 0 ? 120 : 80, minB = 80;
+      const delta = Math.max(minA - startWidths[a], Math.min(startWidths[b] - minB, sign * dx));
+      next[a] = startWidths[a] + delta;
+      next[b] = startWidths[b] - delta;
+      return next;
+    };
+    root.addEventListener('mousedown', e => {
+      if (!visible || root.hasAttribute('data-sp-native-layout') || e.button !== 0) return;
+      const sep = e.target.closest?.('[role="separator"]:not(.sp-layout-resize)');
+      if (!sep || !root.contains(sep)) return;
+      const pair = resolvePair(sep); if (!pair) return;
+      e.preventDefault(); e.stopImmediatePropagation();
+      const startWidths = pair.flexCells.map(c => c.getBoundingClientRect().width || 120);
+      const startX = e.clientX;
+      document.documentElement.classList.add('g4a-resizing');
+      const move = ev => { rootState.weights = adjust(startWidths, pair.k, ev.clientX - startX); schedule(); };
+      const up = () => {
+        document.documentElement.classList.remove('g4a-resizing');
+        window.removeEventListener('mousemove', move, true);
+        window.removeEventListener('mouseup', up, true);
+      };
+      window.addEventListener('mousemove', move, true);
+      window.addEventListener('mouseup', up, true);
+    }, { capture: true, signal: rootState.events.signal });
+    root.addEventListener('keydown', e => {
+      if (!visible || root.hasAttribute('data-sp-native-layout') || !['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(e.key)) return;
+      const sep = e.target.closest?.('[role="separator"]:not(.sp-layout-resize)');
+      if (!sep || !root.contains(sep)) return;
+      const pair = resolvePair(sep); if (!pair) return;
+      e.preventDefault(); e.stopImmediatePropagation();
+      const startWidths = pair.flexCells.map(c => c.getBoundingClientRect().width || 120);
+      rootState.weights = adjust(startWidths, pair.k, e.key === 'ArrowRight' || e.key === 'ArrowUp' ? 10 : -10);
+      schedule();
+    }, { capture: true, signal: rootState.events.signal });
+  }
   function releaseRow(row) {
     const state = layouts.get(row); if (!state) return;
-    view?.release(state.host); state.shell.remove(); layouts.delete(row);
+    view?.release(state.host); state.shell.remove(); state.prevSep?.remove();
+    state.prevHost?.removeAttribute('data-g4a-prev-sep');
+    layouts.delete(row);
     row.classList.remove('g4a-row'); row.removeAttribute('data-g4a-measure');
     row.style.removeProperty('--g4a-tracks'); row.style.removeProperty('--g4a-total');
     for (const c of state.positions) { c.removeAttribute('data-g4a-position'); c.style.removeProperty('--g4a-position'); }
@@ -174,15 +242,44 @@ async function startGenre4all() {
     const container = rowContainer(row); if (!container || getComputedStyle(container).display !== 'grid') return;
     let state = layouts.get(container);
     if (!state) {
-      const shell = node('genre4all-column', header ? 'Gênero' : null, { 'data-kind': header ? 'header' : 'data', title: 'Genre4all' });
+      const shell = node('genre4all-column', null, { 'data-kind': header ? 'header' : 'data', title: 'Genre4all' });
+      const label = header ? node('span', 'Gênero', { class: 'g4a-header-label standalone-ellipsis-one-line', 'data-encore-id': 'text' }) : null;
+      const sep = header ? node('div', null, { role: 'separator', 'aria-orientation': 'horizontal', 'aria-hidden': 'true', 'data-skip-in-keyboard-nav': 'true', class: 'g4a-header-sep' }) : null;
       const host = header ? null : node('div', null, { class: 'g4a-data' });
-      if (host) shell.append(host);
-      state = { shell, host, positions: new Set(), root };
+      if (header) shell.append(label, sep); else shell.append(host);
+      state = { shell, label, sep, host, prevSep: null, prevHost: null, positions: new Set(), root };
       layouts.set(container, state);
     }
     const foreign = cells(container); if (!foreign.length) return;
-    const end = foreign.find(c => c.matches('.main-trackList-rowSectionEnd')) || foreign[foreign.length - 1];
+    const end = foreign.find(c => c.matches('.main-trackList-rowSectionEnd,[data-sp-layout-position="native:end"]')) || foreign[foreign.length - 1];
     if (state.shell.parentElement !== container || state.shell.nextElementSibling !== end) container.insertBefore(state.shell, end);
+    const insert = foreign.indexOf(end);
+    if (header) {
+      const sampleText = container.querySelector('[role="columnheader"] [data-encore-id="text"]');
+      if (sampleText && state.label) {
+        const cls = `${sampleText.className} g4a-header-label standalone-ellipsis-one-line`.trim();
+        if (state.label.className !== cls) state.label.className = cls;
+      }
+      const sampleSep = container.querySelector('[role="columnheader"] [role="separator"]:not(.sp-layout-resize):not([data-g4a-sep])');
+      const sepClass = `${sampleSep?.className || ''} g4a-header-sep`.trim();
+      if (state.sep && state.sep.className !== sepClass) state.sep.className = sepClass;
+      const prev = insert >= 2 && !root.hasAttribute('data-sp-native-layout') ? foreign[insert - 1] : null;
+      const prevHost = prev ? (prev.querySelector('[data-tracklist-draggable-column]') || prev) : null;
+      if (state.prevHost && state.prevHost !== prevHost) {
+        state.prevSep?.remove(); state.prevSep = null;
+        state.prevHost.removeAttribute('data-g4a-prev-sep'); state.prevHost = null;
+      }
+      if (prevHost && !prev.querySelector('[role="separator"]:not(.sp-layout-resize):not([data-g4a-sep])')) {
+        if (!state.prevSep) state.prevSep = node('div', null, { role: 'separator', 'aria-orientation': 'horizontal', 'aria-hidden': 'true', 'data-skip-in-keyboard-nav': 'true', 'data-g4a-sep': '', class: sepClass });
+        if (state.prevSep.className !== sepClass) state.prevSep.className = sepClass;
+        if (state.prevSep.parentElement !== prevHost) prevHost.append(state.prevSep);
+        if (!prevHost.hasAttribute('data-g4a-prev-sep')) prevHost.setAttribute('data-g4a-prev-sep', '');
+        state.prevHost = prevHost;
+      } else if (state.prevSep) {
+        state.prevSep.remove(); state.prevSep = null;
+        state.prevHost?.removeAttribute('data-g4a-prev-sep'); state.prevHost = null;
+      }
+    }
     // Temporarily disable only our CSS to read the latest native/Sort Play layout.
     container.setAttribute('data-g4a-measure', '');
     const computed = getComputedStyle(container);
@@ -191,18 +288,35 @@ async function startGenre4all() {
     const raw = computed.gridTemplateColumns.replace(/\[[^\]]*\]/g, '').trim().split(/\s+/).map(parseFloat);
     let widths = raw.length === foreign.length && raw.every(Number.isFinite) ? raw : foreign.map(c => c.getBoundingClientRect().width || 120);
     // Preserve named line positions by assigning our own numeric positions via separate properties.
-    const width = 176;
+    let width = 176;
     if (!root.hasAttribute('data-sp-native-layout')) {
-      const title = foreign.findIndex(c => c.classList.contains('main-trackList-rowSectionStart'));
-      const index = title >= 0 ? title : Math.min(1, widths.length - 1);
-      widths[index] = Math.max(140, widths[index] - width - gap);
+      const flexStart = insert > 1 ? 1 : 0;
+      const flexCount = Math.max(1, insert - flexStart);
+      const flexWidths = widths.slice(flexStart, flexStart + flexCount);
+      const flexSum = flexWidths.reduce((a, b) => a + b, 0);
+      const avail = Math.max(0, flexSum - gap);
+      const rootState = roots.get(root);
+      const baseGenre = Math.min(176, Math.max(110, flexSum / (flexCount + 1)));
+      const weights = rootState?.weights?.length === flexCount + 1 ? rootState.weights : [...flexWidths, baseGenre];
+      const weightSum = weights.reduce((a, b) => a + b, 0) || 1;
+      const mins = weights.map((_, k) => k === 0 ? 120 : 80);
+      const minSum = mins.reduce((a, b) => a + b, 0);
+      let alloc = weights.map((w, k) => Math.max(mins[k], avail * (w / weightSum)));
+      const allocSum = alloc.reduce((a, b) => a + b, 0);
+      if (avail > minSum && allocSum > avail) {
+        const extra = alloc.reduce((s, v, k) => s + Math.max(0, v - mins[k]), 0);
+        if (extra > 0) alloc = alloc.map((v, k) => v > mins[k] ? mins[k] + (v - mins[k]) * ((extra - (allocSum - avail)) / extra) : v);
+      }
+      for (let k = 0; k < flexCount; k++) widths[flexStart + k] = alloc[k];
+      width = alloc[flexCount];
     }
-    const insert = foreign.indexOf(end);
     widths.splice(insert, 0, width);
     const all = [...foreign]; all.splice(insert, 0, state.shell);
     const total = Math.ceil(widths.reduce((a,b) => a + b, 0) + gap * Math.max(0, widths.length - 1) + padding);
     const template = widths.map(w => `${Math.max(0,w)}px`).join(' ');
     ownProperty(container, '--g4a-tracks', template); ownProperty(container, '--g4a-total', `${total}px`);
+    const rootState = roots.get(root);
+    if (rootState) rootState.maxTotal = Math.max(rootState.maxTotal || 0, total);
     for (const c of state.positions) if (!all.includes(c)) { c.removeAttribute('data-g4a-position'); c.style.removeProperty('--g4a-position'); state.positions.delete(c); }
     all.forEach((c, i) => {
       if (!c.hasAttribute('data-g4a-position')) c.setAttribute('data-g4a-position', '');
@@ -258,8 +372,8 @@ async function startGenre4all() {
   // Observe native changes and virtualization; ignore our rendering and menu writes.
   const observer = new MutationObserver(records => {
     if (records.some(m => {
-      if (m.target.closest?.('genre4all-column,[data-g4a-menu-item],.g4a-genre-dialog,.g4a-preferences')) return false;
-      return m.type !== 'childList' || [...m.addedNodes, ...m.removedNodes].some(n => n.nodeType === 1 && !n.matches('genre4all-column,[data-g4a-menu-item]'));
+      if (m.target.closest?.('genre4all-column,[data-g4a-menu-item],[data-g4a-sep],.g4a-genre-dialog,.g4a-preferences')) return false;
+      return m.type !== 'childList' || [...m.addedNodes, ...m.removedNodes].some(n => n.nodeType === 1 && !n.matches('genre4all-column,[data-g4a-menu-item],[data-g4a-sep]'));
     })) schedule();
   });
   observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['aria-rowindex','data-uri','href','style','class'], characterData: true });
@@ -276,18 +390,36 @@ async function startGenre4all() {
         const rows = [...root.querySelectorAll(ROW)].filter(row => row.closest(ROOT) === root);
         if (!rows.length) continue;
         found.add(root);
-        if (!roots.has(root)) { roots.set(root, {}); resize?.observe(root); }
+        let rootState = roots.get(root);
+        if (!rootState) {
+          rootState = { events: new AbortController(), weights: null, maxTotal: 0 };
+          roots.set(root, rootState);
+          attachResize(root, rootState);
+          resize?.observe(root);
+        }
+        rootState.maxTotal = 0;
         root.classList.toggle('g4a-root', visible);
         if (visible) {
           for (const row of rows) {
             const header = !!row.querySelector('[role="columnheader"]');
             if (header || getUri(row)) layout(row, header, root);
           }
+          if (rootState.maxTotal > (root.clientWidth || rootState.maxTotal) + 2) {
+            if (!root.hasAttribute('data-g4a-overflow')) root.setAttribute('data-g4a-overflow', '');
+          } else if (root.hasAttribute('data-g4a-overflow')) {
+            root.removeAttribute('data-g4a-overflow');
+          }
           view?.sync(root, [{ type: 'genre', dataSelector: '.g4a-data' }]);
+        } else if (root.hasAttribute('data-g4a-overflow')) {
+          root.removeAttribute('data-g4a-overflow');
         }
       }
       for (const [row, state] of layouts) if (!row.isConnected || !found.has(state.root) || !row.contains(state.shell)) releaseRow(row);
-      for (const root of roots.keys()) if (!found.has(root)) { roots.delete(root); root.classList.remove('g4a-root'); resize?.unobserve(root); }
+      for (const [root, rootState] of roots) if (!found.has(root)) {
+        rootState.events.abort(); roots.delete(root);
+        root.classList.remove('g4a-root'); root.removeAttribute('data-g4a-overflow');
+        resize?.unobserve(root);
+      }
       view?.prune();
     } catch (error) { console.error('[Genre4all] Falha ao atualizar coluna.', error); }
     // Only synchronous writes from this pass are discarded. Async results remain observable.
@@ -298,7 +430,11 @@ async function startGenre4all() {
     closed = true; lifecycle.abort(); observer.disconnect(); resize?.disconnect(); unlisten?.();
     if (frame !== null) cancelAnimationFrame(frame);
     for (const row of [...layouts.keys()]) releaseRow(row);
-    for (const root of roots.keys()) root.classList.remove('g4a-root'); roots.clear();
+    for (const [root, rootState] of roots) {
+      rootState.events.abort();
+      root.classList.remove('g4a-root'); root.removeAttribute('data-g4a-overflow');
+    }
+    roots.clear();
     view?.close(); service?.close(); storage.close(); preferences?.remove();
     document.querySelectorAll('[data-g4a-menu-item]').forEach(n => n.remove()); style.remove();
     if (globalThis.Genre4all === api) delete globalThis.Genre4all;
