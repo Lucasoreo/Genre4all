@@ -345,7 +345,7 @@ async function startGenre4all() {
     const container = rowContainer(row); if (!container || getComputedStyle(container).display !== 'grid') return;
     let state = layouts.get(container);
     if (!state) {
-      const shell = node('genre4all-column', null, { 'data-kind': header ? 'header' : 'data', title: header ? 'Gênero — arraste para mover a coluna' : 'Genre4all' });
+      const shell = node('genre4all-column', null, { 'data-kind': header ? 'header' : 'data' });
       const label = header ? node('span', 'Gênero', { class: 'g4a-header-label standalone-ellipsis-one-line', 'data-encore-id': 'text' }) : null;
       const sep = header ? node('div', null, { role: 'separator', 'aria-orientation': 'horizontal', 'aria-hidden': 'true', 'data-skip-in-keyboard-nav': 'true', class: 'g4a-header-sep' }) : null;
       const host = header ? null : node('div', null, { class: 'g4a-data' });

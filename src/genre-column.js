@@ -79,24 +79,26 @@ const Genre4allColumn = (() => {
     .g4a-genre-primary:hover { filter:brightness(1.06); }
     .g4a-genre-state { color:var(--spice-subtext,#ddd); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:12px; }
     .g4a-genre-host :focus-visible { outline:2px solid #7850a0; outline-offset:-2px; box-shadow:inset 0 0 0 2px #fff; }
-    .g4a-genre-fan { position:fixed; z-index:9999; display:flex; flex-direction:column; align-items:flex-start; gap:5px; margin:0; padding:2px 0; list-style:none; pointer-events:auto; perspective:600px; }
+    .g4a-genre-fan { position:fixed; z-index:9999; display:flex; flex-direction:column; align-items:flex-start; gap:5px; margin:0; padding:2px 0; list-style:none; pointer-events:auto; }
     .g4a-genre-fan[data-direction="up"] { flex-direction:column-reverse; }
-    .g4a-genre-fan .g4a-genre-chip { flex:none; width:max-content; max-width:min(320px,calc(100vw - 24px)); box-shadow:0 8px 20px rgba(0,0,0,.48),0 2px 6px rgba(0,0,0,.32),inset 0 0 0 1px rgba(255,255,255,.14); transform-origin:top left; will-change:transform,opacity; animation:g4a-domino-down 300ms cubic-bezier(.22,1,.36,1) both; animation-delay:calc(var(--g4a-i,0) * 42ms); }
+    .g4a-genre-fan .g4a-genre-chip { flex:none; width:max-content; max-width:min(320px,calc(100vw - 24px)); box-shadow:0 8px 20px rgba(0,0,0,.48),0 2px 6px rgba(0,0,0,.32),inset 0 0 0 1px rgba(255,255,255,.14); transform-origin:top left; will-change:transform,opacity; animation:g4a-domino-down var(--g4a-dur,320ms) cubic-bezier(.42,0,.2,1) both; animation-delay:var(--g4a-delay,0ms); }
     .g4a-genre-fan[data-direction="up"] .g4a-genre-chip { transform-origin:bottom left; animation-name:g4a-domino-up; }
     .g4a-genre-fan.g4a-genre-fan-closing .g4a-genre-chip { animation:g4a-domino-out 130ms cubic-bezier(.4,0,1,1) both; }
     @keyframes g4a-domino-down {
-      0% { opacity:0; transform:translateY(-14px) scale(.92) rotateX(-12deg); }
-      60% { opacity:1; }
-      100% { opacity:1; transform:translateY(0) scale(1) rotateX(0deg); }
+      0% { opacity:0; transform:translate3d(-3.5px,-14px,0) scale(.94); }
+      38% { opacity:.6; transform:translate3d(-1.5px,-9.5px,0) scale(.96); }
+      78% { opacity:1; transform:translate3d(2.5px,0,0) scale(1); }
+      100% { opacity:1; transform:translate3d(0,0,0) scale(1); }
     }
     @keyframes g4a-domino-up {
-      0% { opacity:0; transform:translateY(14px) scale(.92) rotateX(12deg); }
-      60% { opacity:1; }
-      100% { opacity:1; transform:translateY(0) scale(1) rotateX(0deg); }
+      0% { opacity:0; transform:translate3d(-3.5px,14px,0) scale(.94); }
+      38% { opacity:.6; transform:translate3d(-1.5px,9.5px,0) scale(.96); }
+      78% { opacity:1; transform:translate3d(2.5px,0,0) scale(1); }
+      100% { opacity:1; transform:translate3d(0,0,0) scale(1); }
     }
     @keyframes g4a-domino-out {
-      0% { opacity:1; transform:translateY(0) scale(1); }
-      100% { opacity:0; transform:translateY(-8px) scale(.94); }
+      0% { opacity:1; transform:translate3d(0,0,0) scale(1); }
+      100% { opacity:0; transform:translate3d(-2px,-8px,0) scale(.94); }
     }
     @media (forced-colors:active) { .g4a-genre-chip { forced-color-adjust:none; background:Canvas; color:CanvasText !important; border:1px solid CanvasText; } .g4a-genre-host :focus-visible { outline:2px solid Highlight; box-shadow:none; } }
   `;
@@ -127,7 +129,6 @@ const Genre4allColumn = (() => {
       n.style.setProperty('--g4a-genre-color', bg);
       n.style.setProperty('--g4a-genre-ink', fg);
       if (fg === LIGHT_INK) n.dataset.contrast = 'light';
-      n.title = (label.kinds || [label.kind]).includes('style') ? 'Subgênero / estilo' : 'Gênero';
       return n;
     }
     function closeFan(immediate = false) {
@@ -161,10 +162,15 @@ const Genre4allColumn = (() => {
       if (activeFan?.record === r && activeFan.element.isConnected && !activeFan.closing) return;
       closeFan(true);
       const fan = node('ul', null, { class: 'g4a-genre-fan', role: 'list', 'aria-label': 'Gêneros e subgêneros associados' });
+      let delay = 0;
       extra.forEach((label, i) => {
         const item = chip(label, 'li');
         item.classList.add('g4a-genre-fan-chip');
+        const dur = Math.max(190, Math.round(320 * Math.pow(0.88, i)));
         item.style.setProperty('--g4a-i', String(i));
+        item.style.setProperty('--g4a-delay', `${delay}ms`);
+        item.style.setProperty('--g4a-dur', `${dur}ms`);
+        delay += Math.max(24, Math.round(68 * Math.pow(0.78, i)));
         fan.append(item);
       });
       const rect = anchor.getBoundingClientRect();
