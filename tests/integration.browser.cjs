@@ -10,11 +10,19 @@ const root = path.resolve(__dirname, '..');
 const sourceRoot = process.env.SORT_PLAY_SOURCE || path.join(__dirname,'fixtures/sort-play-2');
 const structureFile = fs.existsSync(path.join(sourceRoot,'sort-play.js')) ? path.join(sourceRoot,'sort-play.js') : path.join(sourceRoot,'tracklist-structure.js');
 if (!fs.existsSync(structureFile)) throw new Error('Sort Play compatibility sources are missing: '+sourceRoot);
-function nativeFunction(source,name) {
+function nativeFunction(rawSource,name) {
+  const source=rawSource.replace(/\r\n/g,'\n');
   const start=source.search(new RegExp('^  (?:async )?function '+name+'\\(','m'));
   if(start < 0) throw new Error('Missing original function: '+name);
   return source.slice(start,source.indexOf('\n  }',start)+6);
 }
+const browserExecutable = [
+  chromium.executablePath(),
+  'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+  'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+  'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+  '/usr/bin/chromium'
+].find(p => p && fs.existsSync(p));
 const html = `<!doctype html><html lang="pt-BR"><meta charset="utf-8"><style>
 body{background:#121212;color:#eee;font:14px sans-serif;margin:20px}main{width:100%}
 .main-trackList-trackList{width:100%;box-sizing:border-box}
@@ -25,13 +33,13 @@ body{background:#121212;color:#eee;font:14px sans-serif;margin:20px}main{width:1
 </style><body><main></main></body></html>`;
 (async()=>{
   const server=http.createServer((req,res)=>{res.setHeader('Content-Type','text/html');res.end(html);});server.listen(0,'127.0.0.1');await once(server,'listening');
-  const browser=await chromium.launch({headless:true,...(fs.existsSync(chromium.executablePath())?{}:{executablePath:'/usr/bin/chromium'}),args:['--no-sandbox']});
+  const browser=await chromium.launch({headless:true,...(browserExecutable?{executablePath:browserExecutable}:{}),args:['--no-sandbox']});
   try{
     const page=await browser.newPage({viewport:{width:1200,height:720}});page.setDefaultTimeout(6000);
     const errors=[];page.on('pageerror',e=>errors.push(e.message));page.on('console',m=>{if(m.type()==='error')errors.push(m.text());});
     await page.goto(`http://127.0.0.1:${server.address().port}`);
     await page.evaluate(()=>{
-      window.calls=[];window.pending=new Map();window.path='/playlist/fixture';window.sortPlayClicks=0;
+      window.calls=[];window.pending=new Map();window.path='/playlist/fixture';window.sortPlayClicks=0;window.dynamicGenre='electro house';
       window.Spicetify={Platform:{Transport:{},History:{location:{get pathname(){return window.path}},listen(fn){window.navigate=fn;return ()=>{window.navigate=null}}}}};
       function bytes(name,score=.9){const text=new TextEncoder().encode(name);const float=new Uint8Array(4);new DataView(float.buffer).setFloat32(0,score,true);return [10,text.length+7,10,text.length,...text,21,...float];}
       class MetadataService{
@@ -39,7 +47,8 @@ body{background:#121212;color:#eee;font:14px sans-serif;margin:20px}main{width:1
         async fetch(request){const uri=request.extensionQuery[0].entityUri[0];calls.push(uri);
           if(uri.endsWith('slow'))await new Promise(resolve=>pending.set(uri,resolve));
           if(uri.endsWith('error'))throw new Error('fixture failure');
-          const value=uri.endsWith('empty')?[]:[...bytes(uri.endsWith('new')?'techno':'electro house'),...bytes('happy'),...bytes('brazil'),...bytes('house',.01)];
+          const primary=uri.endsWith('new')?'techno':window.dynamicGenre;
+          const value=uri.endsWith('empty')?[]:[...bytes(primary),...bytes('tech house',.8),...bytes('happy'),...bytes('brazil'),...bytes('house',.01)];
           return {extension:[{extensionKind:6,entityExtension:[{entityUri:uri,extensionData:{value}}]}]};
         }
       }
@@ -68,12 +77,65 @@ body{background:#121212;color:#eee;font:14px sans-serif;margin:20px}main{width:1
     });
     await page.addScriptTag({path:path.join(root,'Genre4all.js')});
     await page.locator('.g4a-data[data-genre-state=success]').waitFor();
+    assert.equal(await page.evaluate(()=>Genre4all.version),'1.0.0');
     assert.equal(await page.locator('genre4all-column[data-kind=header]').count(),1);
     assert.equal(await page.locator('.g4a-genre-chip').filter({hasText:'happy'}).count(),0);
     assert.ok(await page.locator('.g4a-genre-chip').filter({hasText:'electro house'}).count());
     assert.equal(await page.evaluate(()=>row.offsetHeight),56);
     const ax=await (await page.context().newCDPSession(page)).send('Accessibility.getFullAXTree');
     assert.ok(ax.nodes.some(n=>n.role?.value==='columnheader'&&n.name?.value==='Gênero'),'ElementInternals exposes real accessibility role without light-DOM selector collisions');
+
+    // Drag-reordering intermediate columns (native columns like Álbum / Adicionada em / BPM as well as Gênero)
+    {
+      const albumHeader = page.locator('[role="columnheader"]', { hasText: 'Álbum' });
+      const addedHeader = page.locator('[role="columnheader"]', { hasText: 'Adicionada em' });
+      const genreHeader = page.locator('genre4all-column[data-kind="header"]');
+      const albumBoxBefore = await albumHeader.boundingBox();
+      const addedBoxBefore = await addedHeader.boundingBox();
+      assert.ok(albumBoxBefore.x < addedBoxBefore.x, 'Álbum starts to the left of Adicionada em');
+      // Drag 'Adicionada em' to the left of 'Álbum'
+      await page.mouse.move(addedBoxBefore.x + addedBoxBefore.width / 2, addedBoxBefore.y + addedBoxBefore.height / 2);
+      await page.mouse.down();
+      await page.mouse.move(albumBoxBefore.x + 10, albumBoxBefore.y + albumBoxBefore.height / 2, { steps: 5 });
+      await page.mouse.up();
+      const albumBoxAfter = await albumHeader.boundingBox();
+      const addedBoxAfter = await addedHeader.boundingBox();
+      assert.ok(addedBoxAfter.x < albumBoxAfter.x, 'Dragging native column Adicionada em moves it to the left of Álbum');
+      const rowOrderAfterNativeDrag = await page.evaluate(() => {
+        const cells = [...row.children].sort((a, b) => a.getBoundingClientRect().x - b.getBoundingClientRect().x);
+        return cells.map(c => c.textContent.trim());
+      });
+      assert.equal(rowOrderAfterNativeDrag[2], 'há 2 dias', 'Track row data cell for Adicionada em also moved to slot 2');
+      assert.equal(rowOrderAfterNativeDrag[3], 'Real Thing', 'Track row data cell for Álbum shifted to slot 3');
+
+      // Reset column order back to default for subsequent tests
+      await page.evaluate(() => { Genre4all.setColumnOrder([]); Genre4all.setOrderOffset(0); });
+    }
+
+    // Automatic reload when genre expires (simulated inactivity / visibilitychange)
+    {
+      const callsBefore = await page.evaluate(() => calls.length);
+      await page.evaluate(() => {
+        window.dynamicGenre = 'progressive house';
+        window.__realNow = Date.now;
+        Date.now = () => window.__realNow() + 3605000;
+        window.dispatchEvent(new Event('focus'));
+        document.dispatchEvent(new Event('visibilitychange'));
+      });
+      await page.waitForFunction(() => document.querySelector('.g4a-data .g4a-genre-primary')?.textContent?.includes('progressive house'));
+      const callsAfter = await page.evaluate(() => calls.length);
+      assert.ok(callsAfter > callsBefore, 'Expired genres automatically reload without opening settings');
+      await page.evaluate(() => {
+        Date.now = window.__realNow;
+        window.dynamicGenre = 'electro house';
+        Genre4all.openConfig();
+        document.querySelector('.g4a-preferences-actions button')?.click();
+      });
+      await page.locator('.g4a-data[data-genre-state=success]').waitFor();
+      await page.waitForFunction(() => document.querySelector('.g4a-data .g4a-genre-primary')?.textContent?.includes('electro house'));
+      await page.evaluate(() => { window.calls.length = 1; });
+    }
+
     await page.evaluate(()=>openMenu());
     const toggle=page.getByRole('menuitemcheckbox',{name:'Gênero',exact:true});await toggle.waitFor().catch(async e=>{console.log(await page.locator('[role=menu]').evaluate(n=>n.outerHTML),errors);throw e});assert.equal(await toggle.getAttribute('aria-checked'),'true');
     await toggle.click();await page.waitForFunction(()=>!document.querySelector('genre4all-column'));
@@ -131,6 +193,7 @@ body{background:#121212;color:#eee;font:14px sans-serif;margin:20px}main{width:1
       await page.setViewportSize({width:620,height:720});
       await page.evaluate(()=>Genre4all.sync());await page.waitForTimeout(100);
       const reached=await page.evaluate(()=>{grid.scrollLeft=grid.scrollWidth;const g=row.querySelector('genre4all-column').getBoundingClientRect(),r=grid.getBoundingClientRect();return {ok:g.right<=r.right+1&&g.left>=r.left-1,g:g.toJSON(),r:r.toJSON(),scroll:grid.scrollLeft,width:grid.scrollWidth,html:grid.outerHTML.slice(0,3000)}});assert.ok(reached.ok,JSON.stringify(reached));assert.ok(reached,'Genre4all remains reachable when extra columns overflow');
+      await page.setViewportSize({width:1200,height:720});
       await page.evaluate(()=>{nativeLayoutController.close();build();Genre4all.sync()});
     }
     await page.evaluate(()=>{build('spotify:track:slow');Genre4all.sync()});
@@ -153,6 +216,6 @@ body{background:#121212;color:#eee;font:14px sans-serif;margin:20px}main{width:1
     assert.equal(await page.evaluate(()=>Genre4all.visible),false,'preference survives reload');
     await page.evaluate(()=>Genre4all.close());assert.equal(await page.locator('[id^=genre4all],genre4all-column,.g4a-row').count(),0);
     assert.deepEqual(errors,[]);
-    console.log('Browser integration passed: standalone bundle, MetadataService wire format, native menu, refresh, original Sort Play extra columns, overflow, virtualization, statuses, nested rows, reload and cleanup. Mocked Spotify; not Spotify Desktop.');
+    console.log('Browser integration passed: standalone bundle, MetadataService wire format, native menu, column drag reordering, refresh, original Sort Play extra columns, overflow, virtualization, statuses, nested rows, reload and cleanup. Mocked Spotify; not Spotify Desktop.');
   }finally{await browser.close();server.closeAllConnections();await new Promise(r=>server.close(r))}
 })().catch(error=>{console.error(error);process.exitCode=1});

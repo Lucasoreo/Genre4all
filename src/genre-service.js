@@ -6,7 +6,9 @@ const Genre4allGenres = (() => {
   const HOUR = 3600000;
   const TTL = { spotify: HOUR };
   const CACHE_VERSION = 2;
-  const clone = value => JSON.parse(JSON.stringify(value));
+  const CACHE_LIMIT = 2000;
+  const clone = typeof structuredClone === 'function' ? value => structuredClone(value) : value => JSON.parse(JSON.stringify(value));
+  const identityCache = new WeakMap();
   const key = value => String(value || '').normalize('NFKC').trim().replace(/\s+/gu, ' ').toLocaleLowerCase('en-US');
   const matchText = value => key(value).replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
   const defaultConfig = () => ({ version: 1, order: [...PROVIDERS], enabled: Object.fromEntries(PROVIDERS.map(p => [p, true])), showGenres: true, showStyles: true, colors: true });
@@ -46,21 +48,30 @@ const Genre4allGenres = (() => {
     return [...seen.values()];
   }
   function identityFor(track) {
-    const t = track || {};
+    const t = track && typeof track === 'object' ? track : {};
     const metadata = t.metadata || {};
-    const title = String(t.name || t.title || metadata.title || '').trim();
+    const rawTitle = String(t.name || t.title || metadata.title || '').trim();
+    const rawUri = String(t.uri || '');
+    const rawIsrcField = String(t.external_ids?.isrc || t.isrc || t.track?.external_ids?.isrc || '');
+    if (track && typeof track === 'object') {
+      const hit = identityCache.get(track);
+      if (hit && hit.uri === rawUri && hit.title === rawTitle && hit.isrc === rawIsrcField) return hit.value;
+    }
+    const title = rawTitle;
     const artists = (t.artists?.length ? t.artists.map(a => typeof a === 'string' ? a : a.name) : [t.artistName || metadata.artist_name]).filter(Boolean).map(String);
-    const uri = String(t.uri || '');
+    const uri = rawUri;
     const durationValue = Number(t.duration_ms || t.durationMs || t.duration?.milliseconds || t.duration?.totalMilliseconds || (typeof t.duration === 'number' ? t.duration : null) || metadata.duration);
     const durationMs = Number.isFinite(durationValue) && durationValue > 0 ? durationValue : null;
     const album = String(t.album?.name || t.albumName || metadata.album_title || '').trim();
-    const rawIsrc = String(t.external_ids?.isrc || t.isrc || t.track?.external_ids?.isrc || '').toUpperCase();
+    const rawIsrc = rawIsrcField.toUpperCase();
     const isrc = /^[A-Z]{2}[A-Z0-9]{3}\d{7}$/u.test(rawIsrc) ? rawIsrc : '';
     const version = versionOf(title);
-    return {
+    const value = {
       uri, title, artists, durationMs, album, isrc, version,
       key: JSON.stringify([uri, key(title), artists.map(key), durationMs, key(album), isrc, version])
     };
+    if (track && typeof track === 'object') identityCache.set(track, { uri: rawUri, title: rawTitle, isrc: rawIsrcField, value });
+    return value;
   }
   // Do not strip version text for matching. Distinct remix names remain distinct titles.
   function versionOf(title) {
@@ -145,6 +156,7 @@ const Genre4allGenres = (() => {
         const result = tail.then(async () => {
           checkAbort(signal);
           if (now() < blockedUntil) throw new GenreError('rate_limited', 'RATE_LIMITED', blockedUntil);
+          if (nextAt > now() + spacing) nextAt = now() + spacing;
           await wait(Math.max(0, nextAt - now()), signal);
           checkAbort(signal);
           if (now() < blockedUntil) throw new GenreError('rate_limited', 'RATE_LIMITED', blockedUntil);
@@ -235,14 +247,15 @@ const Genre4allGenres = (() => {
     return out;
   }
   function createService(options = {}) {
-    const now = options.now || Date.now;
+    const now = options.now || (() => Date.now());
     const storage = options.storage || { async get() {}, async set() {}, async remove() {}, async clear() {}, async entries() { return []; } };
     const providerCache = new Map(), resolved = new Map(), inflight = new Map();
-    const limiters = Object.fromEntries(PROVIDERS.map(p => [p, createLimiter(25, { now, wait: options.wait, maxQueue: 128 })]));
+    const limiters = Object.fromEntries(PROVIDERS.map(p => [p, createLimiter(25, { now, wait: options.wait, maxQueue: 256 })]));
     let config = defaultConfig(), revision = 1, closed = false;
     let persistence = Promise.resolve(), cacheMutation = Promise.resolve(), expiryTimer = null;
     const changes = new Set();
     function write(space, id, value) { const operation = persistence.then(() => storage.set(space, id, clone(value))); persistence = operation.catch(() => {}); return operation; }
+    function remove(space, id) { const operation = persistence.then(() => storage.remove(space, id)); persistence = operation.catch(() => {}); return operation; }
     const ready = (async () => {
       config = configFrom(await storage.get('settings', 'genre-selector-v1'));
       for (const [id, entry] of await storage.entries('cache')) {
@@ -250,23 +263,28 @@ const Genre4allGenres = (() => {
           providerCache.set(id, entry);
         } else await storage.remove('cache', id);
       }
-      while (providerCache.size > 500) { const id = providerCache.keys().next().value; providerCache.delete(id); await storage.remove('cache', id); }
+      while (providerCache.size > CACHE_LIMIT) { const id = providerCache.keys().next().value; providerCache.delete(id); await storage.remove('cache', id); }
       armExpiry();
     })();
     function notify() { for (const fn of changes) fn(); }
     function armExpiry() {
       clearTimeout(expiryTimer);
       if (closed) return;
-      const expiry = Math.min(...[...providerCache.values()].map(v => v.expiresAt));
-      if (!Number.isFinite(expiry)) return;
+      const expiries = [...providerCache.values(), ...resolved.values()].map(v => v.expiresAt).filter(Number.isFinite);
+      if (!expiries.length) return;
+      const expiry = Math.min(...expiries);
       expiryTimer = setTimeout(async () => {
+        let expiredAny = false;
         try {
-          for (const map of [providerCache, resolved]) for (const [id, entry] of map) if (entry.expiresAt <= now()) {
-            map.delete(id); if (map !== resolved) await storage.remove('cache', id);
+          for (const [id, entry] of providerCache) if (entry.expiresAt <= now()) {
+            providerCache.delete(id); expiredAny = true; await remove('cache', id);
+          }
+          for (const [id, entry] of resolved) if (entry.expiresAt <= now()) {
+            resolved.delete(id); expiredAny = true;
           }
         } catch { /* Reads check expiry too. */ }
-        finally { armExpiry(); }
-      }, Math.max(1, expiry - now()));
+        finally { armExpiry(); if (expiredAny) notify(); }
+      }, Math.min(Math.max(1, expiry - now()), 2147483647));
       expiryTimer.unref?.();
     }
     function invalidate() {
@@ -284,14 +302,14 @@ const Genre4allGenres = (() => {
     async function cachePut(map, id, value, expiresAt) {
       const entry = { version: CACHE_VERSION, expiresAt, value: clone(value) };
       map.set(id, entry);
-      while (map.size > 500) { const oldest = map.keys().next().value; map.delete(oldest); await storage.remove('cache', oldest); }
-      await write('cache', id, entry);
+      while (map.size > CACHE_LIMIT) { const oldest = map.keys().next().value; map.delete(oldest); remove('cache', oldest); }
+      write('cache', id, entry);
       armExpiry();
     }
     async function cacheGet(map, id) {
       const item = map.get(id);
       if (!item) return null;
-      if (item.expiresAt <= now()) { map.delete(id); await storage.remove('cache', id); return null; }
+      if (item.expiresAt <= now()) { map.delete(id); remove('cache', id); return null; }
       return clone(item.value);
     }
     function failure(provider, error) {
@@ -350,7 +368,10 @@ const Genre4allGenres = (() => {
       if (closed || signal?.aborted) return { status: 'cancelled', labels: [], configVersion: currentRevision, attempts: [] };
       const id = `${identity.key}:${currentRevision}`;
       const cached = resolved.get(id);
-      if (cached && cached.expiresAt > now()) return clone(cached);
+      if (cached) {
+        if (cached.expiresAt > now()) return clone(cached);
+        resolved.delete(id);
+      }
       try {
         return clone(await subscribe(inflight, id, async sharedSignal => {
           const attempts = [], enabled = policy.order.filter(p => policy.enabled[p]);
@@ -373,8 +394,11 @@ const Genre4allGenres = (() => {
           final ||= { status: 'empty', reason: 'ALL_SOURCES_EMPTY', labels: [], selectedProvider: null };
           const expiresAt = Math.min(...attempts.map(r => r.expiresAt || now()));
           const result = { ...final, identityKey: identity.key, configVersion: currentRevision, attempts, expiresAt };
-          if (['success', 'empty'].includes(result.status) && expiresAt > now()) resolved.set(id, result);
-          while (resolved.size > 500) resolved.delete(resolved.keys().next().value);
+          if (['success', 'empty'].includes(result.status) && expiresAt > now()) {
+            resolved.set(id, result);
+            armExpiry();
+          }
+          while (resolved.size > CACHE_LIMIT) resolved.delete(resolved.keys().next().value);
           return result;
         }, signal));
       } catch (e) { return { ...failure(null, e), configVersion: currentRevision, attempts: [] }; }
@@ -421,9 +445,9 @@ const Genre4allGenres = (() => {
             const id = identityFor(t);
             return [id.key, ...(id.uri.startsWith('spotify:track:') ? [id.uri] : [])];
           }));
-          const remove = new Set();
-          for (const [id] of providerCache) if ([...targets].some(k => k && id.includes(k))) remove.add(id);
-          for (const id of remove) { providerCache.delete(id); await storage.remove('cache', id); }
+          const removeIds = new Set();
+          for (const [id] of providerCache) if ([...targets].some(k => k && id.includes(k))) removeIds.add(id);
+          for (const id of removeIds) { providerCache.delete(id); await storage.remove('cache', id); }
         });
         const results = [];
         for (const track of tracks) { if (opts.signal?.aborted) break; results.push(await resolve(track, opts)); }

@@ -220,6 +220,30 @@ for (const operation of ['clearCache', 'refresh', 'refreshContext']) test(`${ope
   unsubscribe(); service.close();
 });
 
+test('expired cache entries automatically notify listeners and resolve fresh data without manual refresh', async () => {
+  let current = 'Initial genre', calls = 0, notified = 0;
+  const service = api.createService({
+    storage: storage(),
+    providers: {
+      spotify: async () => {
+        calls++;
+        return { provider: 'spotify', status: 'success', labels: api.labelsFrom([current]), expiresAt: Date.now() + 40 };
+      }
+    }
+  });
+  const unsub = service.onChange(() => { notified++; });
+  const first = await service.resolve(TRACK);
+  assert.deepEqual(first.labels.map(l => l.label), ['Initial genre']);
+  assert.equal(calls, 1);
+  current = 'Reloaded after expiry';
+  await new Promise(r => setTimeout(r, 70));
+  assert.ok(notified >= 1, 'expiry timer notifies subscribers so visible cells reload automatically');
+  const second = await service.resolve(TRACK);
+  assert.deepEqual(second.labels.map(l => l.label), ['Reloaded after expiry']);
+  assert.equal(calls, 2);
+  unsub(); service.close();
+});
+
 test('Spotify capability tests and regular resolutions share the provider limiter and await catalog readiness', async () => {
   let time = 1000, prepared = false; const starts = [];
   const service = api.createService({

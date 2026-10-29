@@ -3,28 +3,33 @@ async function startGenre4all() {
   'use strict';
   const KEY = 'genre4all-visible-v1';
   const ORDER_KEY = 'genre4all-order-offset-v1';
+  const COLUMNS_KEY = 'genre4all-column-order-v1';
   const ROW = '.main-trackList-trackListHeaderRow,.main-trackList-trackListRow,[role="row"]';
   const ROOT = '.main-trackList-trackList,[data-testid="tracklist"],[role="grid"]';
   const CELL = '[role="columnheader"],[role="gridcell"],[class*="main-trackList-rowSection"]';
   const CONFIG_ICON = '<svg height="16" width="16" viewBox="0 0 16 16" fill="currentColor"><path d="M14 2v9.5a2.5 2.5 0 1 1-1.5-2.3V4.3L6 5.9v7.6a2.5 2.5 0 1 1-1.5-2.3V2.7L14 1v1zm-9.5 9.5a1 1 0 1 0 0 2 1 1 0 0 0 0-2zm8-2a1 1 0 1 0 0 2 1 1 0 0 0 0-2z"/></svg>';
-  const lifecycle = new AbortController(), roots = new Map(), layouts = new Map();
+  const lifecycle = new AbortController(), roots = new Map(), layouts = new Map(), rowCache = new WeakMap();
   let closed = false, frame = null, preferences = null, view = null, service = null, profileMenuItem = null;
-  let visible = true, orderOffset = 0, metadataClient = null, lastDiscovery = 0, unlisten = null;
+  let visible = true, orderOffset = 0, columnOrder = [], metadataClient = null, metadataTransport = null, MetadataServiceClass = null, lastDiscovery = 0, unlisten = null;
   try {
     visible = localStorage.getItem(KEY) !== 'false';
     orderOffset = Math.max(0, parseInt(localStorage.getItem(ORDER_KEY) || '0', 10) || 0);
+    const savedColumns = JSON.parse(localStorage.getItem(COLUMNS_KEY) || '[]');
+    if (Array.isArray(savedColumns)) columnOrder = savedColumns.filter(k => typeof k === 'string' && k);
   } catch { /* Session preference still works. */ }
   const context = () => globalThis.Spicetify?.Platform?.History?.location?.pathname || location.pathname;
   const api = {
-    version: '0.1.0-test',
+    version: '1.0.0',
     get visible() { return visible; },
     get orderOffset() { return orderOffset; },
+    get columnOrder() { return [...columnOrder]; },
     setVisible,
     setOrderOffset,
+    setColumnOrder,
     openConfig: showPreferences,
     sync: schedule,
     close,
-    diagnostics: () => ({ version: api.version, visible, orderOffset, context: context(), roots: roots.size, rows: layouts.size, service: service?.stats(), view: view?.stats(), metadataAvailable: !!metadataClient })
+    diagnostics: () => ({ version: api.version, visible, orderOffset, columnOrder: [...columnOrder], context: context(), roots: roots.size, rows: layouts.size, service: service?.stats(), view: view?.stats(), metadataAvailable: !!metadataClient })
   };
   // One instance even if Marketplace and a manual installation both load the file.
   globalThis.Genre4all?.close?.();
@@ -49,7 +54,8 @@ async function startGenre4all() {
     .g4a-root .g4a-row:not([data-g4a-measure]) > [data-g4a-position] { grid-column:var(--g4a-position) !important; min-width:0; }
     genre4all-column { display:flex; align-items:center; min-width:0; overflow:hidden; box-sizing:border-box; }
     genre4all-column[data-kind=header] { position:relative; justify-content:flex-start; justify-self:stretch; width:100%; height:100%; color:var(--text-subdued,var(--spice-subtext,#b3b3b3)); font-size:0.875rem; font-weight:400; line-height:normal; cursor:grab; user-select:none; }
-    genre4all-column[data-kind=header].g4a-header-dragging { cursor:grabbing; opacity:.75; z-index:3; }
+    .g4a-root:not([data-sp-native-layout]) [role="columnheader"][data-g4a-col-key] { cursor:grab; user-select:none; }
+    genre4all-column[data-kind=header].g4a-header-dragging,[role="columnheader"].g4a-header-dragging { cursor:grabbing !important; opacity:.75; z-index:3; }
     genre4all-column .g4a-genre-host { width:100%; }
     .g4a-header-label { min-width:0; margin-inline-end:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     [data-g4a-prev-sep] { display:flex; align-items:center; }
@@ -80,6 +86,7 @@ async function startGenre4all() {
   `;
   document.head.append(style);
 
+  const normalize = value => String(value || '').normalize('NFD').replace(/\p{M}/gu, '').toLowerCase();
   function node(tag, text, attrs = {}) {
     const n = document.createElement(tag); if (text != null) n.textContent = text;
     for (const [key, value] of Object.entries(attrs)) n.setAttribute(key, String(value));
@@ -89,6 +96,16 @@ async function startGenre4all() {
     if (n.style.getPropertyValue(name) !== value) n.style.setProperty(name, value);
   }
   function schedule() { if (!closed && frame === null) frame = requestAnimationFrame(sync); }
+  function invalidateLayouts(resetWeights = false) {
+    for (const rootState of roots.values()) {
+      rootState.measured = null;
+      rootState.midOrder = null;
+      rootState.headerForeign = null;
+      rootState.midOrderCount = -1;
+      if (resetWeights) rootState.weights = null;
+    }
+    for (const state of layouts.values()) state.appliedKey = null;
+  }
   function setVisible(value) {
     visible = !!value;
     try { localStorage.setItem(KEY, String(visible)); } catch { /* Keep the current session usable. */ }
@@ -97,20 +114,51 @@ async function startGenre4all() {
       for (const row of [...layouts.keys()]) releaseRow(row);
       for (const root of roots.keys()) { root.classList.remove('g4a-root'); root.removeAttribute('data-g4a-overflow'); }
     }
+    invalidateLayouts(false);
+    for (const rootState of roots.values()) { rootState.midOrder = null; rootState.headerForeign = null; rootState.midOrderCount = -1; }
     updateMenus(); schedule();
   }
   function setOrderOffset(value) {
     const next = Math.max(0, Math.floor(Number(value) || 0));
-    if (next === orderOffset) return;
     orderOffset = next;
     try { localStorage.setItem(ORDER_KEY, String(orderOffset)); } catch { /* Keep the current session usable. */ }
-    for (const rootState of roots.values()) rootState.weights = null;
+    if (columnOrder.length) {
+      const withoutGenre = columnOrder.filter(k => k !== '__genre__');
+      const idx = Math.max(0, Math.min(withoutGenre.length, withoutGenre.length - orderOffset));
+      withoutGenre.splice(idx, 0, '__genre__');
+      columnOrder = withoutGenre;
+      try { localStorage.setItem(COLUMNS_KEY, JSON.stringify(columnOrder)); } catch { /* Keep session usable. */ }
+    }
+    invalidateLayouts(true);
+    sync();
+  }
+  function setColumnOrder(order) {
+    if (!Array.isArray(order)) return;
+    columnOrder = [...new Set(order.filter(k => typeof k === 'string' && k.trim()).map(k => k.trim()))];
+    try { localStorage.setItem(COLUMNS_KEY, JSON.stringify(columnOrder)); } catch { /* Keep session usable. */ }
+    const genreIdx = columnOrder.indexOf('__genre__');
+    if (genreIdx >= 0) {
+      orderOffset = Math.max(0, (columnOrder.length - 1) - genreIdx);
+      try { localStorage.setItem(ORDER_KEY, String(orderOffset)); } catch { /* Keep session usable. */ }
+    }
+    invalidateLayouts(false);
+    for (const rootState of roots.values()) { rootState.midOrder = null; rootState.headerForeign = null; rootState.midOrderCount = -1; }
     sync();
   }
 
   // Adapted from Sort-Play-2 getWebpackService/getMetadataClient; scoped to this extension.
+  function resolveTransport() {
+    const platform = globalThis.Spicetify?.Platform;
+    return platform?.ProductStateAPI?.productStateApi?.transport || platform?.Transport || platform?.PlayerAPI?._queue?._client?._transport || null;
+  }
   function getMetadataClient() {
-    if (metadataClient) return metadataClient;
+    const currentTransport = resolveTransport();
+    if (metadataClient && (!currentTransport || metadataTransport === currentTransport)) return metadataClient;
+    if (MetadataServiceClass && currentTransport) {
+      metadataTransport = currentTransport;
+      metadataClient = new MetadataServiceClass(currentTransport);
+      return metadataClient;
+    }
     if (Date.now() - lastDiscovery < 3000) return null;
     lastDiscovery = Date.now();
     const chunk = window.rspackChunk ?? window.webpackChunkclient_web ?? window.rspackChunkclient_web;
@@ -128,42 +176,74 @@ async function startGenre4all() {
         }
         const MetadataService = candidates.find(c => c?.SERVICE_ID === 'spotify.mdata_esperanto.proto.MetadataService');
         if (!MetadataService) continue;
-        const platform = Spicetify.Platform;
-        const transport = platform.ProductStateAPI?.productStateApi?.transport || platform.Transport || platform.PlayerAPI?._queue?._client?._transport;
-        if (!transport) return null;
-        metadataClient = new MetadataService(transport);
+        MetadataServiceClass = MetadataService;
+        if (!currentTransport) return null;
+        metadataTransport = currentTransport;
+        metadataClient = new MetadataService(currentTransport);
         return metadataClient;
       }
     } catch (error) { console.warn('[Genre4all] MetadataService indisponível.', error); }
     return null;
   }
-  function getUri(row) {
+
+  const validUri = uri => typeof uri === 'string' && /^spotify:(track|local):/.test(uri);
+  function computeUri(row, rowProps, firstProps, fiber, dataUri, fallbackHref) {
     const seen = new Set();
-    const valid = uri => typeof uri === 'string' && /^spotify:(track|local):/.test(uri);
     function find(value, depth = 10) {
       if (!value || typeof value !== 'object' || !depth || seen.has(value) || seen.size > 300) return null;
       seen.add(value);
-      if (valid(value.uri)) return value.uri;
+      if (validUri(value.uri)) return value.uri;
       for (const key of Object.keys(value)) if (['children','props','value','item','track','data','content','node','spec','_path'].includes(key) || /^\d+$/.test(key)) {
         const uri = find(value[key], depth - 1); if (uri) return uri;
       }
       return null;
     }
     // React identity wins over a stale DOM link in a recycled row.
-    for (const element of [row, row.firstElementChild].filter(Boolean)) {
-      const props = Object.keys(element).find(k => k.startsWith('__reactProps$'));
-      const uri = find(element[props]); if (uri) return uri;
-      const fiberKey = Object.keys(element).find(k => k.startsWith('__reactFiber$'));
-      for (let f = element[fiberKey], i = 0; f && i < 8; f = f.return, i++) {
+    for (const props of [rowProps, firstProps]) {
+      const uri = find(props); if (uri) return uri;
+    }
+    const first = row.firstElementChild;
+    const firstFiberKey = first ? (first.__g4aFiberKey ?? (first.__g4aFiberKey = Object.keys(first).find(k => k.startsWith('__reactFiber$')) || '')) : '';
+    for (const startFiber of [fiber, firstFiberKey ? first[firstFiberKey] : null].filter(Boolean)) {
+      for (let f = startFiber, i = 0; f && i < 8; f = f.return, i++) {
         const uri = find(f.pendingProps) || find(f.memoizedProps); if (uri) return uri;
       }
     }
-    if (valid(row.dataset.uri)) return row.dataset.uri;
-    const href = row.querySelector('a[href*="/track/"]')?.getAttribute('href');
+    if (validUri(dataUri)) return dataUri;
+    const href = fallbackHref || row.querySelector('a[href*="/track/"]')?.getAttribute('href');
     const id = href?.match(/\/track\/([A-Za-z0-9]{22})(?:[/?#]|$)/)?.[1];
     return id ? `spotify:track:${id}` : null;
   }
-  function track(row) { return Genre4allColumn.trackFromRow(row, getUri(row)); }
+  function getRowMeta(row) {
+    const propsKey = row.__g4aPropsKey ?? (row.__g4aPropsKey = Object.keys(row).find(k => k.startsWith('__reactProps$')) || '');
+    const fiberKey = row.__g4aFiberKey ?? (row.__g4aFiberKey = Object.keys(row).find(k => k.startsWith('__reactFiber$')) || '');
+    const first = row.firstElementChild;
+    const firstPropsKey = first ? (first.__g4aPropsKey ?? (first.__g4aPropsKey = Object.keys(first).find(k => k.startsWith('__reactProps$')) || '')) : '';
+    const rowProps = propsKey ? row[propsKey] : null;
+    const firstProps = first && firstPropsKey ? first[firstPropsKey] : null;
+    const fiber = fiberKey ? row[fiberKey] : null;
+    const fiberProps = fiber?.memoizedProps || fiber?.pendingProps || null;
+    const rowIndex = row.getAttribute('aria-rowindex') || '';
+    const dataUri = row.dataset.uri || '';
+    const itemUri = rowProps?.item?.uri || rowProps?.children?.props?.item?.uri || firstProps?.item?.uri || fiberProps?.item?.uri || '';
+    const href = !rowProps && !firstProps && !fiberProps && !dataUri ? (row.querySelector('a[href*="/track/"]')?.getAttribute('href') || '') : '';
+    const cached = rowCache.get(row);
+    if (cached && cached.rowProps === rowProps && cached.firstProps === firstProps && cached.fiberProps === fiberProps
+      && cached.rowIndex === rowIndex && cached.dataUri === dataUri && cached.itemUri === itemUri && cached.href === href) {
+      return cached;
+    }
+    const uri = computeUri(row, rowProps, firstProps, fiber, dataUri, href);
+    const entry = { rowProps, firstProps, fiberProps, rowIndex, dataUri, itemUri, href, uri, track: null };
+    rowCache.set(row, entry);
+    return entry;
+  }
+  function getUri(row) { return getRowMeta(row).uri; }
+  function track(row) {
+    const meta = getRowMeta(row);
+    if (!meta.uri) return { uri: null };
+    if (!meta.track || meta.track.uri !== meta.uri) meta.track = Genre4allColumn.trackFromRow(row, meta.uri);
+    return meta.track;
+  }
 
   function makeStorage() {
     const memory = new Map();
@@ -210,18 +290,67 @@ async function startGenre4all() {
     document.body.append(d); preferences = d; d.showModal(); done.focus();
   }
 
-  function cells(container) { return [...container.children].filter(c => c.matches(CELL) && getComputedStyle(c).display !== 'none'); }
+  function cells(container, checkComputed = false) {
+    return [...container.children].filter(c => {
+      if (!c.matches(CELL) || c.style.display === 'none' || c.hidden) return false;
+      return !checkComputed || getComputedStyle(c).display !== 'none';
+    });
+  }
+  function visualCells(container) {
+    return [...container.children]
+      .filter(c => (c.matches(CELL) || c.tagName === 'GENRE4ALL-COLUMN') && c.style.display !== 'none' && !c.hidden && getComputedStyle(c).display !== 'none')
+      .sort((a, b) => (parseInt(a.style.getPropertyValue('--g4a-position'), 10) || 0) - (parseInt(b.style.getPropertyValue('--g4a-position'), 10) || 0));
+  }
   function rowContainer(row) {
     if (cells(row).length) return row;
     if (row.children.length === 1 && cells(row.firstElementChild).length) return row.firstElementChild;
     return null;
   }
+  function colKeyForHeader(cell, m) {
+    if (cell.tagName === 'GENRE4ALL-COLUMN') return '__genre__';
+    const typeAttr = cell.getAttribute('data-column-type') || cell.querySelector('[data-column-type]')?.getAttribute('data-column-type');
+    if (typeAttr) return normalize(typeAttr).trim();
+    const textEl = cell.querySelector('[data-encore-id="text"], span');
+    const raw = normalize((textEl ? textEl.textContent : cell.textContent) || cell.getAttribute('aria-label') || '').trim();
+    return raw || `col-${m}`;
+  }
+  function buildMidOrder(foreignHeader, minInsert, endIndex) {
+    const midCount = Math.max(0, endIndex - minInsert);
+    const seenKeys = new Set();
+    const items = [];
+    for (let m = 0; m < midCount; m++) {
+      const cell = foreignHeader ? foreignHeader[minInsert + m] : null;
+      let k = cell ? colKeyForHeader(cell, m) : `col-${m}`;
+      if (seenKeys.has(k)) k = `${k}#${m}`;
+      seenKeys.add(k);
+      items.push({ type: 'native', index: minInsert + m, key: k });
+    }
+    const genreDefaultIdx = Math.max(0, Math.min(midCount, midCount - orderOffset));
+    items.splice(genreDefaultIdx, 0, { type: 'genre', index: -1, key: '__genre__' });
+    if (columnOrder.length >= 2) {
+      const rank = new Map(columnOrder.map((k, idx) => [k, idx]));
+      const matchedSlots = [];
+      const matchedItems = [];
+      items.forEach((item, idx) => {
+        if (rank.has(item.key)) {
+          matchedSlots.push(idx);
+          matchedItems.push(item);
+        }
+      });
+      if (matchedItems.length >= 2) {
+        matchedItems.sort((a, b) => rank.get(a.key) - rank.get(b.key));
+        matchedSlots.forEach((slotIdx, i) => { items[slotIdx] = matchedItems[i]; });
+      }
+    }
+    return items;
+  }
+
   function attachResize(root, rootState) {
     const resolvePair = sep => {
       const headerCell = sep.closest('[role="columnheader"],genre4all-column[data-kind="header"]');
       const container = headerCell?.parentElement;
       if (!container || !layouts.has(container)) return null;
-      const all = [...container.children].filter(c => (c.matches(CELL) || c.tagName === 'GENRE4ALL-COLUMN') && getComputedStyle(c).display !== 'none');
+      const all = visualCells(container);
       const end = all.find(c => c.matches('.main-trackList-rowSectionEnd,[data-sp-layout-position="native:end"]')) || all[all.length - 1];
       const endIndex = all.indexOf(end);
       const flexStart = endIndex > 2 ? 1 : 0;
@@ -239,17 +368,23 @@ async function startGenre4all() {
       next[b] = startWidths[b] - delta;
       return next;
     };
-    root.addEventListener('mousedown', e => {
-      if (!visible || root.hasAttribute('data-sp-native-layout') || e.button !== 0) return;
+    const startHeaderInteraction = e => {
+      if (!visible || root.hasAttribute('data-sp-native-layout') || e.button !== 0 || rootState.activeDrag) return;
       const sep = e.target.closest?.('[role="separator"]:not(.sp-layout-resize)');
       if (sep && root.contains(sep)) {
         const pair = resolvePair(sep); if (!pair) return;
         e.preventDefault(); e.stopImmediatePropagation();
+        rootState.activeDrag = 'resize';
         const startWidths = pair.flexCells.map(c => c.getBoundingClientRect().width || 120);
         const startX = e.clientX;
         document.documentElement.classList.add('g4a-resizing');
-        const move = ev => { rootState.weights = adjust(startWidths, pair.k, ev.clientX - startX); schedule(); };
+        const move = ev => {
+          rootState.weights = adjust(startWidths, pair.k, ev.clientX - startX);
+          rootState.measured = null;
+          schedule();
+        };
         const up = () => {
+          rootState.activeDrag = null;
           document.documentElement.classList.remove('g4a-resizing');
           window.removeEventListener('mousemove', move, true);
           window.removeEventListener('mouseup', up, true);
@@ -258,69 +393,88 @@ async function startGenre4all() {
         window.addEventListener('mouseup', up, true);
         return;
       }
-      const genreHeader = e.target.closest?.('genre4all-column[data-kind="header"]');
-      if (genreHeader && root.contains(genreHeader)) {
-        const container = genreHeader.parentElement;
-        if (!container || !layouts.has(container)) return;
-        const startX = e.clientX;
-        let dragging = false;
-        const move = ev => {
-          if (!dragging && Math.abs(ev.clientX - startX) > 5) {
-            dragging = true;
-            genreHeader.classList.add('g4a-header-dragging');
-            document.documentElement.classList.add('g4a-reordering');
-          }
-          if (!dragging) return;
-          const all = [...container.children].filter(c => (c.matches(CELL) || c.tagName === 'GENRE4ALL-COLUMN') && getComputedStyle(c).display !== 'none');
-          const end = all.find(c => c.matches('.main-trackList-rowSectionEnd,[data-sp-layout-position="native:end"]')) || all[all.length - 1];
-          const allEnd = all.indexOf(end);
-          const minSlot = Math.min(2, Math.max(0, allEnd - 1));
-          let bestSlot = all.indexOf(genreHeader), bestDist = Infinity;
-          for (let s = minSlot; s < allEnd; s++) {
-            const rect = all[s].getBoundingClientRect();
-            const dist = Math.abs(ev.clientX - (rect.left + rect.right) / 2);
-            if (dist < bestDist) { bestDist = dist; bestSlot = s; }
-          }
-          const nextOffset = Math.max(0, (allEnd - 1) - bestSlot);
-          if (nextOffset !== orderOffset) setOrderOffset(nextOffset);
-        };
-        const up = () => {
-          genreHeader.classList.remove('g4a-header-dragging');
-          document.documentElement.classList.remove('g4a-reordering');
-          window.removeEventListener('mousemove', move, true);
-          window.removeEventListener('mouseup', up, true);
-        };
-        window.addEventListener('mousemove', move, true);
-        window.addEventListener('mouseup', up, true);
-      }
-    }, { capture: true, signal: rootState.events.signal });
-    root.addEventListener('pointerdown', e => {
-      if (!visible || root.hasAttribute('data-sp-native-layout') || e.button !== 0) return;
-      if (e.target.closest?.('[role="separator"],genre4all-column')) return;
-      const draggable = e.target.closest?.('[data-tracklist-draggable-column],[role="columnheader"]');
-      if (!draggable || !root.contains(draggable)) return;
-      const headerCell = draggable.closest('[role="columnheader"]');
-      const container = headerCell?.parentElement;
-      const genreHeader = container?.querySelector('genre4all-column[data-kind="header"]');
-      if (!genreHeader) return;
-      const all = [...container.children].filter(c => (c.matches(CELL) || c.tagName === 'GENRE4ALL-COLUMN') && getComputedStyle(c).display !== 'none');
+      const headerCell = e.target.closest?.('genre4all-column[data-kind="header"],[role="columnheader"]');
+      if (!headerCell || !root.contains(headerCell)) return;
+      const container = headerCell.parentElement;
+      if (!container || !layouts.has(container)) return;
+      const all = visualCells(container);
       const end = all.find(c => c.matches('.main-trackList-rowSectionEnd,[data-sp-layout-position="native:end"]')) || all[all.length - 1];
       const allEnd = all.indexOf(end);
-      const nativeIdx = all.indexOf(headerCell), genreIdx = all.indexOf(genreHeader);
-      if (nativeIdx < 2 || nativeIdx >= allEnd || genreIdx < 0) return;
-      const up = ev => {
-        window.removeEventListener('pointerup', up, true);
-        window.removeEventListener('pointercancel', up, true);
-        const gRect = genreHeader.getBoundingClientRect();
-        if (nativeIdx < genreIdx && ev.clientX > gRect.left + gRect.width * 0.4) {
-          setOrderOffset(Math.min(allEnd - 3, orderOffset + 1));
-        } else if (nativeIdx > genreIdx && ev.clientX < gRect.right - gRect.width * 0.4) {
-          setOrderOffset(Math.max(0, orderOffset - 1));
+      const minSlot = Math.min(2, Math.max(0, allEnd - 1));
+      const initialSlot = all.indexOf(headerCell);
+      if (initialSlot < minSlot || initialSlot >= allEnd) return;
+      rootState.activeDrag = 'reorder';
+      const startX = e.clientX;
+      let dragging = false;
+      const clearNativeTransforms = () => {
+        for (const w of container.querySelectorAll('[data-tracklist-draggable-column],[class*="columnHeaderMotionWrapper"]')) {
+          if (w.style.transform) w.style.transform = '';
         }
       };
-      window.addEventListener('pointerup', up, true);
-      window.addEventListener('pointercancel', up, true);
-    }, { capture: true, signal: rootState.events.signal });
+      const move = ev => {
+        if (!dragging && Math.abs(ev.clientX - startX) > 5) {
+          dragging = true;
+          headerCell.classList.add('g4a-header-dragging');
+          document.documentElement.classList.add('g4a-reordering');
+          clearNativeTransforms();
+        }
+        if (!dragging) return;
+        clearNativeTransforms();
+        const curAll = visualCells(container);
+        const curEnd = curAll.find(c => c.matches('.main-trackList-rowSectionEnd,[data-sp-layout-position="native:end"]')) || curAll[curAll.length - 1];
+        const curAllEnd = curAll.indexOf(curEnd);
+        const curMinSlot = Math.min(2, Math.max(0, curAllEnd - 1));
+        const fromSlot = curAll.indexOf(headerCell);
+        if (fromSlot < curMinSlot || fromSlot >= curAllEnd) return;
+        let bestSlot = fromSlot, bestDist = Infinity;
+        for (let s = curMinSlot; s < curAllEnd; s++) {
+          const rect = curAll[s].getBoundingClientRect();
+          const dist = Math.abs(ev.clientX - (rect.left + rect.right) / 2);
+          if (dist < bestDist) { bestDist = dist; bestSlot = s; }
+        }
+        if (bestSlot !== fromSlot) {
+          const midCells = curAll.slice(curMinSlot, curAllEnd);
+          const keys = midCells.map((c, idx) => c.dataset.g4aColKey || colKeyForHeader(c, idx));
+          const fromIdx = fromSlot - curMinSlot;
+          const toIdx = bestSlot - curMinSlot;
+          const [movedKey] = keys.splice(fromIdx, 1);
+          keys.splice(toIdx, 0, movedKey);
+          if (Array.isArray(rootState.weights) && rootState.weights.length === curAllEnd - (curAllEnd > 2 ? 1 : 0)) {
+            const weightOffset = curMinSlot - (curAllEnd > 2 ? 1 : 0);
+            const nextWeights = [...rootState.weights];
+            const [movedW] = nextWeights.splice(weightOffset + fromIdx, 1);
+            nextWeights.splice(weightOffset + toIdx, 0, movedW);
+            rootState.weights = nextWeights;
+          }
+          const preserved = columnOrder.filter(k => !keys.includes(k));
+          columnOrder = [...keys, ...preserved];
+          try { localStorage.setItem(COLUMNS_KEY, JSON.stringify(columnOrder)); } catch { /* Keep session usable. */ }
+          const genreIdx = keys.indexOf('__genre__');
+          if (genreIdx >= 0) {
+            orderOffset = Math.max(0, (keys.length - 1) - genreIdx);
+            try { localStorage.setItem(ORDER_KEY, String(orderOffset)); } catch { /* Keep session usable. */ }
+          }
+          invalidateLayouts(false);
+          sync();
+        }
+      };
+      const up = () => {
+        rootState.activeDrag = null;
+        window.removeEventListener('mousemove', move, true);
+        window.removeEventListener('mouseup', up, true);
+        if (dragging) {
+          headerCell.classList.remove('g4a-header-dragging');
+          document.documentElement.classList.remove('g4a-reordering');
+          clearNativeTransforms();
+          const suppressClick = clickEv => { clickEv.preventDefault(); clickEv.stopImmediatePropagation(); };
+          headerCell.addEventListener('click', suppressClick, true);
+          setTimeout(() => headerCell.removeEventListener('click', suppressClick, true), 0);
+        }
+      };
+      window.addEventListener('mousemove', move, true);
+      window.addEventListener('mouseup', up, true);
+    };
+    root.addEventListener('mousedown', startHeaderInteraction, { capture: true, signal: rootState.events.signal });
     root.addEventListener('keydown', e => {
       if (!visible || root.hasAttribute('data-sp-native-layout') || !['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(e.key)) return;
       const sep = e.target.closest?.('[role="separator"]:not(.sp-layout-resize)');
@@ -329,6 +483,7 @@ async function startGenre4all() {
       e.preventDefault(); e.stopImmediatePropagation();
       const startWidths = pair.flexCells.map(c => c.getBoundingClientRect().width || 120);
       rootState.weights = adjust(startWidths, pair.k, e.key === 'ArrowRight' || e.key === 'ArrowUp' ? 10 : -10);
+      rootState.measured = null;
       schedule();
     }, { capture: true, signal: rootState.events.signal });
   }
@@ -339,28 +494,114 @@ async function startGenre4all() {
     layouts.delete(row);
     row.classList.remove('g4a-row'); row.removeAttribute('data-g4a-measure');
     row.style.removeProperty('--g4a-tracks'); row.style.removeProperty('--g4a-total');
-    for (const c of state.positions) { c.removeAttribute('data-g4a-position'); c.style.removeProperty('--g4a-position'); }
+    for (const c of state.positions) {
+      c.removeAttribute('data-g4a-position');
+      c.removeAttribute('data-g4a-col-key');
+      c.style.removeProperty('--g4a-position');
+    }
   }
-  function layout(row, header, root) {
-    const container = rowContainer(row); if (!container || getComputedStyle(container).display !== 'grid') return;
+  function measureGrid(container, foreign, endIndex, minInsert, midOrder, isNativeLayout, rootState) {
+    container.setAttribute('data-g4a-measure', '');
+    const computed = getComputedStyle(container);
+    const gap = parseFloat(computed.columnGap) || 0;
+    const padding = (parseFloat(computed.paddingLeft) || 0) + (parseFloat(computed.paddingRight) || 0);
+    const raw = computed.gridTemplateColumns.replace(/\[[^\]]*\]/g, '').trim().split(/\s+/).map(parseFloat);
+    const baseWidths = raw.length === foreign.length && raw.every(Number.isFinite) ? raw : foreign.map(c => c.getBoundingClientRect().width || 120);
+    container.removeAttribute('data-g4a-measure');
+    const width = 176;
+    let widths;
+    if (!isNativeLayout) {
+      const flexStart = endIndex > 1 ? 1 : 0;
+      const flexCount = Math.max(1, endIndex - flexStart);
+      const nativeFlexWidths = baseWidths.slice(flexStart, flexStart + flexCount);
+      const flexSum = nativeFlexWidths.reduce((a, b) => a + b, 0);
+      const avail = Math.max(0, flexSum - gap);
+      const baseGenre = Math.min(176, Math.max(110, flexSum / (flexCount + 1)));
+      const orderedMidWidths = midOrder.map(item => item.type === 'genre' ? baseGenre : (baseWidths[item.index] ?? 120));
+      const leadingFlex = minInsert > flexStart ? baseWidths.slice(flexStart, minInsert) : [];
+      const defaultWeights = [...leadingFlex, ...orderedMidWidths];
+      const weights = rootState?.weights?.length === defaultWeights.length ? rootState.weights : defaultWeights;
+      const weightSum = weights.reduce((a, b) => a + b, 0) || 1;
+      const mins = weights.map((_, k) => k === 0 ? 120 : 80);
+      const minSum = mins.reduce((a, b) => a + b, 0);
+      let alloc = weights.map((w, k) => Math.max(mins[k], avail * (w / weightSum)));
+      const allocSum = alloc.reduce((a, b) => a + b, 0);
+      if (avail > minSum && allocSum > avail) {
+        const extra = alloc.reduce((s, v, k) => s + Math.max(0, v - mins[k]), 0);
+        if (extra > 0) alloc = alloc.map((v, k) => v > mins[k] ? mins[k] + (v - mins[k]) * ((extra - (allocSum - avail)) / extra) : v);
+      }
+      widths = [
+        ...baseWidths.slice(0, flexStart),
+        ...alloc,
+        ...baseWidths.slice(endIndex)
+      ];
+    } else {
+      widths = [...baseWidths];
+      widths.splice(endIndex, 0, width);
+    }
+    const total = Math.ceil(widths.reduce((a, b) => a + b, 0) + gap * Math.max(0, widths.length - 1) + padding);
+    const template = widths.map(w => `${Math.max(0, w)}px`).join(' ');
+    return { total, template };
+  }
+  function layout(row, header, root, rootState) {
+    const container = rowContainer(row); if (!container) return;
     let state = layouts.get(container);
     if (!state) {
+      if (getComputedStyle(container).display !== 'grid') return;
       const shell = node('genre4all-column', null, { 'data-kind': header ? 'header' : 'data' });
       const label = header ? node('span', 'Gênero', { class: 'g4a-header-label standalone-ellipsis-one-line', 'data-encore-id': 'text' }) : null;
       const sep = header ? node('div', null, { role: 'separator', 'aria-orientation': 'horizontal', 'aria-hidden': 'true', 'data-skip-in-keyboard-nav': 'true', class: 'g4a-header-sep' }) : null;
       const host = header ? null : node('div', null, { class: 'g4a-data' });
       if (header) shell.append(label, sep); else shell.append(host);
-      state = { shell, label, sep, host, prevSep: null, prevHost: null, positions: new Set(), root };
+      state = { shell, label, sep, host, prevSep: null, prevHost: null, positions: new Set(), root, appliedKey: null };
       layouts.set(container, state);
     }
-    const foreign = cells(container); if (!foreign.length) return;
+    const isNativeLayout = root.hasAttribute('data-sp-native-layout');
+    const foreign = cells(container, header || isNativeLayout || !rootState.measured);
+    if (!foreign.length) return;
     const end = foreign.find(c => c.matches('.main-trackList-rowSectionEnd,[data-sp-layout-position="native:end"]')) || foreign[foreign.length - 1];
     const endIndex = foreign.indexOf(end);
     const minInsert = Math.min(2, endIndex);
-    const insert = root.hasAttribute('data-sp-native-layout') ? endIndex : Math.max(minInsert, Math.min(endIndex, endIndex - orderOffset));
-    const refNode = foreign[insert] || end;
-    if (state.shell.parentElement !== container || state.shell.nextElementSibling !== refNode) container.insertBefore(state.shell, refNode);
+    let midOrder;
+    if (isNativeLayout) {
+      midOrder = [];
+      for (let i = minInsert; i < endIndex; i++) midOrder.push({ type: 'native', index: i, key: `col-${i}` });
+      midOrder.push({ type: 'genre', index: -1, key: '__genre__' });
+    } else if (header || !rootState.midOrder || rootState.midOrderCount !== endIndex - minInsert) {
+      midOrder = buildMidOrder(header ? foreign : rootState.headerForeign, minInsert, endIndex);
+      if (header) {
+        rootState.headerForeign = foreign;
+        rootState.midOrder = midOrder;
+        rootState.midOrderCount = endIndex - minInsert;
+      }
+    } else {
+      midOrder = rootState.midOrder;
+    }
+    const orderSignature = midOrder.map(item => `${item.type}:${item.index}:${item.key}`).join('|');
+    const rootWidth = root.clientWidth || 0;
+    const inlineGrid = container.style.gridTemplateColumns || '';
+    const spTracks = root.style.getPropertyValue('--sp-layout-tracks') || container.style.getPropertyValue('--sp-layout-tracks') || '';
+    const weightsKey = rootState.weights ? rootState.weights.map(w => Math.round(w)).join(',') : '';
+    const measureKey = `${isNativeLayout}|${rootWidth}|${foreign.length}|${endIndex}|${inlineGrid}|${spTracks}|${weightsKey}|${orderSignature}`;
+
+    if (!header && state.appliedKey === measureKey && state.shell.parentElement === container && rootState.measured?.key === measureKey) {
+      rootState.maxTotal = Math.max(rootState.maxTotal || 0, rootState.measured.total);
+      return;
+    }
+
+    const midCells = midOrder.map(item => item.type === 'genre' ? state.shell : foreign[item.index]).filter(Boolean);
+    const all = [...foreign.slice(0, minInsert), ...midCells, ...foreign.slice(endIndex)];
+    const genreVisualIdx = all.indexOf(state.shell);
+    const insertDomRef = foreign[Math.min(endIndex, Math.max(minInsert, genreVisualIdx))] || end;
+    if (state.shell.parentElement !== container || state.shell.nextElementSibling !== insertDomRef) {
+      container.insertBefore(state.shell, insertDomRef);
+    }
+
     if (header) {
+      midOrder.forEach(item => {
+        const targetCell = item.type === 'genre' ? state.shell : foreign[item.index];
+        if (targetCell && targetCell.dataset.g4aColKey !== item.key) targetCell.dataset.g4aColKey = item.key;
+      });
       const sampleText = container.querySelector('[role="columnheader"] [data-encore-id="text"]');
       if (sampleText && state.label) {
         const cls = `${sampleText.className} g4a-header-label standalone-ellipsis-one-line`.trim();
@@ -369,7 +610,7 @@ async function startGenre4all() {
       const sampleSep = container.querySelector('[role="columnheader"] [role="separator"]:not(.sp-layout-resize):not([data-g4a-sep])');
       const sepClass = `${sampleSep?.className || ''} g4a-header-sep`.trim();
       if (state.sep && state.sep.className !== sepClass) state.sep.className = sepClass;
-      const prev = endIndex >= 2 && !root.hasAttribute('data-sp-native-layout') ? foreign[endIndex - 1] : null;
+      const prev = endIndex >= 2 && !isNativeLayout ? foreign[endIndex - 1] : null;
       const prevHost = prev ? (prev.querySelector('[data-tracklist-draggable-column]') || prev) : null;
       if (state.prevHost && state.prevHost !== prevHost) {
         state.prevSep?.remove(); state.prevSep = null;
@@ -386,57 +627,33 @@ async function startGenre4all() {
         state.prevHost?.removeAttribute('data-g4a-prev-sep'); state.prevHost = null;
       }
     }
-    // Temporarily disable only our CSS to read the latest native/Sort Play layout.
-    container.setAttribute('data-g4a-measure', '');
-    const computed = getComputedStyle(container);
-    const gap = parseFloat(computed.columnGap) || 0;
-    const padding = (parseFloat(computed.paddingLeft) || 0) + (parseFloat(computed.paddingRight) || 0);
-    const raw = computed.gridTemplateColumns.replace(/\[[^\]]*\]/g, '').trim().split(/\s+/).map(parseFloat);
-    let widths = raw.length === foreign.length && raw.every(Number.isFinite) ? raw : foreign.map(c => c.getBoundingClientRect().width || 120);
-    // Preserve named line positions by assigning our own numeric positions via separate properties.
-    const width = 176;
-    if (!root.hasAttribute('data-sp-native-layout')) {
-      const flexStart = endIndex > 1 ? 1 : 0;
-      const flexCount = Math.max(1, endIndex - flexStart);
-      const flexWidths = widths.slice(flexStart, flexStart + flexCount);
-      const flexSum = flexWidths.reduce((a, b) => a + b, 0);
-      const avail = Math.max(0, flexSum - gap);
-      const rootState = roots.get(root);
-      const baseGenre = Math.min(176, Math.max(110, flexSum / (flexCount + 1)));
-      const defaultWeights = [...flexWidths];
-      defaultWeights.splice(Math.max(0, insert - flexStart), 0, baseGenre);
-      const weights = rootState?.weights?.length === flexCount + 1 && rootState.insert === insert ? rootState.weights : defaultWeights;
-      const weightSum = weights.reduce((a, b) => a + b, 0) || 1;
-      const mins = weights.map((_, k) => k === 0 ? 120 : 80);
-      const minSum = mins.reduce((a, b) => a + b, 0);
-      let alloc = weights.map((w, k) => Math.max(mins[k], avail * (w / weightSum)));
-      const allocSum = alloc.reduce((a, b) => a + b, 0);
-      if (avail > minSum && allocSum > avail) {
-        const extra = alloc.reduce((s, v, k) => s + Math.max(0, v - mins[k]), 0);
-        if (extra > 0) alloc = alloc.map((v, k) => v > mins[k] ? mins[k] + (v - mins[k]) * ((extra - (allocSum - avail)) / extra) : v);
-      }
-      widths.splice(insert, 0, baseGenre);
-      for (let k = 0; k <= flexCount; k++) widths[flexStart + k] = alloc[k];
-      if (rootState) rootState.insert = insert;
-    } else {
-      widths.splice(insert, 0, width);
+
+    let measured = rootState.measured?.key === measureKey ? rootState.measured : null;
+    if (!measured) {
+      const m = measureGrid(container, foreign, endIndex, minInsert, midOrder, isNativeLayout, rootState);
+      measured = { key: measureKey, total: m.total, template: m.template };
+      if (!inlineGrid) rootState.measured = measured;
     }
-    const all = [...foreign]; all.splice(insert, 0, state.shell);
-    const total = Math.ceil(widths.reduce((a,b) => a + b, 0) + gap * Math.max(0, widths.length - 1) + padding);
-    const template = widths.map(w => `${Math.max(0,w)}px`).join(' ');
-    ownProperty(container, '--g4a-tracks', template); ownProperty(container, '--g4a-total', `${total}px`);
-    const rootState = roots.get(root);
-    if (rootState) rootState.maxTotal = Math.max(rootState.maxTotal || 0, total);
-    for (const c of state.positions) if (!all.includes(c)) { c.removeAttribute('data-g4a-position'); c.style.removeProperty('--g4a-position'); state.positions.delete(c); }
+
+    ownProperty(container, '--g4a-tracks', measured.template);
+    ownProperty(container, '--g4a-total', `${measured.total}px`);
+    rootState.maxTotal = Math.max(rootState.maxTotal || 0, measured.total);
+    for (const c of state.positions) if (!all.includes(c)) {
+      c.removeAttribute('data-g4a-position');
+      c.style.removeProperty('--g4a-position');
+      state.positions.delete(c);
+    }
     all.forEach((c, i) => {
       if (!c.hasAttribute('data-g4a-position')) c.setAttribute('data-g4a-position', '');
-      ownProperty(c, '--g4a-position', String(i + 1)); state.positions.add(c);
+      ownProperty(c, '--g4a-position', String(i + 1));
+      state.positions.add(c);
     });
-    if (state.shell.getAttribute('aria-colindex') !== String(insert + 1)) state.shell.setAttribute('aria-colindex', String(insert + 1));
-    container.classList.add('g4a-row'); container.removeAttribute('data-g4a-measure');
+    const colIdx = String(genreVisualIdx + 1);
+    if (state.shell.getAttribute('aria-colindex') !== colIdx) state.shell.setAttribute('aria-colindex', colIdx);
+    container.classList.add('g4a-row');
+    state.appliedKey = measureKey;
   }
 
-  const normalize = value => value.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase();
   function columnMenu(menu) {
     if (!menu.isConnected || menu.closest('.g4a-preferences,.g4a-genre-dialog')) return false;
     const text = normalize(menu.textContent || '');
@@ -504,15 +721,20 @@ async function startGenre4all() {
     updateMenus();
   }
 
-  // Observe native changes and virtualization; ignore our rendering and menu writes.
+  // Observe native changes and virtualization; ignore our rendering, menu writes and unrelated player animations.
   const observer = new MutationObserver(records => {
+    if (document.documentElement.classList.contains('g4a-reordering')) return;
     if (records.some(m => {
-      if (m.target.closest?.('genre4all-column,[data-g4a-menu-item],[data-g4a-profile-item],[data-g4a-sep],.g4a-genre-fan,.g4a-preferences')) return false;
-      return m.type !== 'childList' || [...m.addedNodes, ...m.removedNodes].some(n => n.nodeType === 1 && !n.matches('genre4all-column,[data-g4a-menu-item],[data-g4a-profile-item],[data-g4a-sep],.g4a-genre-fan'));
+      const target = m.target.nodeType === 1 ? m.target : m.target.parentElement;
+      if (!target || target.closest?.('genre4all-column,[data-g4a-menu-item],[data-g4a-profile-item],[data-g4a-sep],.g4a-genre-fan,.g4a-preferences')) return false;
+      if (m.type === 'childList') {
+        return [...m.addedNodes, ...m.removedNodes].some(n => n.nodeType === 1 && !n.matches('genre4all-column,[data-g4a-menu-item],[data-g4a-profile-item],[data-g4a-sep],.g4a-genre-fan'));
+      }
+      return !!target.closest?.(`${ROOT},[role="menu"],.main-contextMenu-menu`);
     })) schedule();
   });
   observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['aria-rowindex','data-uri','href','style','class'], characterData: true });
-  const resize = typeof ResizeObserver === 'function' ? new ResizeObserver(schedule) : null;
+  const resize = typeof ResizeObserver === 'function' ? new ResizeObserver(() => { invalidateLayouts(false); schedule(); }) : null;
 
   function sync() {
     frame = null; if (closed) return;
@@ -527,7 +749,7 @@ async function startGenre4all() {
         found.add(root);
         let rootState = roots.get(root);
         if (!rootState) {
-          rootState = { events: new AbortController(), weights: null, insert: null, maxTotal: 0 };
+          rootState = { events: new AbortController(), weights: null, measured: null, midOrder: null, midOrderCount: -1, headerForeign: null, maxTotal: 0, activeDrag: null };
           roots.set(root, rootState);
           attachResize(root, rootState);
           resize?.observe(root);
@@ -535,10 +757,13 @@ async function startGenre4all() {
         rootState.maxTotal = 0;
         root.classList.toggle('g4a-root', visible);
         if (visible) {
+          const headerRows = [], dataRows = [];
           for (const row of rows) {
-            const header = !!row.querySelector('[role="columnheader"]');
-            if (header || getUri(row)) layout(row, header, root);
+            if (row.querySelector('[role="columnheader"]')) headerRows.push(row);
+            else if (getUri(row)) dataRows.push(row);
           }
+          for (const row of headerRows) layout(row, true, root, rootState);
+          for (const row of dataRows) layout(row, false, root, rootState);
           if (rootState.maxTotal > (root.clientWidth || rootState.maxTotal) + 2) {
             if (!root.hasAttribute('data-g4a-overflow')) root.setAttribute('data-g4a-overflow', '');
           } else if (root.hasAttribute('data-g4a-overflow')) {
@@ -576,7 +801,7 @@ async function startGenre4all() {
     if (globalThis.Genre4all === api) delete globalThis.Genre4all;
   }
   window.addEventListener('pagehide', close, { once: true, signal: lifecycle.signal });
-  window.addEventListener('resize', schedule, { signal: lifecycle.signal });
+  window.addEventListener('resize', () => { invalidateLayouts(false); schedule(); }, { signal: lifecycle.signal });
   // React may replace metadata on a recycled DOM node without any attribute mutation.
   const recheck = setInterval(() => { if (!document.hidden) schedule(); }, 1500);
   lifecycle.signal.addEventListener('abort', () => clearInterval(recheck), { once: true });
@@ -595,7 +820,7 @@ async function startGenre4all() {
     describe: result => ({ SPOTIFY_METADATA_UNAVAILABLE: 'O serviço de metadados está indisponível nesta versão do Spotify. Atualize Spicetify/Spotify e tente novamente.', SPOTIFY_TIMEOUT: 'O Spotify não respondeu a tempo. Use Atualizar gêneros.', SPOTIFY_TRACK_REQUIRED: 'Gêneros disponíveis para faixas do catálogo do Spotify.', SPOTIFY_EXTENSION_MISSING: 'Esta versão do Spotify não disponibilizou os metadados de gênero.' }[result.errorCode] || result.errorCode || 'O Spotify não retornou gêneros para esta faixa.')
   });
   service.ready.catch(error => console.warn('[Genre4all] Falha ao iniciar cache.', error));
-  unlisten = Spicetify.Platform.History?.listen?.(() => { view.reset(); schedule(); });
+  unlisten = Spicetify.Platform.History?.listen?.(() => { view.reset(); invalidateLayouts(false); schedule(); });
   schedule();
 }
 if (typeof document !== 'undefined') startGenre4all().catch(error => console.error('[Genre4all] Falha na inicialização.', error));

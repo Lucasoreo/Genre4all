@@ -24,19 +24,10 @@ const Genre4allColumn = (() => {
     });
     return (0.2126 * r + 0.7152 * g + 0.0722 * b) < 0.30 ? LIGHT_INK : INK;
   }
-  const STATES = { queued: 'Aguardando', loading: 'Carregando…', success: 'Gêneros', empty: 'Sem gêneros', no_match: 'Sem correspondência', not_configured: 'Configurar gêneros', unsupported: 'Indisponível', rate_limited: 'Limite da fonte', error: 'Falha nos gêneros', cancelled: 'Cancelado', expired: 'Gêneros expirados' };
+  const STATES = { queued: 'Aguardando', loading: 'Carregando…', success: 'Gêneros', empty: 'Sem gêneros', no_match: 'Sem correspondência', not_configured: 'Configurar gêneros', unsupported: 'Indisponível', rate_limited: 'Limite da fonte', error: 'Falha nos gêneros', cancelled: 'Cancelado', expired: 'Carregando…' };
   const stateLabel = r => r.result?.reason === 'SOURCES_DISABLED' ? 'Fontes desativadas' : STATES[r.state] || STATES.error;
   function trackFromRow(row, uri, legacy) {
     if (legacy?.uri === uri && (legacy.name || legacy.title || legacy.metadata?.title)) return legacy;
-    const titleCell = row.querySelector('[data-sp-layout-position="native:title"], .main-trackList-rowSectionStart, [role="gridcell"][aria-colindex="2"]');
-    const title = (row.querySelector('.main-trackList-rowTitle, [data-testid="tracklist-row-title"], [data-testid="internal-track-link"]')
-      || titleCell?.querySelector('[data-encore-id="text"][dir="auto"]'))?.textContent?.trim();
-    const artists = [...row.querySelectorAll('a[href*="/artist/"]')].map(a => ({ name: a.textContent.trim() })).filter(a => a.name);
-    const album = row.querySelector('a[href*="/album/"]')?.textContent?.trim();
-    const duration = row.querySelector('.main-trackList-rowSectionEnd, [data-sp-layout-position="native:end"], [role="gridcell"]:last-of-type')?.textContent?.match(/\b(\d{1,2}):(\d{2})\b/u);
-    const fromDOM = { uri, ...(title ? { name: title } : {}), artists: [...new Map(artists.map(a => [a.name, a])).values()], ...(album ? { album: { name: album } } : {}),
-      ...(duration ? { duration_ms: (Number(duration[1]) * 60 + Number(duration[2])) * 1000 } : {}) };
-    if (title && artists.length) return fromDOM;
     const seen = new Set();
     function find(value, depth = 10) {
       if (!value || typeof value !== 'object' || depth <= 0 || seen.has(value) || seen.size >= 300) return null;
@@ -52,16 +43,25 @@ const Genre4allColumn = (() => {
       }
       return null;
     }
-    const propsKey = Object.keys(row).find(k => k.startsWith('__reactProps$'));
-    const fromProps = find(row[propsKey]); if (fromProps) return fromProps;
-    const fiberKey = Object.keys(row).find(k => k.startsWith('__reactFiber$'));
-    let fiber = row[fiberKey];
+    const propsKey = row.__g4aPropsKey ?? (row.__g4aPropsKey = Object.keys(row).find(k => k.startsWith('__reactProps$')) || '');
+    if (propsKey) {
+      const fromProps = find(row[propsKey]); if (fromProps) return fromProps;
+    }
+    const fiberKey = row.__g4aFiberKey ?? (row.__g4aFiberKey = Object.keys(row).find(k => k.startsWith('__reactFiber$')) || '');
+    let fiber = fiberKey ? row[fiberKey] : null;
     for (let depth = 0; fiber && depth < 8; depth++, fiber = fiber.return) {
       const found = find(fiber.memoizedProps) || find(fiber.pendingProps); if (found) return found;
       const parentUri = fiber.return?.memoizedProps?.uri;
       if (parentUri?.startsWith('spotify:track:') && parentUri !== uri) break;
     }
-    return fromDOM;
+    const titleCell = row.querySelector('[data-sp-layout-position="native:title"], .main-trackList-rowSectionStart, [role="gridcell"][aria-colindex="2"]');
+    const title = (row.querySelector('.main-trackList-rowTitle, [data-testid="tracklist-row-title"], [data-testid="internal-track-link"]')
+      || titleCell?.querySelector('[data-encore-id="text"][dir="auto"]'))?.textContent?.trim();
+    const artists = [...row.querySelectorAll('a[href*="/artist/"]')].map(a => ({ name: a.textContent.trim() })).filter(a => a.name);
+    const album = row.querySelector('a[href*="/album/"]')?.textContent?.trim();
+    const duration = row.querySelector('.main-trackList-rowSectionEnd, [data-sp-layout-position="native:end"], [role="gridcell"]:last-of-type')?.textContent?.match(/\b(\d{1,2}):(\d{2})\b/u);
+    return { uri, ...(title ? { name: title } : {}), artists: [...new Map(artists.map(a => [a.name, a])).values()], ...(album ? { album: { name: album } } : {}),
+      ...(duration ? { duration_ms: (Number(duration[1]) * 60 + Number(duration[2])) * 1000 } : {}) };
   }
   function sourceLink(result) {
     try {
@@ -104,7 +104,7 @@ const Genre4allColumn = (() => {
   `;
   function createController(service, options) {
     const doc = options.document || document, win = doc.defaultView;
-    const records = new Map(), lifecycle = new AbortController();
+    const records = new Map(), rowRecords = new Map(), lifecycle = new AbortController();
     let active = 0, frame = null, closed = false, activeFan = null, fanTimer = null, closeTimer = null;
     const style = doc.createElement('style'); style.id = 'genre4all-column-style'; style.textContent = CSS; doc.head.append(style);
     function node(tag, text, attrs = {}) {
@@ -118,8 +118,18 @@ const Genre4allColumn = (() => {
         && service.identityFor(options.getTrack(r.row)).key === r.identityKey
         && service.revision === r.revision;
     }
+    function isExpired(r) {
+      return r.state === 'expired' || (['success', 'empty', 'no_match'].includes(r.state) && r.result?.expiresAt && r.result.expiresAt <= Date.now());
+    }
     function expire(r) {
-      if (['success', 'empty', 'no_match'].includes(r.state) && r.result?.expiresAt && r.result.expiresAt <= Date.now()) r.state = 'expired';
+      if (isExpired(r)) {
+        clearTimeout(r.expiry); r.expiry = null;
+        if (!r.task) {
+          r.result = null;
+          r.state = 'queued';
+          schedule();
+        }
+      }
     }
     function chip(label, tag = 'span') {
       const bg = colorFor(label.key, service.getConfig().colors);
@@ -221,7 +231,11 @@ const Genre4allColumn = (() => {
       const r = records.get(cell); if (!r) return;
       records.delete(cell); r.events?.abort(); r.task?.abort(); clearTimeout(r.expiry);
       if (activeFan?.record === r) closeFan(true);
-      if (![...records.values()].some(other => other.row === r.row)) observer?.unobserve(r.row);
+      const rowSet = rowRecords.get(r.row);
+      if (rowSet) {
+        rowSet.delete(r);
+        if (!rowSet.size) { rowRecords.delete(r.row); observer?.unobserve(r.row); }
+      }
       cell.replaceChildren(); cell.classList.remove('g4a-genre-host'); delete cell.dataset.genreState; cell.removeAttribute('aria-busy');
       if (r.gridcell && ![...records.values()].some(other => other.gridcell === r.gridcell)) r.gridcell.classList.remove('g4a-genre-gridcell');
     }
@@ -229,59 +243,91 @@ const Genre4allColumn = (() => {
     function schedule() { if (!closed && frame === null) frame = win.requestAnimationFrame(pump); }
     function pump() {
       frame = null; prune();
-      const candidates = [...records.values()].filter(r => r.visible && r.state === 'queued');
-      candidates.sort((a, b) => Math.abs(a.row.getBoundingClientRect().top) - Math.abs(b.row.getBoundingClientRect().top));
-      for (const r of candidates) { if (active >= 4) break; start(r); }
+      const candidates = [];
+      for (const r of records.values()) {
+        if (isExpired(r) && !r.task) { clearTimeout(r.expiry); r.expiry = null; r.result = null; r.state = 'queued'; render(r); }
+        if (r.visible && r.state === 'queued' && !r.task) candidates.push(r);
+      }
+      if (!candidates.length || active >= 8) return;
+      if (candidates.length > 1) {
+        const distances = new Map(candidates.map(r => [r, Math.abs(r.row.getBoundingClientRect().top)]));
+        candidates.sort((a, b) => distances.get(a) - distances.get(b));
+      }
+      for (const r of candidates) { if (active >= 8) break; start(r); }
     }
     async function start(r) {
       if (!valid(r) || r.task) return;
-      clearTimeout(r.expiry); r.state = 'loading'; r.result = null; render(r);
+      clearTimeout(r.expiry); r.expiry = null; r.state = 'loading'; r.result = null; render(r);
       const task = new AbortController(); r.task = task; active++;
       try {
         const result = await service.resolve(r.track, { signal: task.signal });
         if (!valid(r) || task.signal.aborted || result.configVersion !== r.revision) return;
         r.result = result; r.state = result.status;
-        const expirable = ['success', 'empty', 'no_match'].includes(result.status);
-        if (expirable && result.expiresAt && result.expiresAt <= Date.now()) r.state = 'expired';
         render(r);
-        if (expirable && result.expiresAt > Date.now()) r.expiry = setTimeout(() => {
-          if (!valid(r)) return;
-          r.state = 'expired'; render(r);
-        }, Math.min(result.expiresAt - Date.now(), 2147483647));
+        if (['success', 'empty', 'no_match'].includes(result.status) && result.expiresAt) {
+          const delay = Math.max(50, Math.min(result.expiresAt - Date.now(), 2147483647));
+          r.expiry = setTimeout(() => {
+            if (!valid(r)) return;
+            r.expiry = null; r.result = null; r.state = 'queued';
+            render(r); schedule();
+          }, delay);
+        }
       } catch { if (valid(r) && !task.signal.aborted) { r.result = { status: 'error', errorCode: 'GENRE_VIEW_FAILED' }; r.state = 'error'; render(r); } }
       finally { if (r.task === task) r.task = null; active--; if (valid(r) && r.state === 'loading' && task.signal.aborted) r.state = 'queued'; schedule(); }
     }
     const observer = typeof win.IntersectionObserver === 'function' ? new win.IntersectionObserver(entries => {
-      for (const entry of entries) for (const r of records.values()) if (r.row === entry.target) {
-        r.visible = entry.isIntersecting;
-        if (!r.visible && r.task) { r.task.abort(); r.state = 'queued'; render(r); }
+      for (const entry of entries) {
+        const rowSet = rowRecords.get(entry.target);
+        if (!rowSet) continue;
+        for (const r of rowSet) {
+          r.visible = entry.isIntersecting;
+          if (!r.visible && r.task) { r.task.abort(); r.state = 'queued'; render(r); }
+        }
       }
       schedule();
-    }, { rootMargin: '56px 0px' }) : null;
+    }, { rootMargin: '112px 0px' }) : null;
     function sync(container, configs) {
       if (closed || !container) return;
-      const desired = new Set();
+      const desired = new Set(), pendingMounts = [];
+      const genreConfigs = configs.filter(c => c.type === 'genre');
+      const context = options.getContext();
       for (const row of container.querySelectorAll('.main-trackList-trackListRow, [role="row"]')) {
         if (row.querySelector('[role="columnheader"]')) continue;
-        for (const config of configs.filter(c => c.type === 'genre')) {
+        for (const config of genreConfigs) {
           const cell = row.querySelector(config.dataSelector); if (!cell || cell.closest('.main-trackList-trackListRow, [role="row"]') !== row) continue;
           const uri = options.getUri(row); if (!uri) continue;
           desired.add(cell);
           const track = options.getTrack(row), identityKey = service.identityFor(track).key;
           const previous = records.get(cell);
-          if (previous && valid(previous) && previous.identityKey === identityKey && previous.cell.firstChild) continue;
+          if (previous && valid(previous) && previous.identityKey === identityKey && previous.cell.firstChild) {
+            if (isExpired(previous)) expire(previous);
+            continue;
+          }
+          pendingMounts.push({ cell, row, track, identityKey, uri, context });
+        }
+      }
+      if (pendingMounts.length) {
+        // Read layout geometry in a single batch before performing DOM mutations.
+        const vh = win.innerHeight || 800;
+        const visibility = pendingMounts.map(({ row }) => {
+          const rect = row.getBoundingClientRect();
+          return rect.height > 0 && rect.bottom > -112 && rect.top < vh + 112;
+        });
+        for (let i = 0; i < pendingMounts.length; i++) {
+          const { cell, row, track, identityKey, uri, context: ctx } = pendingMounts[i];
           release(cell);
           const gridcell = cell.closest('[role="gridcell"]'); gridcell?.classList.add('g4a-genre-gridcell');
           const safeTrack = track?.uri === uri ? track : { uri };
-          const rect = row.getBoundingClientRect();
-          const initialVisible = rect.height > 0 && rect.bottom > -56 && rect.top < (win.innerHeight || 800) + 56;
-          const r = { cell, row, track: safeTrack, identityKey, uri, context: options.getContext(), revision: service.revision, state: 'queued', result: null, visible: initialVisible, gridcell, events: new AbortController() };
+          const r = { cell, row, track: safeTrack, identityKey, uri, context: ctx, revision: service.revision, state: 'queued', result: null, visible: visibility[i], gridcell, events: new AbortController() };
           records.set(cell, r);
+          let rowSet = rowRecords.get(row);
+          if (!rowSet) { rowSet = new Set(); rowRecords.set(row, rowSet); observer?.observe(row); }
+          rowSet.add(r);
           for (const type of ['click', 'dblclick', 'pointerdown', 'pointerup', 'mousedown', 'mouseup', 'contextmenu']) {
             const stop = e => e.stopPropagation(); cell.addEventListener(type, stop, { signal: r.events.signal });
           }
           cell.addEventListener('keyup', e => { if ([' ', 'Enter', 'Escape', 'ArrowDown'].includes(e.key)) e.stopPropagation(); }, { signal: r.events.signal });
-          render(r); observer?.observe(row);
+          render(r);
         }
       }
       for (const r of records.values()) if (container.contains(r.cell) && !desired.has(r.cell)) release(r.cell);
@@ -289,8 +335,8 @@ const Genre4allColumn = (() => {
     }
     const unsubscribe = service.onChange(() => {
       for (const r of [...records.values()]) {
-        if (r.revision !== service.revision) {
-          r.task?.abort(); clearTimeout(r.expiry); r.revision = service.revision; r.state = 'queued'; r.result = null;
+        if (r.revision !== service.revision || isExpired(r)) {
+          r.task?.abort(); clearTimeout(r.expiry); r.expiry = null; r.revision = service.revision; r.state = 'queued'; r.result = null;
         }
         render(r);
       }
@@ -298,15 +344,26 @@ const Genre4allColumn = (() => {
     });
     function fallbackVisibility() {
       if (observer) return;
-      for (const r of records.values()) { const rect = r.row.getBoundingClientRect(); r.visible = rect.height > 0 && rect.bottom > 0 && rect.top < win.innerHeight; }
+      const vh = win.innerHeight || 800;
+      const entries = [...records.values()].map(r => [r, r.row.getBoundingClientRect()]);
+      for (const [r, rect] of entries) r.visible = rect.height > 0 && rect.bottom > 0 && rect.top < vh;
       schedule();
     }
     doc.addEventListener('scroll', () => { closeFan(true); fallbackVisibility(); }, { capture: true, passive: true, signal: lifecycle.signal });
     win.addEventListener('resize', () => { closeFan(true); fallbackVisibility(); }, { signal: lifecycle.signal });
     function recheckExpiry() {
       if (doc.hidden || closed) return;
-      for (const r of records.values()) if (r.result) render(r);
+      let needsPump = false;
+      for (const r of records.values()) {
+        if (isExpired(r) || (r.state === 'error' && ['SPOTIFY_TIMEOUT', 'SPOTIFY_METADATA_FAILED', 'SPOTIFY_METADATA_UNAVAILABLE'].includes(r.result?.errorCode))) {
+          clearTimeout(r.expiry); r.expiry = null; r.result = null; r.state = 'queued';
+          render(r); needsPump = true;
+        } else if (r.result) {
+          render(r);
+        }
+      }
       prune();
+      if (needsPump) schedule();
     }
     doc.addEventListener('visibilitychange', recheckExpiry, { signal: lifecycle.signal });
     win.addEventListener('focus', recheckExpiry, { signal: lifecycle.signal });
