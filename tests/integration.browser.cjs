@@ -39,7 +39,21 @@ body{background:#121212;color:#eee;font:14px sans-serif;margin:20px}main{width:1
     const errors=[];page.on('pageerror',e=>errors.push(e.message));page.on('console',m=>{if(m.type()==='error')errors.push(m.text());});
     await page.goto(`http://127.0.0.1:${server.address().port}`);
     await page.evaluate(()=>{
-      window.calls=[];window.pending=new Map();window.path='/playlist/fixture';window.sortPlayClicks=0;window.dynamicGenre='electro house';
+      window.calls=[];window.discogsCalls=[];window.mbCalls=[];window.pending=new Map();window.path='/playlist/fixture';window.sortPlayClicks=0;window.dynamicGenre='electro house';
+      window.mockDiscogsResults=[];window.mockMbRecordings=[];
+      const realFetch=window.fetch.bind(window);
+      window.fetch=async(url,init)=>{
+        const u=String(url);
+        if(u.includes('api.discogs.com')){
+          window.discogsCalls.push(u);
+          return {ok:true,status:200,async json(){return {results:window.mockDiscogsResults};}};
+        }
+        if(u.includes('musicbrainz.org')){
+          window.mbCalls.push(u);
+          return {ok:true,status:200,async json(){return {recordings:window.mockMbRecordings};}};
+        }
+        return realFetch(url,init);
+      };
       window.Spicetify={Platform:{Transport:{},History:{location:{get pathname(){return window.path}},listen(fn){window.navigate=fn;return ()=>{window.navigate=null}}}}};
       function bytes(name,score=.9){const text=new TextEncoder().encode(name);const float=new Uint8Array(4);new DataView(float.buffer).setFloat32(0,score,true);return [10,text.length+7,10,text.length,...text,21,...float];}
       class MetadataService{
@@ -77,7 +91,7 @@ body{background:#121212;color:#eee;font:14px sans-serif;margin:20px}main{width:1
     });
     await page.addScriptTag({path:path.join(root,'Genre4all.js')});
     await page.locator('.g4a-data[data-genre-state=success]').waitFor();
-    assert.equal(await page.evaluate(()=>Genre4all.version),'1.0.0');
+    assert.equal(await page.evaluate(()=>Genre4all.version),'1.1.0');
     assert.equal(await page.locator('genre4all-column[data-kind=header]').count(),1);
     assert.equal(await page.locator('.g4a-genre-chip').filter({hasText:'happy'}).count(),0);
     assert.ok(await page.locator('.g4a-genre-chip').filter({hasText:'electro house'}).count());

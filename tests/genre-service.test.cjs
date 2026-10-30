@@ -2,7 +2,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const api = require('../src/genre-service.js');
-const { createSpotifyAdapter } = require('../src/genre-transport.js');
+const { createSpotifyAdapter, createDiscogsAdapter, createMusicBrainzAdapter } = require('../src/genre-transport.js');
 const TRACK = { uri: 'spotify:track:aaaaaaaaaaaaaaaaaaaaaa', name: 'Real Thing', artists: [{ name: 'Artist A' }], album: { name: 'Release A' }, duration_ms: 240000, external_ids: { isrc: 'TEST12345678' } };
 
 function storage() {
@@ -25,10 +25,117 @@ function encodedConcept(name, score) {
   return new Uint8Array([10, b.length + 7, 10, b.length, ...b, 21, ...f]);
 }
 
-test('PROVIDERS contains only spotify as the priority source', () => {
-  assert.deepEqual(api.PROVIDERS, ['spotify']);
-  assert.deepEqual(api.defaultConfig().order, ['spotify']);
-  assert.deepEqual(api.defaultConfig().enabled, { spotify: true });
+test('PROVIDERS contains discogs, musicbrainz, and spotify in priority order', () => {
+  assert.deepEqual(api.PROVIDERS, ['discogs', 'musicbrainz', 'spotify']);
+  assert.deepEqual(api.defaultConfig().order, ['discogs', 'musicbrainz', 'spotify']);
+  assert.deepEqual(api.defaultConfig().enabled, { discogs: true, musicbrainz: true, spotify: true });
+  assert.equal(api.defaultConfig().discogsToken, '');
+  assert.equal(api.defaultConfig().musicbrainzToken, '');
+});
+
+test('Discogs priority short-circuits MusicBrainz and Spotify, placing main genre before subgenres', async () => {
+  let mbCalls = 0, spCalls = 0;
+  const service = api.createService({
+    storage: storage(),
+    discogsInterval: 1,
+    discogs: async () => ({
+      genres: ['Electronic', 'Rock'],
+      styles: ['Synth-pop', 'Indie Rock'],
+      entityId: '999',
+      sourceUrl: 'https://www.discogs.com/master/999'
+    }),
+    musicbrainz: async () => { mbCalls++; return { genres: ['Pop'], tags: ['Dance'] }; },
+    spotify: async () => { spCalls++; return [{ name: 'House', score: 0.9 }]; }
+  });
+  const result = await service.resolve(TRACK);
+  assert.equal(result.status, 'success');
+  assert.equal(result.selectedProvider, 'discogs');
+  assert.equal(mbCalls, 0, 'MusicBrainz must not be called when Discogs succeeds');
+  assert.equal(spCalls, 0, 'Spotify must not be called when Discogs succeeds');
+  assert.deepEqual(result.labels.map(l => l.label), ['Electronic', 'Rock', 'Synth-pop', 'Indie Rock']);
+  assert.deepEqual(result.labels.map(l => l.kind), ['genre', 'genre', 'style', 'style']);
+  assert.ok(result.labels.every(l => l.provider === 'discogs'));
+  service.close();
+});
+
+test('MusicBrainz success still queries and appends Spotify genres while keeping MusicBrainz main genre first', async () => {
+  let spCalls = 0;
+  const service = api.createService({
+    storage: storage(),
+    musicbrainzInterval: 1,
+    discogs: async () => null, // No match on Discogs
+    musicbrainz: async () => ({
+      genres: ['Rock'],
+      tags: ['Grunge', 'Alternative Rock'],
+      entityId: 'mb-1',
+      sourceUrl: 'https://musicbrainz.org/recording/mb-1'
+    }),
+    spotify: async () => {
+      spCalls++;
+      return [{ name: 'Post-Grunge', score: 0.88 }, { name: 'Rock', score: 0.95 }];
+    },
+    validateSpotifyGenre: () => true
+  });
+  const result = await service.resolve(TRACK);
+  assert.equal(result.status, 'success');
+  assert.equal(result.selectedProvider, 'musicbrainz');
+  assert.equal(spCalls, 1, 'Spotify must also be queried when MusicBrainz succeeds');
+  assert.deepEqual(result.labels.map(l => l.label), ['Rock', 'Grunge', 'Alternative Rock', 'Post-Grunge']);
+  assert.deepEqual(result.labels.map(l => l.provider), ['musicbrainz', 'musicbrainz', 'musicbrainz', 'spotify']);
+  assert.equal(result.labels[0].kind, 'genre');
+  service.close();
+});
+
+test('createDiscogsAdapter and createMusicBrainzAdapter parse API responses and respect tokens', async () => {
+  let cfg = { discogsToken: '', musicbrainzToken: 'mb-secret' };
+  const discogsNoToken = createDiscogsAdapter(api, () => cfg, async () => { throw new Error('should not fetch'); });
+  assert.equal(discogsNoToken.isConfigured(), false);
+  await assert.rejects(discogsNoToken( api.identityFor(TRACK) ), e => e.status === 'not_configured' && e.code === 'DISCOGS_TOKEN_REQUIRED');
+
+  cfg.discogsToken = 'my-discogs-token';
+  assert.equal(discogsNoToken.isConfigured(), true);
+  const discogsOk = createDiscogsAdapter(api, () => cfg, async url => {
+    assert.ok(String(url).includes('token=my-discogs-token'));
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return {
+          results: [
+            { id: 42, type: 'master', uri: '/master/42-Artist-A-Real-Thing', title: 'Artist A - Real Thing', genre: ['Electronic'], style: ['Deep House', 'Tech House'] }
+          ]
+        };
+      }
+    };
+  });
+  const dRes = await discogsOk(api.identityFor(TRACK));
+  assert.deepEqual(dRes.genres, ['Electronic']);
+  assert.deepEqual(dRes.styles, ['Deep House', 'Tech House']);
+
+  const mbOk = createMusicBrainzAdapter(api, () => cfg, async (url, init) => {
+    assert.equal(init.headers.Authorization, 'Bearer mb-secret');
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return {
+          recordings: [
+            {
+              id: 'rec-123',
+              title: 'Real Thing',
+              length: 240000,
+              'artist-credit': [{ name: 'Artist A', artist: { name: 'Artist A' } }],
+              genres: [{ name: 'Electronic', count: 5 }],
+              tags: [{ name: 'Progressive House', count: 3 }]
+            }
+          ]
+        };
+      }
+    };
+  });
+  const mRes = await mbOk(api.identityFor(TRACK));
+  assert.deepEqual(mRes.genres, ['Electronic']);
+  assert.deepEqual(mRes.tags, ['Progressive House']);
 });
 
 test('Spotify resolution returns all valid labels and supports both broad genres and styles', async () => {
@@ -74,20 +181,20 @@ test('Spotify resolution works with only track URI (even when DOM title or artis
   service.close();
 });
 
-test('disabling Spotify source performs no queries and returns SOURCES_DISABLED', async () => {
+test('disabling all sources performs no queries and returns SOURCES_DISABLED', async () => {
   let calls = 0;
   const service = api.createService({
     storage: storage(),
     spotify: async () => { calls++; return [{ name: 'House' }]; },
     validateSpotifyGenre: () => true
   });
-  await service.configure({ enabled: { spotify: false } });
+  await service.configure({ enabled: { discogs: false, musicbrainz: false, spotify: false } });
   const r = await service.resolve(TRACK);
   assert.equal(r.status, 'empty');
   assert.equal(r.reason, 'SOURCES_DISABLED');
   assert.equal(calls, 0);
   await service.resetConfig();
-  assert.deepEqual(service.getConfig().order, ['spotify']);
+  assert.deepEqual(service.getConfig().order, ['discogs', 'musicbrainz', 'spotify']);
   assert.equal(service.getConfig().enabled.spotify, true);
   service.close();
 });
@@ -256,5 +363,56 @@ test('Spotify capability tests and regular resolutions share the provider limite
   const [one, two] = await Promise.all([service.testSpotify(TRACK), service.resolve(TRACK)]);
   assert.equal(one.status, 'success'); assert.equal(two.status, 'success');
   assert.equal(starts.length, 2); assert.ok(starts[1] - starts[0] >= 25);
+  service.close();
+});
+
+test('rate-limit exhaustion or connection failure automatically descends in priority (Discogs -> MusicBrainz -> Spotify) and circuit-breaks queued tracks', async () => {
+  let dcCalls = 0, mbCalls = 0, spCalls = 0;
+  let mbFail = false;
+  const service = api.createService({
+    storage: storage(),
+    discogsInterval: 1000,
+    musicbrainzInterval: 1,
+    discogs: async () => {
+      dcCalls++;
+      throw new api.GenreError('rate_limited', 'DISCOGS_RATE_LIMITED', Date.now() + 60000);
+    },
+    musicbrainz: async () => {
+      mbCalls++;
+      if (mbFail) throw new api.GenreError('error', 'MUSICBRAINZ_REQUEST_FAILED', Date.now() + 20000);
+      return { genres: ['Electronic'], tags: ['House'] };
+    },
+    spotify: async () => {
+      spCalls++;
+      return [{ name: 'Deep House', score: 0.9 }];
+    },
+    validateSpotifyGenre: () => true
+  });
+
+  // Track 1: Discogs is rate-limited -> descends to MusicBrainz (+ Spotify)
+  const res1 = await service.resolve(TRACK);
+  assert.equal(res1.status, 'success');
+  assert.equal(res1.selectedProvider, 'musicbrainz');
+  assert.deepEqual(res1.labels.map(l => l.label), ['Electronic', 'House', 'Deep House']);
+  assert.equal(dcCalls, 1);
+
+  // Track 2: Discogs circuit-breaker is active (blockedUntil) so dcCalls does NOT increment, AND now MusicBrainz fails connection -> descends to Spotify!
+  mbFail = true;
+  const track2 = { ...TRACK, uri: 'spotify:track:bbbbbbbbbbbbbbbbbbbbbb', name: 'Another Track' };
+  const res2 = await service.resolve(track2);
+  assert.equal(res2.status, 'success');
+  assert.equal(res2.selectedProvider, 'spotify');
+  assert.deepEqual(res2.labels.map(l => l.label), ['Deep House']);
+  assert.equal(dcCalls, 1, 'Discogs was skipped immediately due to active rate-limit block');
+  assert.equal(mbCalls, 2);
+
+  // Track 3: Both Discogs and MusicBrainz circuit-breakers are active -> goes straight to Spotify with 0 external calls
+  const track3 = { ...TRACK, uri: 'spotify:track:cccccccccccccccccccccc', name: 'Third Track' };
+  const res3 = await service.resolve(track3);
+  assert.equal(res3.status, 'success');
+  assert.equal(res3.selectedProvider, 'spotify');
+  assert.equal(dcCalls, 1);
+  assert.equal(mbCalls, 2, 'MusicBrainz was skipped immediately due to active connection-failure cooldown');
+  assert.equal(spCalls, 3);
   service.close();
 });

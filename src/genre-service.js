@@ -1,17 +1,26 @@
-/* Genre4all genre resolver, adapted from Sort-Play-2. MIT, hoeci and contributors. Spotify metadata priority. */
+/* Genre4all genre resolver (v1.1). Priority: Discogs -> MusicBrainz (+ Spotify) -> Spotify. */
 const Genre4allGenres = (() => {
   'use strict';
-  const PROVIDERS = Object.freeze(['spotify']);
+  const PROVIDERS = Object.freeze(['discogs', 'musicbrainz', 'spotify']);
   const STATUSES = Object.freeze(['success', 'empty', 'no_match', 'not_configured', 'unsupported', 'rate_limited', 'error', 'cancelled']);
   const HOUR = 3600000;
-  const TTL = { spotify: HOUR };
+  const TTL = { discogs: 24 * HOUR, musicbrainz: 24 * HOUR, spotify: HOUR };
   const CACHE_VERSION = 2;
   const CACHE_LIMIT = 2000;
   const clone = typeof structuredClone === 'function' ? value => structuredClone(value) : value => JSON.parse(JSON.stringify(value));
   const identityCache = new WeakMap();
   const key = value => String(value || '').normalize('NFKC').trim().replace(/\s+/gu, ' ').toLocaleLowerCase('en-US');
   const matchText = value => key(value).replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
-  const defaultConfig = () => ({ version: 1, order: [...PROVIDERS], enabled: Object.fromEntries(PROVIDERS.map(p => [p, true])), showGenres: true, showStyles: true, colors: true });
+  const defaultConfig = () => ({
+    version: 1,
+    order: [...PROVIDERS],
+    enabled: Object.fromEntries(PROVIDERS.map(p => [p, true])),
+    showGenres: true,
+    showStyles: true,
+    colors: true,
+    discogsToken: '',
+    musicbrainzToken: ''
+  });
   function configFrom(value) {
     const v = value && typeof value === 'object' ? value : {};
     const defaults = defaultConfig();
@@ -21,12 +30,14 @@ const Genre4allGenres = (() => {
       enabled: Object.fromEntries(PROVIDERS.map(p => [p, typeof v.enabled?.[p] === 'boolean' ? v.enabled[p] : true])),
       showGenres: v.showGenres !== false,
       showStyles: v.showStyles !== false,
-      colors: v.colors !== false
+      colors: v.colors !== false,
+      discogsToken: typeof v.discogsToken === 'string' ? v.discogsToken.trim() : '',
+      musicbrainzToken: typeof v.musicbrainzToken === 'string' ? v.musicbrainzToken.trim() : ''
     };
   }
-  /** @typedef {{key:string,label:string,kind:'genre'|'style'|'tag',kinds?:string[],rawValue:string}} GenreLabel */
+  /** @typedef {{key:string,label:string,kind:'genre'|'style'|'tag',kinds?:string[],rawValue:string,provider?:string}} GenreLabel */
   /** @typedef {{provider:string,status:string,labels:GenreLabel[],entityType?:string,entityId?:string,sourceUrl?:string,fetchedAt?:number,expiresAt?:number,match?:{method:string,explanation:string,accepted:boolean},retryAt?:number,errorCode?:string}} ProviderResult */
-  function labelsFrom(values, kind = 'genre') {
+  function labelsFrom(values, kind = 'genre', provider = undefined) {
     const seen = new Set();
     return (Array.isArray(values) ? values : []).flatMap(raw => {
       const text = typeof raw === 'string' ? raw : (raw?.label ?? raw?.name);
@@ -35,17 +46,36 @@ const Genre4allGenres = (() => {
       const itemKind = (typeof raw === 'object' && raw?.kind) ? raw.kind : kind;
       if (seen.has(`${k}:${itemKind}`)) return [];
       seen.add(`${k}:${itemKind}`);
-      return [{ key: k, label: text.trim().replace(/\s+/gu, ' '), kind: itemKind, rawValue: typeof raw === 'object' && typeof raw?.rawValue === 'string' ? raw.rawValue : text }];
+      const itemProvider = (typeof raw === 'object' && raw?.provider) ? raw.provider : provider;
+      return [{
+        key: k,
+        label: text.trim().replace(/\s+/gu, ' '),
+        kind: itemKind,
+        rawValue: typeof raw === 'object' && typeof raw?.rawValue === 'string' ? raw.rawValue : text,
+        ...(itemProvider ? { provider: itemProvider } : {})
+      }];
     });
   }
   function dedupeLabels(values) {
     const seen = new Map();
     for (const label of values) {
       const kinds = label.kinds || [label.kind];
-      if (seen.has(label.key)) seen.get(label.key).kinds = [...new Set([...seen.get(label.key).kinds, ...kinds])];
-      else seen.set(label.key, { ...label, kinds: [...kinds] });
+      if (seen.has(label.key)) {
+        const existing = seen.get(label.key);
+        existing.kinds = [...new Set([...existing.kinds, ...kinds])];
+      } else {
+        seen.set(label.key, { ...label, kinds: [...kinds] });
+      }
     }
     return [...seen.values()];
+  }
+  function sortLabelsByKind(values) {
+    const genres = [], styles = [];
+    for (const label of values) {
+      if (label.kind === 'genre') genres.push(label);
+      else styles.push(label);
+    }
+    return [...genres, ...styles];
   }
   function identityFor(track) {
     const t = track && typeof track === 'object' ? track : {};
@@ -147,6 +177,7 @@ const Genre4allGenres = (() => {
     let tail = Promise.resolve(), pending = 0, nextAt = 0, blockedUntil = 0, spacing = interval;
     return {
       block(until) { if (Number.isFinite(until)) blockedUntil = Math.max(blockedUntil, until); },
+      unblock() { blockedUntil = 0; },
       setSpacing(ms) { if (Number.isFinite(ms) && ms > 0) { spacing = Math.max(interval, ms); nextAt = Math.max(nextAt, now() + spacing); } },
       async run(work, signal) {
         checkAbort(signal);
@@ -250,7 +281,8 @@ const Genre4allGenres = (() => {
     const now = options.now || (() => Date.now());
     const storage = options.storage || { async get() {}, async set() {}, async remove() {}, async clear() {}, async entries() { return []; } };
     const providerCache = new Map(), resolved = new Map(), inflight = new Map();
-    const limiters = Object.fromEntries(PROVIDERS.map(p => [p, createLimiter(25, { now, wait: options.wait, maxQueue: 256 })]));
+    const intervals = { discogs: options.discogsInterval ?? 1000, musicbrainz: options.musicbrainzInterval ?? 1000, spotify: options.spotifyInterval ?? 25 };
+    const limiters = Object.fromEntries(PROVIDERS.map(p => [p, createLimiter(intervals[p] ?? 25, { now, wait: options.wait, maxQueue: 256 })]));
     let config = defaultConfig(), revision = 1, closed = false;
     let persistence = Promise.resolve(), cacheMutation = Promise.resolve(), expiryTimer = null;
     const changes = new Set();
@@ -259,7 +291,7 @@ const Genre4allGenres = (() => {
     const ready = (async () => {
       config = configFrom(await storage.get('settings', 'genre-selector-v1'));
       for (const [id, entry] of await storage.entries('cache')) {
-        if (entry?.version === CACHE_VERSION && entry.value && typeof entry.value === 'object' && Number.isFinite(entry.expiresAt) && entry.expiresAt > now() && id.startsWith('provider:spotify:')) {
+        if (entry?.version === CACHE_VERSION && entry.value && typeof entry.value === 'object' && Number.isFinite(entry.expiresAt) && entry.expiresAt > now() && PROVIDERS.some(p => id.startsWith(`provider:${p}:`))) {
           providerCache.set(id, entry);
         } else await storage.remove('cache', id);
       }
@@ -317,7 +349,111 @@ const Genre4allGenres = (() => {
       return { provider, status: e.status, labels: [], errorCode: e.code, ...(e.retryAt ? { retryAt: e.retryAt } : {}) };
     }
     function response(provider, state, labels = [], fields = {}) {
-      return { provider, status: state, labels: dedupeLabels(labels), fetchedAt: now(), expiresAt: now() + TTL[provider], ...fields };
+      return { provider, status: state, labels: dedupeLabels(labels), fetchedAt: now(), expiresAt: now() + (TTL[provider] || HOUR), ...fields };
+    }
+    function blockOnError(limiter, e) {
+      if (e instanceof GenreError) {
+        if (e.status === 'cancelled') return;
+        if (e.retryAt) limiter.block(e.retryAt);
+        else if (e.status === 'rate_limited') limiter.block(now() + 60000);
+        else if (e.status === 'error') limiter.block(now() + 20000);
+      } else {
+        limiter.block(now() + 20000);
+      }
+    }
+    async function discogs(identity, signal) {
+      if (!options.discogs || (typeof options.discogs.isConfigured === 'function' && !options.discogs.isConfigured())) {
+        return failure('discogs', new GenreError('not_configured', 'DISCOGS_TOKEN_REQUIRED'));
+      }
+      if (!identity.title || !identity.artists?.length) return failure('discogs', new GenreError('unsupported', 'TRACK_METADATA_REQUIRED'));
+      let data;
+      try {
+        data = await limiters.discogs.run(async () => {
+          try {
+            const res = await options.discogs(identity, signal);
+            if (res?.rateLimitExhaustedUntil) limiters.discogs.block(res.rateLimitExhaustedUntil);
+            return res;
+          } catch (err) {
+            blockOnError(limiters.discogs, err);
+            throw err;
+          }
+        }, signal);
+      } catch (e) {
+        throw e instanceof GenreError ? e : new GenreError('error', 'DISCOGS_REQUEST_FAILED');
+      }
+      checkAbort(signal);
+      if (!data) return response('discogs', 'no_match', []);
+      const rawGenres = Array.isArray(data.genres) ? data.genres : (Array.isArray(data.genre) ? data.genre : []);
+      const rawStyles = Array.isArray(data.styles) ? data.styles : (Array.isArray(data.style) ? data.style : []);
+      const genreLabels = labelsFrom(rawGenres, 'genre', 'discogs');
+      const styleLabels = labelsFrom(rawStyles, 'style', 'discogs');
+      if (!genreLabels.length && styleLabels.length) {
+        if (options.formatSpotifyGenres) {
+          const derived = labelsFrom(options.formatSpotifyGenres(styleLabels.map(s => ({ name: s.label, rawValue: s.rawValue }))), 'genre', 'discogs').filter(l => l.kind === 'genre');
+          if (derived.length) genreLabels.push(...derived);
+          else styleLabels[0].kind = 'genre';
+        } else {
+          styleLabels[0].kind = 'genre';
+        }
+      }
+      const labels = sortLabelsByKind(dedupeLabels([...genreLabels, ...styleLabels]));
+      return response('discogs', labels.length ? 'success' : 'empty', labels, {
+        entityType: data.entityType || 'release',
+        entityId: data.entityId || identity.key,
+        sourceUrl: data.sourceUrl || 'https://www.discogs.com',
+        validationRule: 'discogs-search-v1',
+        match: accepted('discogs-search', 'Gêneros e subgêneros obtidos do Discogs.')
+      });
+    }
+    async function musicbrainz(identity, signal) {
+      if (!options.musicbrainz || (typeof options.musicbrainz.isConfigured === 'function' && !options.musicbrainz.isConfigured())) {
+        return failure('musicbrainz', new GenreError('not_configured', 'MUSICBRAINZ_UNAVAILABLE'));
+      }
+      if (!identity.isrc && (!identity.title || !identity.artists?.length)) return failure('musicbrainz', new GenreError('unsupported', 'TRACK_METADATA_REQUIRED'));
+      let data;
+      try {
+        data = await limiters.musicbrainz.run(async () => {
+          try {
+            return await options.musicbrainz(identity, signal);
+          } catch (err) {
+            blockOnError(limiters.musicbrainz, err);
+            throw err;
+          }
+        }, signal);
+      } catch (e) {
+        throw e instanceof GenreError ? e : new GenreError('error', 'MUSICBRAINZ_REQUEST_FAILED');
+      }
+      checkAbort(signal);
+      if (!data) return response('musicbrainz', 'no_match', []);
+      await options.prepareSpotifyGenres?.();
+      checkAbort(signal);
+      const rawGenres = Array.isArray(data.genres) ? data.genres : [];
+      const rawTags = Array.isArray(data.styles) ? data.styles : (Array.isArray(data.tags) ? data.tags : []);
+      const validTags = rawTags.filter(t => {
+        const name = typeof t === 'string' ? t : t?.name;
+        if (!name || typeof name !== 'string') return false;
+        return options.validateSpotifyGenre ? options.validateSpotifyGenre(name, 1) === true : true;
+      });
+      const genreLabels = labelsFrom(rawGenres, 'genre', 'musicbrainz');
+      const styleLabels = labelsFrom(validTags, 'style', 'musicbrainz');
+      if (!genreLabels.length && styleLabels.length) {
+        if (options.formatSpotifyGenres) {
+          const formatted = labelsFrom(options.formatSpotifyGenres(styleLabels.map(s => ({ name: s.label, rawValue: s.rawValue }))), 'genre', 'musicbrainz');
+          const derivedGenres = formatted.filter(l => l.kind === 'genre');
+          if (derivedGenres.length) genreLabels.push(...derivedGenres);
+          else styleLabels[0].kind = 'genre';
+        } else {
+          styleLabels[0].kind = 'genre';
+        }
+      }
+      const labels = sortLabelsByKind(dedupeLabels([...genreLabels, ...styleLabels]));
+      return response('musicbrainz', labels.length ? 'success' : 'empty', labels, {
+        entityType: data.entityType || 'recording',
+        entityId: data.entityId || identity.key,
+        sourceUrl: data.sourceUrl || 'https://musicbrainz.org',
+        validationRule: 'musicbrainz-ws2-v1',
+        match: accepted('musicbrainz-ws2', 'Gêneros e subgêneros obtidos do MusicBrainz.')
+      });
     }
     async function spotify(identity, signal) {
       if (!identity.uri.startsWith('spotify:track:') || !options.spotify) return failure('spotify', new GenreError('unsupported', 'SPOTIFY_TRACK_REQUIRED'));
@@ -335,9 +471,12 @@ const Genre4allGenres = (() => {
       });
       const formatted = options.formatSpotifyGenres
         ? options.formatSpotifyGenres(valid)
-        : labelsFrom(valid.map(c => c.name));
-      const labels = Array.isArray(formatted) ? dedupeLabels(labelsFrom(formatted)) : labelsFrom(valid.map(c => c.name));
-      labels.forEach(label => { label.rawValue ||= valid.find(c => key(c.name) === label.key)?.rawValue || label.label; });
+        : labelsFrom(valid.map(c => c.name), 'genre', 'spotify');
+      const labels = Array.isArray(formatted) ? dedupeLabels(labelsFrom(formatted, 'genre', 'spotify')) : labelsFrom(valid.map(c => c.name), 'genre', 'spotify');
+      labels.forEach(label => {
+        label.provider ||= 'spotify';
+        label.rawValue ||= valid.find(c => key(c.name) === label.key)?.rawValue || label.label;
+      });
       return response('spotify', labels.length ? 'success' : 'empty', labels, {
         entityType: 'recording',
         entityId: identity.uri,
@@ -346,9 +485,9 @@ const Genre4allGenres = (() => {
         match: accepted('spotify-uri', 'Gêneros obtidos automaticamente dos metadados da faixa no Spotify (MetadataService).')
       });
     }
-    const adapters = { spotify, ...options.providers };
+    const adapters = { discogs, musicbrainz, spotify, ...options.providers };
     async function runProvider(provider, identity, signal) {
-      const cacheKey = identity.uri.startsWith('spotify:track:') ? identity.uri : identity.key;
+      const cacheKey = provider === 'spotify' && identity.uri.startsWith('spotify:track:') ? identity.uri : identity.key;
       const id = `provider:${provider}:${cacheKey}`;
       const cached = await cacheGet(providerCache, id);
       if (cached) return cached;
@@ -357,10 +496,18 @@ const Genre4allGenres = (() => {
         checkAbort(signal);
         if (!r || r.provider !== provider || !STATUSES.includes(r.status) || !Array.isArray(r.labels)) throw new GenreError('error', 'PROVIDER_CONTRACT_INVALID');
         if (r.status === 'success' && !r.labels.length) throw new GenreError('error', 'PROVIDER_EMPTY_SUCCESS');
-        const result = { ...r, dependencies: [] };
-        if (['success', 'empty', 'no_match'].includes(r.status)) await cachePut(providerCache, id, result, r.expiresAt || now() + TTL[provider]);
+        const labels = r.labels.map(l => ({ ...l, provider: l.provider || provider }));
+        const orderedLabels = provider === 'spotify' ? labels : sortLabelsByKind(labels);
+        const result = { ...r, labels: orderedLabels, dependencies: [] };
+        if (['success', 'empty', 'no_match'].includes(r.status)) await cachePut(providerCache, id, result, r.expiresAt || now() + (TTL[provider] || HOUR));
         return result;
       } catch (e) { return failure(provider, e); }
+    }
+    function filterByPolicy(rawLabels, policy, provider) {
+      const filtered = rawLabels
+        .map(l => ({ ...l, provider: l.provider || provider }))
+        .filter(l => (l.kinds || [l.kind]).some(kind => kind === 'style' ? policy.showStyles : policy.showGenres));
+      return provider === 'spotify' ? filtered : sortLabelsByKind(filtered);
     }
     async function resolve(track, { signal } = {}) {
       try { await ready; await cacheMutation; } catch { return { ...failure(null, new GenreError('error', 'STORAGE_UNAVAILABLE')), configVersion: revision, attempts: [] }; }
@@ -376,23 +523,81 @@ const Genre4allGenres = (() => {
         return clone(await subscribe(inflight, id, async sharedSignal => {
           const attempts = [], enabled = policy.order.filter(p => policy.enabled[p]);
           if (!enabled.length) return { status: 'empty', reason: 'SOURCES_DISABLED', labels: [], attempts, configVersion: currentRevision };
-          if (!identity.uri) return { status: 'unsupported', errorCode: 'SPOTIFY_TRACK_REQUIRED', labels: [], attempts, configVersion: currentRevision };
-          let final;
+          if (!identity.uri || !identity.uri.startsWith('spotify:track:')) return { status: 'unsupported', errorCode: 'SPOTIFY_TRACK_REQUIRED', labels: [], attempts, configVersion: currentRevision };
+          let final = null;
+          let mbSuccess = null;
           for (const provider of enabled) {
             checkAbort(sharedSignal);
+            const isDiscogsReady = Boolean(options.providers?.discogs || (options.discogs && (typeof options.discogs.isConfigured !== 'function' || options.discogs.isConfigured())));
+            const isMbReady = Boolean(options.providers?.musicbrainz || (options.musicbrainz && (typeof options.musicbrainz.isConfigured !== 'function' || options.musicbrainz.isConfigured())));
+            if (provider === 'discogs' && !isDiscogsReady && enabled.length > 1) continue;
+            if (provider === 'musicbrainz' && !isMbReady && enabled.length > 1) continue;
             const raw = await runProvider(provider, identity, sharedSignal);
             checkAbort(sharedSignal);
             if (revision !== currentRevision) throw cancelled();
-            const labels = raw.labels.filter(l => (l.kinds || [l.kind]).some(kind => kind === 'style' ? policy.showStyles : policy.showGenres));
-            const usable = raw.status === 'success' && !labels.length ? { ...raw, status: 'empty', reason: 'LABEL_FILTERS_EMPTY' } : raw;
-            attempts.push({ ...usable, labels: dedupeLabels(labels) });
-            if (usable.status === 'success' || !['empty', 'no_match'].includes(usable.status)) {
-              final = { ...usable, labels: dedupeLabels(labels), selectedProvider: usable.status === 'success' ? provider : null };
-              break;
+            const labels = filterByPolicy(raw.labels, policy, provider);
+            const usable = raw.status === 'success' && !labels.length
+              ? { ...raw, status: 'empty', reason: 'LABEL_FILTERS_EMPTY', labels: [] }
+              : { ...raw, labels: dedupeLabels(labels) };
+            attempts.push(usable);
+            if (usable.status === 'success') {
+              if (provider === 'discogs') {
+                // Rule 1: Discogs found genres -> short-circuit immediately (do not query MusicBrainz or Spotify).
+                final = { ...usable, selectedProvider: 'discogs' };
+                break;
+              }
+              if (provider === 'musicbrainz') {
+                // Rule 2: MusicBrainz found genres -> retain as primary, and also query Spotify if enabled.
+                mbSuccess = usable;
+                const spIdx = enabled.indexOf('spotify');
+                if (spIdx === -1 || spIdx < enabled.indexOf('musicbrainz')) {
+                  final = { ...usable, selectedProvider: 'musicbrainz' };
+                  break;
+                }
+                continue;
+              }
+              if (provider === 'spotify') {
+                if (mbSuccess) {
+                  // Combine MusicBrainz (primary) + Spotify (complementary).
+                  // Keep MusicBrainz labels first (with main genre at index 0), followed by Spotify labels.
+                  const merged = dedupeLabels([...mbSuccess.labels, ...usable.labels]);
+                  const firstGenreIdx = merged.findIndex(l => l.kind === 'genre');
+                  if (firstGenreIdx > 0) {
+                    const [firstGenre] = merged.splice(firstGenreIdx, 1);
+                    merged.unshift(firstGenre);
+                  }
+                  final = {
+                    ...mbSuccess,
+                    labels: merged,
+                    selectedProvider: 'musicbrainz',
+                    expiresAt: Math.min(mbSuccess.expiresAt || Infinity, usable.expiresAt || Infinity)
+                  };
+                } else {
+                  final = { ...usable, selectedProvider: 'spotify' };
+                }
+                break;
+              }
             }
           }
-          final ||= { status: 'empty', reason: 'ALL_SOURCES_EMPTY', labels: [], selectedProvider: null };
-          const expiresAt = Math.min(...attempts.map(r => r.expiresAt || now()));
+          if (!final && mbSuccess) {
+            final = { ...mbSuccess, selectedProvider: 'musicbrainz' };
+          }
+          if (!final) {
+            const lastAttempt = attempts[attempts.length - 1];
+            const anyEmpty = attempts.some(a => a.status === 'empty');
+            if (anyEmpty) {
+              final = { status: 'empty', reason: 'ALL_SOURCES_EMPTY', labels: [], selectedProvider: null };
+            } else if (lastAttempt && !['empty', 'no_match', 'not_configured'].includes(lastAttempt.status)) {
+              final = { ...lastAttempt, labels: [], selectedProvider: null };
+            } else {
+              const allNotConfigured = attempts.length > 0 && attempts.every(a => a.status === 'not_configured');
+              final = allNotConfigured
+                ? { ...attempts[0], labels: [], selectedProvider: null }
+                : { status: 'empty', reason: 'ALL_SOURCES_EMPTY', labels: [], selectedProvider: null };
+            }
+          }
+          const validExpiries = attempts.map(r => r.expiresAt).filter(Number.isFinite);
+          const expiresAt = Number.isFinite(final.expiresAt) ? final.expiresAt : (validExpiries.length ? Math.min(...validExpiries) : now() + HOUR);
           const result = { ...final, identityKey: identity.key, configVersion: currentRevision, attempts, expiresAt };
           if (['success', 'empty'].includes(result.status) && expiresAt > now()) {
             resolved.set(id, result);
@@ -411,9 +616,21 @@ const Genre4allGenres = (() => {
       async configure(patch) {
         await ready;
         const next = configFrom({ ...config, ...patch, enabled: { ...config.enabled, ...patch.enabled } });
-        const policyChanged = JSON.stringify({ ...next, colors: true }) !== JSON.stringify({ ...config, colors: true });
+        const tokenChanged = next.discogsToken !== config.discogsToken || next.musicbrainzToken !== config.musicbrainzToken;
+        const policyChanged = tokenChanged || JSON.stringify({ ...next, colors: true }) !== JSON.stringify({ ...config, colors: true });
         const previous = config;
         config = next;
+        if (tokenChanged) {
+          if (next.discogsToken !== previous.discogsToken) limiters.discogs.unblock();
+          if (next.musicbrainzToken !== previous.musicbrainzToken) limiters.musicbrainz.unblock();
+          for (const [id] of providerCache) {
+            if ((next.discogsToken !== previous.discogsToken && id.startsWith('provider:discogs:'))
+              || (next.musicbrainzToken !== previous.musicbrainzToken && id.startsWith('provider:musicbrainz:'))) {
+              providerCache.delete(id);
+              remove('cache', id);
+            }
+          }
+        }
         if (policyChanged) invalidate(); else notify();
         try { await write('settings', 'genre-selector-v1', next); }
         catch (error) { if (config === next) { config = previous; invalidate(); } throw error; }
@@ -422,6 +639,7 @@ const Genre4allGenres = (() => {
       async resetConfig() { return this.configure(defaultConfig()); },
       async clearCache() {
         await ready;
+        for (const p of PROVIDERS) limiters[p].unblock();
         await mutateCache(async () => {
           providerCache.clear(); resolved.clear(); clearTimeout(expiryTimer);
           await storage.clear('cache');
@@ -429,6 +647,7 @@ const Genre4allGenres = (() => {
       },
       async refresh(track, opts = {}) {
         await ready;
+        for (const p of PROVIDERS) limiters[p].unblock();
         await mutateCache(async () => {
           const identity = identityFor(track);
           const target = identity.uri.startsWith('spotify:track:') ? identity.uri : identity.key;
@@ -440,6 +659,7 @@ const Genre4allGenres = (() => {
       },
       async refreshContext(tracks, opts = {}) {
         await ready;
+        for (const p of PROVIDERS) limiters[p].unblock();
         await mutateCache(async () => {
           const targets = new Set(tracks.flatMap(t => {
             const id = identityFor(t);
@@ -466,6 +686,6 @@ const Genre4allGenres = (() => {
       close() { closed = true; clearTimeout(expiryTimer); invalidate(); changes.clear(); }
     };
   }
-  return { PROVIDERS, STATUSES, TTL, GenreError, defaultConfig, configFrom, labelsFrom, dedupeLabels, identityFor, versionOf, matchRecording, createLimiter, subscribe, decodeConcepts, createService, retryTime };
+  return { PROVIDERS, STATUSES, TTL, GenreError, defaultConfig, configFrom, labelsFrom, dedupeLabels, sortLabelsByKind, identityFor, versionOf, matchRecording, createLimiter, subscribe, decodeConcepts, createService, retryTime };
 })();
 if (typeof module !== 'undefined' && module.exports) module.exports = Genre4allGenres;

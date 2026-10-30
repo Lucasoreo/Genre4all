@@ -27,20 +27,29 @@ SOFTWARE.
 */
 (function () {
 "use strict";
-/* Genre4all genre resolver, adapted from Sort-Play-2. MIT, hoeci and contributors. Spotify metadata priority. */
+/* Genre4all genre resolver (v1.1). Priority: Discogs -> MusicBrainz (+ Spotify) -> Spotify. */
 const Genre4allGenres = (() => {
   'use strict';
-  const PROVIDERS = Object.freeze(['spotify']);
+  const PROVIDERS = Object.freeze(['discogs', 'musicbrainz', 'spotify']);
   const STATUSES = Object.freeze(['success', 'empty', 'no_match', 'not_configured', 'unsupported', 'rate_limited', 'error', 'cancelled']);
   const HOUR = 3600000;
-  const TTL = { spotify: HOUR };
+  const TTL = { discogs: 24 * HOUR, musicbrainz: 24 * HOUR, spotify: HOUR };
   const CACHE_VERSION = 2;
   const CACHE_LIMIT = 2000;
   const clone = typeof structuredClone === 'function' ? value => structuredClone(value) : value => JSON.parse(JSON.stringify(value));
   const identityCache = new WeakMap();
   const key = value => String(value || '').normalize('NFKC').trim().replace(/\s+/gu, ' ').toLocaleLowerCase('en-US');
   const matchText = value => key(value).replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
-  const defaultConfig = () => ({ version: 1, order: [...PROVIDERS], enabled: Object.fromEntries(PROVIDERS.map(p => [p, true])), showGenres: true, showStyles: true, colors: true });
+  const defaultConfig = () => ({
+    version: 1,
+    order: [...PROVIDERS],
+    enabled: Object.fromEntries(PROVIDERS.map(p => [p, true])),
+    showGenres: true,
+    showStyles: true,
+    colors: true,
+    discogsToken: '',
+    musicbrainzToken: ''
+  });
   function configFrom(value) {
     const v = value && typeof value === 'object' ? value : {};
     const defaults = defaultConfig();
@@ -50,12 +59,14 @@ const Genre4allGenres = (() => {
       enabled: Object.fromEntries(PROVIDERS.map(p => [p, typeof v.enabled?.[p] === 'boolean' ? v.enabled[p] : true])),
       showGenres: v.showGenres !== false,
       showStyles: v.showStyles !== false,
-      colors: v.colors !== false
+      colors: v.colors !== false,
+      discogsToken: typeof v.discogsToken === 'string' ? v.discogsToken.trim() : '',
+      musicbrainzToken: typeof v.musicbrainzToken === 'string' ? v.musicbrainzToken.trim() : ''
     };
   }
-  /** @typedef {{key:string,label:string,kind:'genre'|'style'|'tag',kinds?:string[],rawValue:string}} GenreLabel */
+  /** @typedef {{key:string,label:string,kind:'genre'|'style'|'tag',kinds?:string[],rawValue:string,provider?:string}} GenreLabel */
   /** @typedef {{provider:string,status:string,labels:GenreLabel[],entityType?:string,entityId?:string,sourceUrl?:string,fetchedAt?:number,expiresAt?:number,match?:{method:string,explanation:string,accepted:boolean},retryAt?:number,errorCode?:string}} ProviderResult */
-  function labelsFrom(values, kind = 'genre') {
+  function labelsFrom(values, kind = 'genre', provider = undefined) {
     const seen = new Set();
     return (Array.isArray(values) ? values : []).flatMap(raw => {
       const text = typeof raw === 'string' ? raw : (raw?.label ?? raw?.name);
@@ -64,17 +75,36 @@ const Genre4allGenres = (() => {
       const itemKind = (typeof raw === 'object' && raw?.kind) ? raw.kind : kind;
       if (seen.has(`${k}:${itemKind}`)) return [];
       seen.add(`${k}:${itemKind}`);
-      return [{ key: k, label: text.trim().replace(/\s+/gu, ' '), kind: itemKind, rawValue: typeof raw === 'object' && typeof raw?.rawValue === 'string' ? raw.rawValue : text }];
+      const itemProvider = (typeof raw === 'object' && raw?.provider) ? raw.provider : provider;
+      return [{
+        key: k,
+        label: text.trim().replace(/\s+/gu, ' '),
+        kind: itemKind,
+        rawValue: typeof raw === 'object' && typeof raw?.rawValue === 'string' ? raw.rawValue : text,
+        ...(itemProvider ? { provider: itemProvider } : {})
+      }];
     });
   }
   function dedupeLabels(values) {
     const seen = new Map();
     for (const label of values) {
       const kinds = label.kinds || [label.kind];
-      if (seen.has(label.key)) seen.get(label.key).kinds = [...new Set([...seen.get(label.key).kinds, ...kinds])];
-      else seen.set(label.key, { ...label, kinds: [...kinds] });
+      if (seen.has(label.key)) {
+        const existing = seen.get(label.key);
+        existing.kinds = [...new Set([...existing.kinds, ...kinds])];
+      } else {
+        seen.set(label.key, { ...label, kinds: [...kinds] });
+      }
     }
     return [...seen.values()];
+  }
+  function sortLabelsByKind(values) {
+    const genres = [], styles = [];
+    for (const label of values) {
+      if (label.kind === 'genre') genres.push(label);
+      else styles.push(label);
+    }
+    return [...genres, ...styles];
   }
   function identityFor(track) {
     const t = track && typeof track === 'object' ? track : {};
@@ -176,6 +206,7 @@ const Genre4allGenres = (() => {
     let tail = Promise.resolve(), pending = 0, nextAt = 0, blockedUntil = 0, spacing = interval;
     return {
       block(until) { if (Number.isFinite(until)) blockedUntil = Math.max(blockedUntil, until); },
+      unblock() { blockedUntil = 0; },
       setSpacing(ms) { if (Number.isFinite(ms) && ms > 0) { spacing = Math.max(interval, ms); nextAt = Math.max(nextAt, now() + spacing); } },
       async run(work, signal) {
         checkAbort(signal);
@@ -279,7 +310,8 @@ const Genre4allGenres = (() => {
     const now = options.now || (() => Date.now());
     const storage = options.storage || { async get() {}, async set() {}, async remove() {}, async clear() {}, async entries() { return []; } };
     const providerCache = new Map(), resolved = new Map(), inflight = new Map();
-    const limiters = Object.fromEntries(PROVIDERS.map(p => [p, createLimiter(25, { now, wait: options.wait, maxQueue: 256 })]));
+    const intervals = { discogs: options.discogsInterval ?? 1000, musicbrainz: options.musicbrainzInterval ?? 1000, spotify: options.spotifyInterval ?? 25 };
+    const limiters = Object.fromEntries(PROVIDERS.map(p => [p, createLimiter(intervals[p] ?? 25, { now, wait: options.wait, maxQueue: 256 })]));
     let config = defaultConfig(), revision = 1, closed = false;
     let persistence = Promise.resolve(), cacheMutation = Promise.resolve(), expiryTimer = null;
     const changes = new Set();
@@ -288,7 +320,7 @@ const Genre4allGenres = (() => {
     const ready = (async () => {
       config = configFrom(await storage.get('settings', 'genre-selector-v1'));
       for (const [id, entry] of await storage.entries('cache')) {
-        if (entry?.version === CACHE_VERSION && entry.value && typeof entry.value === 'object' && Number.isFinite(entry.expiresAt) && entry.expiresAt > now() && id.startsWith('provider:spotify:')) {
+        if (entry?.version === CACHE_VERSION && entry.value && typeof entry.value === 'object' && Number.isFinite(entry.expiresAt) && entry.expiresAt > now() && PROVIDERS.some(p => id.startsWith(`provider:${p}:`))) {
           providerCache.set(id, entry);
         } else await storage.remove('cache', id);
       }
@@ -346,7 +378,111 @@ const Genre4allGenres = (() => {
       return { provider, status: e.status, labels: [], errorCode: e.code, ...(e.retryAt ? { retryAt: e.retryAt } : {}) };
     }
     function response(provider, state, labels = [], fields = {}) {
-      return { provider, status: state, labels: dedupeLabels(labels), fetchedAt: now(), expiresAt: now() + TTL[provider], ...fields };
+      return { provider, status: state, labels: dedupeLabels(labels), fetchedAt: now(), expiresAt: now() + (TTL[provider] || HOUR), ...fields };
+    }
+    function blockOnError(limiter, e) {
+      if (e instanceof GenreError) {
+        if (e.status === 'cancelled') return;
+        if (e.retryAt) limiter.block(e.retryAt);
+        else if (e.status === 'rate_limited') limiter.block(now() + 60000);
+        else if (e.status === 'error') limiter.block(now() + 20000);
+      } else {
+        limiter.block(now() + 20000);
+      }
+    }
+    async function discogs(identity, signal) {
+      if (!options.discogs || (typeof options.discogs.isConfigured === 'function' && !options.discogs.isConfigured())) {
+        return failure('discogs', new GenreError('not_configured', 'DISCOGS_TOKEN_REQUIRED'));
+      }
+      if (!identity.title || !identity.artists?.length) return failure('discogs', new GenreError('unsupported', 'TRACK_METADATA_REQUIRED'));
+      let data;
+      try {
+        data = await limiters.discogs.run(async () => {
+          try {
+            const res = await options.discogs(identity, signal);
+            if (res?.rateLimitExhaustedUntil) limiters.discogs.block(res.rateLimitExhaustedUntil);
+            return res;
+          } catch (err) {
+            blockOnError(limiters.discogs, err);
+            throw err;
+          }
+        }, signal);
+      } catch (e) {
+        throw e instanceof GenreError ? e : new GenreError('error', 'DISCOGS_REQUEST_FAILED');
+      }
+      checkAbort(signal);
+      if (!data) return response('discogs', 'no_match', []);
+      const rawGenres = Array.isArray(data.genres) ? data.genres : (Array.isArray(data.genre) ? data.genre : []);
+      const rawStyles = Array.isArray(data.styles) ? data.styles : (Array.isArray(data.style) ? data.style : []);
+      const genreLabels = labelsFrom(rawGenres, 'genre', 'discogs');
+      const styleLabels = labelsFrom(rawStyles, 'style', 'discogs');
+      if (!genreLabels.length && styleLabels.length) {
+        if (options.formatSpotifyGenres) {
+          const derived = labelsFrom(options.formatSpotifyGenres(styleLabels.map(s => ({ name: s.label, rawValue: s.rawValue }))), 'genre', 'discogs').filter(l => l.kind === 'genre');
+          if (derived.length) genreLabels.push(...derived);
+          else styleLabels[0].kind = 'genre';
+        } else {
+          styleLabels[0].kind = 'genre';
+        }
+      }
+      const labels = sortLabelsByKind(dedupeLabels([...genreLabels, ...styleLabels]));
+      return response('discogs', labels.length ? 'success' : 'empty', labels, {
+        entityType: data.entityType || 'release',
+        entityId: data.entityId || identity.key,
+        sourceUrl: data.sourceUrl || 'https://www.discogs.com',
+        validationRule: 'discogs-search-v1',
+        match: accepted('discogs-search', 'Gêneros e subgêneros obtidos do Discogs.')
+      });
+    }
+    async function musicbrainz(identity, signal) {
+      if (!options.musicbrainz || (typeof options.musicbrainz.isConfigured === 'function' && !options.musicbrainz.isConfigured())) {
+        return failure('musicbrainz', new GenreError('not_configured', 'MUSICBRAINZ_UNAVAILABLE'));
+      }
+      if (!identity.isrc && (!identity.title || !identity.artists?.length)) return failure('musicbrainz', new GenreError('unsupported', 'TRACK_METADATA_REQUIRED'));
+      let data;
+      try {
+        data = await limiters.musicbrainz.run(async () => {
+          try {
+            return await options.musicbrainz(identity, signal);
+          } catch (err) {
+            blockOnError(limiters.musicbrainz, err);
+            throw err;
+          }
+        }, signal);
+      } catch (e) {
+        throw e instanceof GenreError ? e : new GenreError('error', 'MUSICBRAINZ_REQUEST_FAILED');
+      }
+      checkAbort(signal);
+      if (!data) return response('musicbrainz', 'no_match', []);
+      await options.prepareSpotifyGenres?.();
+      checkAbort(signal);
+      const rawGenres = Array.isArray(data.genres) ? data.genres : [];
+      const rawTags = Array.isArray(data.styles) ? data.styles : (Array.isArray(data.tags) ? data.tags : []);
+      const validTags = rawTags.filter(t => {
+        const name = typeof t === 'string' ? t : t?.name;
+        if (!name || typeof name !== 'string') return false;
+        return options.validateSpotifyGenre ? options.validateSpotifyGenre(name, 1) === true : true;
+      });
+      const genreLabels = labelsFrom(rawGenres, 'genre', 'musicbrainz');
+      const styleLabels = labelsFrom(validTags, 'style', 'musicbrainz');
+      if (!genreLabels.length && styleLabels.length) {
+        if (options.formatSpotifyGenres) {
+          const formatted = labelsFrom(options.formatSpotifyGenres(styleLabels.map(s => ({ name: s.label, rawValue: s.rawValue }))), 'genre', 'musicbrainz');
+          const derivedGenres = formatted.filter(l => l.kind === 'genre');
+          if (derivedGenres.length) genreLabels.push(...derivedGenres);
+          else styleLabels[0].kind = 'genre';
+        } else {
+          styleLabels[0].kind = 'genre';
+        }
+      }
+      const labels = sortLabelsByKind(dedupeLabels([...genreLabels, ...styleLabels]));
+      return response('musicbrainz', labels.length ? 'success' : 'empty', labels, {
+        entityType: data.entityType || 'recording',
+        entityId: data.entityId || identity.key,
+        sourceUrl: data.sourceUrl || 'https://musicbrainz.org',
+        validationRule: 'musicbrainz-ws2-v1',
+        match: accepted('musicbrainz-ws2', 'Gêneros e subgêneros obtidos do MusicBrainz.')
+      });
     }
     async function spotify(identity, signal) {
       if (!identity.uri.startsWith('spotify:track:') || !options.spotify) return failure('spotify', new GenreError('unsupported', 'SPOTIFY_TRACK_REQUIRED'));
@@ -364,9 +500,12 @@ const Genre4allGenres = (() => {
       });
       const formatted = options.formatSpotifyGenres
         ? options.formatSpotifyGenres(valid)
-        : labelsFrom(valid.map(c => c.name));
-      const labels = Array.isArray(formatted) ? dedupeLabels(labelsFrom(formatted)) : labelsFrom(valid.map(c => c.name));
-      labels.forEach(label => { label.rawValue ||= valid.find(c => key(c.name) === label.key)?.rawValue || label.label; });
+        : labelsFrom(valid.map(c => c.name), 'genre', 'spotify');
+      const labels = Array.isArray(formatted) ? dedupeLabels(labelsFrom(formatted, 'genre', 'spotify')) : labelsFrom(valid.map(c => c.name), 'genre', 'spotify');
+      labels.forEach(label => {
+        label.provider ||= 'spotify';
+        label.rawValue ||= valid.find(c => key(c.name) === label.key)?.rawValue || label.label;
+      });
       return response('spotify', labels.length ? 'success' : 'empty', labels, {
         entityType: 'recording',
         entityId: identity.uri,
@@ -375,9 +514,9 @@ const Genre4allGenres = (() => {
         match: accepted('spotify-uri', 'Gêneros obtidos automaticamente dos metadados da faixa no Spotify (MetadataService).')
       });
     }
-    const adapters = { spotify, ...options.providers };
+    const adapters = { discogs, musicbrainz, spotify, ...options.providers };
     async function runProvider(provider, identity, signal) {
-      const cacheKey = identity.uri.startsWith('spotify:track:') ? identity.uri : identity.key;
+      const cacheKey = provider === 'spotify' && identity.uri.startsWith('spotify:track:') ? identity.uri : identity.key;
       const id = `provider:${provider}:${cacheKey}`;
       const cached = await cacheGet(providerCache, id);
       if (cached) return cached;
@@ -386,10 +525,18 @@ const Genre4allGenres = (() => {
         checkAbort(signal);
         if (!r || r.provider !== provider || !STATUSES.includes(r.status) || !Array.isArray(r.labels)) throw new GenreError('error', 'PROVIDER_CONTRACT_INVALID');
         if (r.status === 'success' && !r.labels.length) throw new GenreError('error', 'PROVIDER_EMPTY_SUCCESS');
-        const result = { ...r, dependencies: [] };
-        if (['success', 'empty', 'no_match'].includes(r.status)) await cachePut(providerCache, id, result, r.expiresAt || now() + TTL[provider]);
+        const labels = r.labels.map(l => ({ ...l, provider: l.provider || provider }));
+        const orderedLabels = provider === 'spotify' ? labels : sortLabelsByKind(labels);
+        const result = { ...r, labels: orderedLabels, dependencies: [] };
+        if (['success', 'empty', 'no_match'].includes(r.status)) await cachePut(providerCache, id, result, r.expiresAt || now() + (TTL[provider] || HOUR));
         return result;
       } catch (e) { return failure(provider, e); }
+    }
+    function filterByPolicy(rawLabels, policy, provider) {
+      const filtered = rawLabels
+        .map(l => ({ ...l, provider: l.provider || provider }))
+        .filter(l => (l.kinds || [l.kind]).some(kind => kind === 'style' ? policy.showStyles : policy.showGenres));
+      return provider === 'spotify' ? filtered : sortLabelsByKind(filtered);
     }
     async function resolve(track, { signal } = {}) {
       try { await ready; await cacheMutation; } catch { return { ...failure(null, new GenreError('error', 'STORAGE_UNAVAILABLE')), configVersion: revision, attempts: [] }; }
@@ -405,23 +552,81 @@ const Genre4allGenres = (() => {
         return clone(await subscribe(inflight, id, async sharedSignal => {
           const attempts = [], enabled = policy.order.filter(p => policy.enabled[p]);
           if (!enabled.length) return { status: 'empty', reason: 'SOURCES_DISABLED', labels: [], attempts, configVersion: currentRevision };
-          if (!identity.uri) return { status: 'unsupported', errorCode: 'SPOTIFY_TRACK_REQUIRED', labels: [], attempts, configVersion: currentRevision };
-          let final;
+          if (!identity.uri || !identity.uri.startsWith('spotify:track:')) return { status: 'unsupported', errorCode: 'SPOTIFY_TRACK_REQUIRED', labels: [], attempts, configVersion: currentRevision };
+          let final = null;
+          let mbSuccess = null;
           for (const provider of enabled) {
             checkAbort(sharedSignal);
+            const isDiscogsReady = Boolean(options.providers?.discogs || (options.discogs && (typeof options.discogs.isConfigured !== 'function' || options.discogs.isConfigured())));
+            const isMbReady = Boolean(options.providers?.musicbrainz || (options.musicbrainz && (typeof options.musicbrainz.isConfigured !== 'function' || options.musicbrainz.isConfigured())));
+            if (provider === 'discogs' && !isDiscogsReady && enabled.length > 1) continue;
+            if (provider === 'musicbrainz' && !isMbReady && enabled.length > 1) continue;
             const raw = await runProvider(provider, identity, sharedSignal);
             checkAbort(sharedSignal);
             if (revision !== currentRevision) throw cancelled();
-            const labels = raw.labels.filter(l => (l.kinds || [l.kind]).some(kind => kind === 'style' ? policy.showStyles : policy.showGenres));
-            const usable = raw.status === 'success' && !labels.length ? { ...raw, status: 'empty', reason: 'LABEL_FILTERS_EMPTY' } : raw;
-            attempts.push({ ...usable, labels: dedupeLabels(labels) });
-            if (usable.status === 'success' || !['empty', 'no_match'].includes(usable.status)) {
-              final = { ...usable, labels: dedupeLabels(labels), selectedProvider: usable.status === 'success' ? provider : null };
-              break;
+            const labels = filterByPolicy(raw.labels, policy, provider);
+            const usable = raw.status === 'success' && !labels.length
+              ? { ...raw, status: 'empty', reason: 'LABEL_FILTERS_EMPTY', labels: [] }
+              : { ...raw, labels: dedupeLabels(labels) };
+            attempts.push(usable);
+            if (usable.status === 'success') {
+              if (provider === 'discogs') {
+                // Rule 1: Discogs found genres -> short-circuit immediately (do not query MusicBrainz or Spotify).
+                final = { ...usable, selectedProvider: 'discogs' };
+                break;
+              }
+              if (provider === 'musicbrainz') {
+                // Rule 2: MusicBrainz found genres -> retain as primary, and also query Spotify if enabled.
+                mbSuccess = usable;
+                const spIdx = enabled.indexOf('spotify');
+                if (spIdx === -1 || spIdx < enabled.indexOf('musicbrainz')) {
+                  final = { ...usable, selectedProvider: 'musicbrainz' };
+                  break;
+                }
+                continue;
+              }
+              if (provider === 'spotify') {
+                if (mbSuccess) {
+                  // Combine MusicBrainz (primary) + Spotify (complementary).
+                  // Keep MusicBrainz labels first (with main genre at index 0), followed by Spotify labels.
+                  const merged = dedupeLabels([...mbSuccess.labels, ...usable.labels]);
+                  const firstGenreIdx = merged.findIndex(l => l.kind === 'genre');
+                  if (firstGenreIdx > 0) {
+                    const [firstGenre] = merged.splice(firstGenreIdx, 1);
+                    merged.unshift(firstGenre);
+                  }
+                  final = {
+                    ...mbSuccess,
+                    labels: merged,
+                    selectedProvider: 'musicbrainz',
+                    expiresAt: Math.min(mbSuccess.expiresAt || Infinity, usable.expiresAt || Infinity)
+                  };
+                } else {
+                  final = { ...usable, selectedProvider: 'spotify' };
+                }
+                break;
+              }
             }
           }
-          final ||= { status: 'empty', reason: 'ALL_SOURCES_EMPTY', labels: [], selectedProvider: null };
-          const expiresAt = Math.min(...attempts.map(r => r.expiresAt || now()));
+          if (!final && mbSuccess) {
+            final = { ...mbSuccess, selectedProvider: 'musicbrainz' };
+          }
+          if (!final) {
+            const lastAttempt = attempts[attempts.length - 1];
+            const anyEmpty = attempts.some(a => a.status === 'empty');
+            if (anyEmpty) {
+              final = { status: 'empty', reason: 'ALL_SOURCES_EMPTY', labels: [], selectedProvider: null };
+            } else if (lastAttempt && !['empty', 'no_match', 'not_configured'].includes(lastAttempt.status)) {
+              final = { ...lastAttempt, labels: [], selectedProvider: null };
+            } else {
+              const allNotConfigured = attempts.length > 0 && attempts.every(a => a.status === 'not_configured');
+              final = allNotConfigured
+                ? { ...attempts[0], labels: [], selectedProvider: null }
+                : { status: 'empty', reason: 'ALL_SOURCES_EMPTY', labels: [], selectedProvider: null };
+            }
+          }
+          const validExpiries = attempts.map(r => r.expiresAt).filter(Number.isFinite);
+          const expiresAt = Number.isFinite(final.expiresAt) ? final.expiresAt : (validExpiries.length ? Math.min(...validExpiries) : now() + HOUR);
           const result = { ...final, identityKey: identity.key, configVersion: currentRevision, attempts, expiresAt };
           if (['success', 'empty'].includes(result.status) && expiresAt > now()) {
             resolved.set(id, result);
@@ -440,9 +645,21 @@ const Genre4allGenres = (() => {
       async configure(patch) {
         await ready;
         const next = configFrom({ ...config, ...patch, enabled: { ...config.enabled, ...patch.enabled } });
-        const policyChanged = JSON.stringify({ ...next, colors: true }) !== JSON.stringify({ ...config, colors: true });
+        const tokenChanged = next.discogsToken !== config.discogsToken || next.musicbrainzToken !== config.musicbrainzToken;
+        const policyChanged = tokenChanged || JSON.stringify({ ...next, colors: true }) !== JSON.stringify({ ...config, colors: true });
         const previous = config;
         config = next;
+        if (tokenChanged) {
+          if (next.discogsToken !== previous.discogsToken) limiters.discogs.unblock();
+          if (next.musicbrainzToken !== previous.musicbrainzToken) limiters.musicbrainz.unblock();
+          for (const [id] of providerCache) {
+            if ((next.discogsToken !== previous.discogsToken && id.startsWith('provider:discogs:'))
+              || (next.musicbrainzToken !== previous.musicbrainzToken && id.startsWith('provider:musicbrainz:'))) {
+              providerCache.delete(id);
+              remove('cache', id);
+            }
+          }
+        }
         if (policyChanged) invalidate(); else notify();
         try { await write('settings', 'genre-selector-v1', next); }
         catch (error) { if (config === next) { config = previous; invalidate(); } throw error; }
@@ -451,6 +668,7 @@ const Genre4allGenres = (() => {
       async resetConfig() { return this.configure(defaultConfig()); },
       async clearCache() {
         await ready;
+        for (const p of PROVIDERS) limiters[p].unblock();
         await mutateCache(async () => {
           providerCache.clear(); resolved.clear(); clearTimeout(expiryTimer);
           await storage.clear('cache');
@@ -458,6 +676,7 @@ const Genre4allGenres = (() => {
       },
       async refresh(track, opts = {}) {
         await ready;
+        for (const p of PROVIDERS) limiters[p].unblock();
         await mutateCache(async () => {
           const identity = identityFor(track);
           const target = identity.uri.startsWith('spotify:track:') ? identity.uri : identity.key;
@@ -469,6 +688,7 @@ const Genre4allGenres = (() => {
       },
       async refreshContext(tracks, opts = {}) {
         await ready;
+        for (const p of PROVIDERS) limiters[p].unblock();
         await mutateCache(async () => {
           const targets = new Set(tracks.flatMap(t => {
             const id = identityFor(t);
@@ -495,10 +715,10 @@ const Genre4allGenres = (() => {
       close() { closed = true; clearTimeout(expiryTimer); invalidate(); changes.clear(); }
     };
   }
-  return { PROVIDERS, STATUSES, TTL, GenreError, defaultConfig, configFrom, labelsFrom, dedupeLabels, identityFor, versionOf, matchRecording, createLimiter, subscribe, decodeConcepts, createService, retryTime };
+  return { PROVIDERS, STATUSES, TTL, GenreError, defaultConfig, configFrom, labelsFrom, dedupeLabels, sortLabelsByKind, identityFor, versionOf, matchRecording, createLimiter, subscribe, decodeConcepts, createService, retryTime };
 })();
 
-/* Spotify MetadataService transport and IndexedDB storage for the Genre Selector. */
+/* Transport adapters (Discogs, MusicBrainz, Spotify MetadataService) and IndexedDB storage for Genre4all. */
 const Genre4allTransport = (() => {
   'use strict';
   function createIndexedDBStorage(indexedDB = globalThis.indexedDB) {
@@ -528,6 +748,224 @@ const Genre4allTransport = (() => {
       async close() { (await ready).close(); }
     };
   }
+
+  const normText = value => String(value || '').normalize('NFKC').toLocaleLowerCase('en-US').replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+  function cleanSearchTitle(title) {
+    return String(title || '')
+      .replace(/\s*\((?:feat\.?|ft\.?|with\s|remaster|live|bonus|deluxe|version|edit|mix)[^)]*\)/giu, '')
+      .replace(/\s*\[(?:feat\.?|ft\.?|with\s|remaster|live|bonus|deluxe|version|edit|mix)[^\]]*\]/giu, '')
+      .replace(/\s*-\s*(?:\d{4}\s+)?(?:remaster(?:ed)?|live|mono|stereo|single\s+version|album\s+version|radio\s+edit).*$/giu, '')
+      .trim() || String(title || '').trim();
+  }
+  function escapeLucene(value) {
+    return String(value || '').replace(/(["\\+\-&|!(){}[\]^~*?:\/])/gu, '\\$1');
+  }
+
+  async function fetchJson(api, fetchImpl, url, headers, signal, prefix) {
+    if (signal?.aborted) throw new api.GenreError('cancelled', 'CANCELLED');
+    if (typeof fetchImpl !== 'function') throw new api.GenreError('unsupported', `${prefix}_FETCH_UNAVAILABLE`);
+    const controller = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; controller.abort(); }, 8000);
+    const onAbort = () => controller.abort();
+    signal?.addEventListener('abort', onAbort, { once: true });
+    try {
+      const res = await fetchImpl(url, { method: 'GET', headers: { Accept: 'application/json', ...headers }, signal: controller.signal });
+      if (signal?.aborted) throw new api.GenreError('cancelled', 'CANCELLED');
+      if (res.status === 401 || res.status === 403) throw new api.GenreError('not_configured', `${prefix}_AUTH_FAILED`, Date.now() + 60000);
+      if (res.status === 429 || res.status === 503) {
+        throw new api.GenreError('rate_limited', `${prefix}_RATE_LIMITED`, api.retryTime(res.headers?.get?.('retry-after'), Date.now()));
+      }
+      if (res.status === 404) return null;
+      if (!res.ok) throw new api.GenreError('error', `${prefix}_HTTP_${res.status}`, res.status >= 500 ? Date.now() + 20000 : undefined);
+      const remaining = Number(res.headers?.get?.('x-discogs-ratelimit-remaining'));
+      const data = await res.json();
+      if (Number.isFinite(remaining) && remaining <= 0 && data && typeof data === 'object') {
+        data.__rateLimitExhaustedUntil = Date.now() + 60000;
+      }
+      return data;
+    } catch (err) {
+      if (err instanceof api.GenreError) throw err;
+      if (signal?.aborted) throw new api.GenreError('cancelled', 'CANCELLED');
+      if (timedOut) throw new api.GenreError('error', `${prefix}_TIMEOUT`, Date.now() + 20000);
+      throw new api.GenreError('error', `${prefix}_REQUEST_FAILED`, Date.now() + 20000);
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+    }
+  }
+
+  function createDiscogsAdapter(api, getConfig, fetchImpl = globalThis.fetch) {
+    function applyAuth(params, token) {
+      if (token.includes(':')) {
+        const [k, ...rest] = token.split(':');
+        params.set('key', k.trim());
+        params.set('secret', rest.join(':').trim());
+      } else {
+        params.set('token', token);
+      }
+    }
+    function pickBest(identity, results) {
+      if (!Array.isArray(results) || !results.length) return null;
+      const targetTitle = normText(identity.title);
+      const targetClean = normText(cleanSearchTitle(identity.title));
+      const targetAlbum = normText(identity.album);
+      const targetArtists = (identity.artists || []).map(a => normText(String(a).replace(/\s*\(\d+\)$/u, ''))).filter(Boolean);
+      let best = null, bestScore = -1;
+      for (const item of results) {
+        const genres = Array.isArray(item?.genre) ? item.genre.filter(Boolean) : [];
+        const styles = Array.isArray(item?.style) ? item.style.filter(Boolean) : [];
+        if (!genres.length && !styles.length) continue;
+        const rawTitle = String(item.title || '');
+        const parts = rawTitle.split(' - ');
+        const itemArtist = normText((parts[0] || '').replace(/\s*\(\d+\)$/u, ''));
+        const itemRelease = normText(parts.slice(1).join(' - ') || rawTitle);
+        const fullNorm = normText(rawTitle);
+        const exactArtist = targetArtists.some(a => itemArtist === a);
+        const partialArtist = exactArtist || targetArtists.some(a => a && (itemArtist.includes(a) || a.includes(itemArtist) || fullNorm.includes(a)));
+        if (!partialArtist) continue;
+        let score = exactArtist ? 50 : 25;
+        if (targetTitle && (itemRelease === targetTitle || itemRelease === targetClean)) score += 40;
+        else if (targetAlbum && itemRelease === targetAlbum) score += 35;
+        else if ((targetClean && itemRelease.includes(targetClean)) || (targetAlbum && itemRelease.includes(targetAlbum))) score += 20;
+        if (item.type === 'master') score += 15;
+        if (genres.length) score += 10;
+        if (styles.length) score += 5;
+        if (score > bestScore) { bestScore = score; best = item; }
+      }
+      return best;
+    }
+    const adapter = async (identity, signal) => {
+      if (signal?.aborted) throw new api.GenreError('cancelled', 'CANCELLED');
+      const cfg = typeof getConfig === 'function' ? getConfig() : (getConfig || {});
+      const token = String(cfg?.discogsToken || '').trim();
+      if (!token) throw new api.GenreError('not_configured', 'DISCOGS_TOKEN_REQUIRED');
+      const title = cleanSearchTitle(identity?.title);
+      const artists = Array.isArray(identity?.artists) ? identity.artists.filter(Boolean) : [];
+      if (!title || !artists.length) throw new api.GenreError('unsupported', 'TRACK_METADATA_REQUIRED');
+
+      const params1 = new URLSearchParams({ artist: artists[0], track: title, per_page: '10' });
+      applyAuth(params1, token);
+      const data1 = await fetchJson(api, fetchImpl, `https://api.discogs.com/database/search?${params1}`, {}, signal, 'DISCOGS');
+      let best = pickBest(identity, data1?.results);
+      let exhaustedUntil = data1?.__rateLimitExhaustedUntil;
+
+      if (!best && !exhaustedUntil) {
+        const q = `${artists[0]} ${identity.album || title}`.trim();
+        const params2 = new URLSearchParams({ q, per_page: '10' });
+        applyAuth(params2, token);
+        const data2 = await fetchJson(api, fetchImpl, `https://api.discogs.com/database/search?${params2}`, {}, signal, 'DISCOGS');
+        best = pickBest(identity, data2?.results);
+        exhaustedUntil = data2?.__rateLimitExhaustedUntil;
+      }
+      if (!best) {
+        if (exhaustedUntil) throw new api.GenreError('rate_limited', 'DISCOGS_RATE_LIMITED', exhaustedUntil);
+        return null;
+      }
+      return {
+        genres: Array.isArray(best.genre) ? best.genre : [],
+        styles: Array.isArray(best.style) ? best.style : [],
+        entityType: best.type || 'release',
+        entityId: String(best.id || ''),
+        sourceUrl: best.uri ? new URL(best.uri, 'https://www.discogs.com').href : 'https://www.discogs.com',
+        ...(exhaustedUntil ? { rateLimitExhaustedUntil: exhaustedUntil } : {})
+      };
+    };
+    adapter.isConfigured = () => {
+      const cfg = typeof getConfig === 'function' ? getConfig() : (getConfig || {});
+      return Boolean(String(cfg?.discogsToken || '').trim());
+    };
+    return adapter;
+  }
+
+  function createMusicBrainzAdapter(api, getConfig, fetchImpl = globalThis.fetch) {
+    function collectBuckets(rec) {
+      const genreMap = new Map(), tagMap = new Map();
+      const add = (map, list, weight = 1) => {
+        if (!Array.isArray(list)) return;
+        for (const item of list) {
+          const name = typeof item === 'string' ? item.trim() : String(item?.name || '').trim();
+          const count = Number.isFinite(item?.count) ? item.count : 1;
+          if (!name || count <= 0) continue;
+          const k = name.toLocaleLowerCase('en-US');
+          const prev = map.get(k);
+          const score = count * weight;
+          if (!prev || score > prev.score) map.set(k, { name: prev?.name || name, score });
+        }
+      };
+      add(genreMap, rec?.genres, 3);
+      add(tagMap, rec?.tags, 3);
+      for (const rel of rec?.releases || []) {
+        add(genreMap, rel?.['release-group']?.genres, 2);
+        add(tagMap, rel?.['release-group']?.tags, 2);
+        add(genreMap, rel?.genres, 2);
+        add(tagMap, rel?.tags, 2);
+      }
+      if (rec?.['release-group']) {
+        add(genreMap, rec['release-group'].genres, 2);
+        add(tagMap, rec['release-group'].tags, 2);
+      }
+      for (const ac of rec?.['artist-credit'] || []) {
+        add(genreMap, ac?.artist?.genres, 1);
+        add(tagMap, ac?.artist?.tags, 1);
+      }
+      const genres = [...genreMap.values()].sort((a, b) => b.score - a.score).map(x => x.name);
+      const tags = [...tagMap.values()].sort((a, b) => b.score - a.score).map(x => x.name);
+      return { genres, tags };
+    }
+    function matchCandidate(identity, recordings) {
+      if (!Array.isArray(recordings) || !recordings.length) return null;
+      for (const rec of recordings) {
+        const recArtists = (rec?.['artist-credit'] || []).map(ac => ac?.artist?.name || ac?.name).filter(Boolean);
+        const isrcs = (rec?.isrcs || []).map(x => typeof x === 'string' ? x : x?.id).filter(Boolean);
+        if (api.matchRecording(identity, { title: rec?.title, artists: recArtists, durationMs: rec?.length, isrcs })) return rec;
+      }
+      const targetClean = normText(cleanSearchTitle(identity.title));
+      const targetArtists = (identity.artists || []).map(normText).filter(Boolean);
+      for (const rec of recordings) {
+        const recClean = normText(cleanSearchTitle(rec?.title));
+        if (!recClean || (recClean !== targetClean && !recClean.includes(targetClean) && !targetClean.includes(recClean))) continue;
+        const recArtists = (rec?.['artist-credit'] || []).map(ac => normText(ac?.artist?.name || ac?.name)).filter(Boolean);
+        if (targetArtists.length && recArtists.some(ra => targetArtists.some(ta => ra === ta || ra.includes(ta) || ta.includes(ra)))) return rec;
+      }
+      return null;
+    }
+    return async (identity, signal) => {
+      if (signal?.aborted) throw new api.GenreError('cancelled', 'CANCELLED');
+      const cfg = typeof getConfig === 'function' ? getConfig() : (getConfig || {});
+      const token = String(cfg?.musicbrainzToken || '').trim();
+      const isrc = String(identity?.isrc || '').trim();
+      const title = cleanSearchTitle(identity?.title);
+      const artists = Array.isArray(identity?.artists) ? identity.artists.filter(Boolean) : [];
+      if (!isrc && (!title || !artists.length)) throw new api.GenreError('unsupported', 'TRACK_METADATA_REQUIRED');
+
+      const headers = token ? { Authorization: `Bearer ${token}` } : {};
+      const parts = [];
+      if (isrc) parts.push(`isrc:${escapeLucene(isrc)}`);
+      if (title && artists.length) parts.push(`(recording:"${escapeLucene(title)}" AND artist:"${escapeLucene(artists[0])}")`);
+      const query = parts.join(' OR ');
+
+      const searchUrl = `https://musicbrainz.org/ws/2/recording?query=${encodeURIComponent(query)}&limit=8&fmt=json`;
+      const data = await fetchJson(api, fetchImpl, searchUrl, headers, signal, 'MUSICBRAINZ');
+      const matched = matchCandidate(identity, data?.recordings);
+      if (!matched) return null;
+
+      let { genres, tags } = collectBuckets(matched);
+      if (!genres.length && !tags.length && matched.id) {
+        const detailUrl = `https://musicbrainz.org/ws/2/recording/${encodeURIComponent(matched.id)}?inc=genres+tags+artists+release-groups&fmt=json`;
+        const detail = await fetchJson(api, fetchImpl, detailUrl, headers, signal, 'MUSICBRAINZ');
+        if (detail) ({ genres, tags } = collectBuckets(detail));
+      }
+      return {
+        genres,
+        tags,
+        entityType: 'recording',
+        entityId: String(matched.id || ''),
+        sourceUrl: matched.id ? `https://musicbrainz.org/recording/${matched.id}` : 'https://musicbrainz.org'
+      };
+    };
+  }
+
   function createSpotifyAdapter(api, getClient) {
     return async (uri, signal) => {
       if (signal?.aborted) throw new api.GenreError('cancelled', 'CANCELLED');
@@ -565,7 +1003,8 @@ const Genre4allTransport = (() => {
       } finally { clearTimeout(timer); signal?.removeEventListener('abort', abort); }
     };
   }
-  return { createIndexedDBStorage, createSpotifyAdapter };
+
+  return { createIndexedDBStorage, createSpotifyAdapter, createDiscogsAdapter, createMusicBrainzAdapter };
 })();
 
 /* Native extra-column view. All genre data and request caching belong to genre-service.js. */
@@ -603,7 +1042,9 @@ const Genre4allColumn = (() => {
       if (!value || typeof value !== 'object' || depth <= 0 || seen.has(value) || seen.size >= 300) return null;
       seen.add(value);
       if (value.uri === uri && typeof (value.name || value.title) === 'string') {
-        const source = Array.isArray(value.artists) ? value.artists : value.artists?.items;
+        const source = Array.isArray(value.artists)
+          ? value.artists
+          : [...(value.artists?.items || []), ...(value.firstArtist?.items || []), ...(value.otherArtists?.items || [])];
         const artists = (source || []).map(a => ({ name: typeof a === 'string' ? a : a.name || a.profile?.name || a.artist?.profile?.name })).filter(a => a.name);
         if (artists.length) return { ...value, uri, name: value.name || value.title, artists, album: value.album || value.albumOfTrack,
           duration_ms: value.duration_ms || value.duration?.totalMilliseconds || value.duration?.milliseconds };
@@ -624,10 +1065,15 @@ const Genre4allColumn = (() => {
       const parentUri = fiber.return?.memoizedProps?.uri;
       if (parentUri?.startsWith('spotify:track:') && parentUri !== uri) break;
     }
+    const doc = row.ownerDocument || document;
     const titleCell = row.querySelector('[data-sp-layout-position="native:title"], .main-trackList-rowSectionStart, [role="gridcell"][aria-colindex="2"]');
     const title = (row.querySelector('.main-trackList-rowTitle, [data-testid="tracklist-row-title"], [data-testid="internal-track-link"]')
       || titleCell?.querySelector('[data-encore-id="text"][dir="auto"]'))?.textContent?.trim();
-    const artists = [...row.querySelectorAll('a[href*="/artist/"]')].map(a => ({ name: a.textContent.trim() })).filter(a => a.name);
+    let artists = [...row.querySelectorAll('a[href*="/artist/"]')].map(a => ({ name: a.textContent.trim() })).filter(a => a.name);
+    if (!artists.length) {
+      const pageArtist = doc.querySelector('[data-testid="creator-link"], main [data-testid="entityTitle"] ~ * a[href*="/artist/"]')?.textContent?.trim();
+      if (pageArtist) artists = [{ name: pageArtist }];
+    }
     const album = row.querySelector('a[href*="/album/"]')?.textContent?.trim();
     const duration = row.querySelector('.main-trackList-rowSectionEnd, [data-sp-layout-position="native:end"], [role="gridcell"]:last-of-type')?.textContent?.match(/\b(\d{1,2}):(\d{2})\b/u);
     return { uri, ...(title ? { name: title } : {}), artists: [...new Map(artists.map(a => [a.name, a])).values()], ...(album ? { album: { name: album } } : {}),
@@ -636,22 +1082,32 @@ const Genre4allColumn = (() => {
   function sourceLink(result) {
     try {
       const url = new URL(result.sourceUrl);
-      const host = { spotify: 'open.spotify.com' }[result.selectedProvider || result.provider];
+      const host = {
+        discogs: 'www.discogs.com',
+        musicbrainz: 'musicbrainz.org',
+        spotify: 'open.spotify.com'
+      }[result.selectedProvider || result.provider];
       return host && url.protocol === 'https:' && url.hostname === host && !url.username && !url.password && !url.port ? url.href : null;
     } catch { return null; }
   }
   const CSS = `
-    .g4a-genre-gridcell { min-width:0 !important; overflow:hidden; }
-    .g4a-genre-host { display:flex !important; align-items:center; justify-content:flex-start; width:100%; min-width:0; max-width:100%; height:100%; overflow:hidden; font:12px/1.2 var(--font-family,CircularSp,sans-serif); }
-    .g4a-genre-chip { display:inline-block; flex:0 1 auto; min-width:0; max-width:100%; height:22px; box-sizing:border-box; border-radius:var(--encore-corner-radius-base,4px); padding:0 8px; font:700 12px/22px var(--font-family,CircularSp,sans-serif); letter-spacing:0.01em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; vertical-align:middle; color:var(--g4a-genre-ink,${INK}) !important; background:var(--g4a-genre-color,#ddd5e5); text-shadow:none; user-select:none; transition:transform .18s cubic-bezier(.22,1,.36,1),filter .18s ease; }
+    .g4a-genre-gridcell { min-width:0 !important; overflow:visible !important; }
+    .g4a-genre-host { display:flex !important; align-items:center; justify-content:flex-start; width:100%; min-width:0; max-width:100%; height:100%; padding:0 3px; box-sizing:border-box; overflow:visible; font:12px/1.2 var(--font-family,CircularSp,sans-serif); }
+    .g4a-genre-chip { display:inline-block; flex:0 1 auto; min-width:0; max-width:100%; height:22px; box-sizing:border-box; border:none; border-radius:5px; padding:0 8px; font:700 12px/22px var(--font-family,CircularSp,sans-serif); letter-spacing:0.01em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; vertical-align:middle; color:var(--g4a-genre-ink,${INK}) !important; background:var(--g4a-genre-color,#ddd5e5); text-shadow:none; user-select:none; transition:box-shadow .5s ease,transform .18s cubic-bezier(.22,1,.36,1),filter .18s ease; }
     .g4a-genre-chip[data-contrast="light"] { text-shadow:0 1px 1px rgba(0,0,0,.25); }
+    .g4a-genre-chip[data-provider="discogs"],.g4a-genre-fan .g4a-genre-chip[data-provider="discogs"] { border:1.5px solid rgb(255,255,255); line-height:19px; box-shadow:0 0 10px rgba(255,255,255,.78),0 0 3px rgba(255,255,255,.95); }
+    .g4a-genre-chip[data-provider="discogs"]:hover,.g4a-genre-chip[data-provider="discogs"]:focus-visible,.g4a-genre-fan .g4a-genre-chip[data-provider="discogs"]:hover { box-shadow:0 0 4px rgb(255,255,255),0 0 12px rgb(255,255,255),0 0 24px rgba(255,255,255,.92),0 0 44px rgba(255,255,255,.75); }
+    .g4a-genre-chip[data-provider="musicbrainz"],.g4a-genre-fan .g4a-genre-chip[data-provider="musicbrainz"] { border:1.5px solid transparent; line-height:19px; background:linear-gradient(var(--g4a-genre-color,#ddd5e5),var(--g4a-genre-color,#ddd5e5)) padding-box,linear-gradient(135deg,rgb(168,85,247) 0%,rgb(168,85,247) 48%,rgb(255,122,0) 52%,rgb(255,122,0) 100%) border-box; box-shadow:-2px -2px 9px rgba(168,85,247,.85),2px 2px 9px rgba(255,122,0,.85); }
+    .g4a-genre-chip[data-provider="musicbrainz"]:hover,.g4a-genre-chip[data-provider="musicbrainz"]:focus-visible,.g4a-genre-fan .g4a-genre-chip[data-provider="musicbrainz"]:hover { box-shadow:-1px -1px 4px rgb(168,85,247),-3px -3px 12px rgb(168,85,247),-5px -5px 24px rgba(168,85,247,.92),-8px -8px 42px rgba(168,85,247,.72),1px 1px 4px rgb(255,122,0),3px 3px 12px rgb(255,122,0),5px 5px 24px rgba(255,122,0,.92),8px 8px 42px rgba(255,122,0,.72); }
     .g4a-genre-primary[data-has-more="true"] { cursor:pointer; }
     .g4a-genre-primary:hover { filter:brightness(1.06); }
     .g4a-genre-state { color:var(--spice-subtext,#ddd); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:12px; }
-    .g4a-genre-host :focus-visible { outline:2px solid #7850a0; outline-offset:-2px; box-shadow:inset 0 0 0 2px #fff; }
-    .g4a-genre-fan { position:fixed; z-index:9999; display:flex; flex-direction:column; align-items:flex-start; gap:5px; margin:0; padding:2px 0; list-style:none; pointer-events:auto; }
+    .g4a-genre-state-action { cursor:pointer; text-decoration:underline; text-underline-offset:2px; }
+    .g4a-genre-host :focus-visible { outline:2px solid #7850a0; outline-offset:-2px; }
+    .g4a-genre-fan { position:fixed; z-index:9999; display:flex; flex-direction:column; align-items:flex-start; gap:6px; margin:0; padding:4px 6px; list-style:none; pointer-events:auto; }
     .g4a-genre-fan[data-direction="up"] { flex-direction:column-reverse; }
-    .g4a-genre-fan .g4a-genre-chip { flex:none; width:max-content; max-width:min(320px,calc(100vw - 24px)); box-shadow:0 8px 20px rgba(0,0,0,.48),0 2px 6px rgba(0,0,0,.32),inset 0 0 0 1px rgba(255,255,255,.14); transform-origin:top left; will-change:transform,opacity; animation:g4a-domino-down var(--g4a-dur,320ms) cubic-bezier(.42,0,.2,1) both; animation-delay:var(--g4a-delay,0ms); }
+    .g4a-genre-fan .g4a-genre-chip { flex:none; width:max-content; max-width:min(320px,calc(100vw - 24px)); transform-origin:top left; will-change:transform,opacity; animation:g4a-domino-down var(--g4a-dur,320ms) cubic-bezier(.42,0,.2,1) both; animation-delay:var(--g4a-delay,0ms); }
+    .g4a-genre-fan .g4a-genre-chip[data-provider="spotify"] { box-shadow:0 8px 20px rgba(0,0,0,.48),0 2px 6px rgba(0,0,0,.32),inset 0 0 0 1px rgba(255,255,255,.14); }
     .g4a-genre-fan[data-direction="up"] .g4a-genre-chip { transform-origin:bottom left; animation-name:g4a-domino-up; }
     .g4a-genre-fan.g4a-genre-fan-closing .g4a-genre-chip { animation:g4a-domino-out 130ms cubic-bezier(.4,0,1,1) both; }
     @keyframes g4a-domino-down {
@@ -701,11 +1157,14 @@ const Genre4allColumn = (() => {
         }
       }
     }
-    function chip(label, tag = 'span') {
+    function chip(label, tag = 'span', fallbackProvider = 'spotify') {
       const bg = colorFor(label.key, service.getConfig().colors);
       const fg = textColorFor(bg);
+      const provider = label.provider || fallbackProvider || 'spotify';
       const n = node(tag, label.label, tag === 'li' ? {} : { role: 'listitem' });
       n.className = 'g4a-genre-chip';
+      n.dataset.provider = provider;
+      if (label.kind) n.dataset.kind = label.kind;
       n.style.setProperty('--g4a-genre-color', bg);
       n.style.setProperty('--g4a-genre-ink', fg);
       if (fg === LIGHT_INK) n.dataset.contrast = 'light';
@@ -741,10 +1200,11 @@ const Genre4allColumn = (() => {
       clearTimeout(fanTimer); fanTimer = null;
       if (activeFan?.record === r && activeFan.element.isConnected && !activeFan.closing) return;
       closeFan(true);
+      const defaultProvider = r.result?.selectedProvider || r.result?.provider || 'spotify';
       const fan = node('ul', null, { class: 'g4a-genre-fan', role: 'list', 'aria-label': 'Gêneros e subgêneros associados' });
       let delay = 0;
       extra.forEach((label, i) => {
-        const item = chip(label, 'li');
+        const item = chip(label, 'li', defaultProvider);
         item.classList.add('g4a-genre-fan-chip');
         const dur = Math.max(190, Math.round(320 * Math.pow(0.88, i)));
         item.style.setProperty('--g4a-i', String(i));
@@ -754,15 +1214,15 @@ const Genre4allColumn = (() => {
         fan.append(item);
       });
       const rect = anchor.getBoundingClientRect();
-      const estHeight = extra.length * 27 + 8;
+      const estHeight = extra.length * 28 + 10;
       const vh = win.innerHeight || 800;
       const spaceBelow = vh - rect.bottom - 12;
       const spaceAbove = rect.top - 12;
       const dir = spaceBelow < estHeight && spaceAbove > spaceBelow ? 'up' : 'down';
       fan.dataset.direction = dir;
-      fan.style.left = `${Math.max(8, Math.round(rect.left))}px`;
-      if (dir === 'down') fan.style.top = `${Math.round(rect.bottom + 5)}px`;
-      else fan.style.bottom = `${Math.round(vh - rect.top + 5)}px`;
+      fan.style.left = `${Math.max(4, Math.round(rect.left - 6))}px`;
+      if (dir === 'down') fan.style.top = `${Math.round(rect.bottom + 3)}px`;
+      else fan.style.bottom = `${Math.round(vh - rect.top + 3)}px`;
       fan.addEventListener('mouseenter', () => { clearTimeout(fanTimer); fanTimer = null; });
       fan.addEventListener('mouseleave', () => scheduleCloseFan(r));
       for (const type of ['click', 'dblclick', 'pointerdown', 'pointerup', 'contextmenu']) fan.addEventListener(type, e => e.stopPropagation());
@@ -777,7 +1237,8 @@ const Genre4allColumn = (() => {
       r.cell.replaceChildren(); r.cell.classList.add('g4a-genre-host'); r.cell.dataset.genreState = r.state;
       r.cell.setAttribute('aria-busy', String(r.state === 'loading'));
       if (r.state === 'success' && r.result?.labels?.length) {
-        const primary = chip(r.result.labels[0]);
+        const defaultProvider = r.result.selectedProvider || r.result.provider || 'spotify';
+        const primary = chip(r.result.labels[0], 'span', defaultProvider);
         primary.classList.add('g4a-genre-primary');
         primary.tabIndex = 0;
         const hasMore = r.result.labels.length > 1;
@@ -793,9 +1254,17 @@ const Genre4allColumn = (() => {
         });
         r.cell.append(primary);
       } else {
-        r.cell.append(node('span', stateLabel(r), { class: 'g4a-genre-state' }));
+        const st = node('span', stateLabel(r), { class: 'g4a-genre-state' });
+        if (r.state === 'not_configured' && typeof options.onConfigure === 'function') {
+          st.classList.add('g4a-genre-state-action');
+          st.tabIndex = 0;
+          st.setAttribute('role', 'button');
+          st.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); options.onConfigure(); });
+          st.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); options.onConfigure(); } });
+        }
+        r.cell.append(st);
       }
-      if (restore) r.cell.querySelector('.g4a-genre-primary')?.focus({ preventScroll: true });
+      if (restore) r.cell.querySelector('.g4a-genre-primary,.g4a-genre-state-action')?.focus({ preventScroll: true });
     }
     function release(cell) {
       const r = records.get(cell); if (!r) return;
@@ -925,7 +1394,7 @@ const Genre4allColumn = (() => {
       if (doc.hidden || closed) return;
       let needsPump = false;
       for (const r of records.values()) {
-        if (isExpired(r) || (r.state === 'error' && ['SPOTIFY_TIMEOUT', 'SPOTIFY_METADATA_FAILED', 'SPOTIFY_METADATA_UNAVAILABLE'].includes(r.result?.errorCode))) {
+        if (isExpired(r) || (r.state === 'error' && ['SPOTIFY_TIMEOUT', 'SPOTIFY_METADATA_FAILED', 'SPOTIFY_METADATA_UNAVAILABLE', 'DISCOGS_TIMEOUT', 'MUSICBRAINZ_TIMEOUT'].includes(r.result?.errorCode))) {
           clearTimeout(r.expiry); r.expiry = null; r.result = null; r.state = 'queued';
           render(r); needsPump = true;
         } else if (r.result) {
@@ -2450,7 +2919,7 @@ async function startGenre4all() {
   } catch { /* Session preference still works. */ }
   const context = () => globalThis.Spicetify?.Platform?.History?.location?.pathname || location.pathname;
   const api = {
-    version: '1.0.0',
+    version: '1.1.0',
     get visible() { return visible; },
     get orderOffset() { return orderOffset; },
     get columnOrder() { return [...columnOrder]; },
@@ -2484,6 +2953,7 @@ async function startGenre4all() {
     .g4a-root .g4a-row:not([data-g4a-measure]) { grid-template-columns:var(--g4a-tracks) !important; min-width:var(--g4a-total) !important; }
     .g4a-root .g4a-row:not([data-g4a-measure]) > [data-g4a-position] { grid-column:var(--g4a-position) !important; min-width:0; }
     genre4all-column { display:flex; align-items:center; min-width:0; overflow:hidden; box-sizing:border-box; }
+    genre4all-column[data-kind=data] { overflow:visible; }
     genre4all-column[data-kind=header] { position:relative; justify-content:flex-start; justify-self:stretch; width:100%; height:100%; color:var(--text-subdued,var(--spice-subtext,#b3b3b3)); font-size:0.875rem; font-weight:400; line-height:normal; cursor:grab; user-select:none; }
     .g4a-root:not([data-sp-native-layout]) [role="columnheader"][data-g4a-col-key] { cursor:grab; user-select:none; }
     genre4all-column[data-kind=header].g4a-header-dragging,[role="columnheader"].g4a-header-dragging { cursor:grabbing !important; opacity:.75; z-index:3; }
@@ -2506,12 +2976,17 @@ async function startGenre4all() {
     .g4a-menu-button:hover,.g4a-menu-button:focus-visible,.g4a-profile-button:hover,.g4a-profile-button:focus-visible { background:#ffffff1a; outline-offset:-2px; }
     .g4a-menu-button[aria-checked=true] { color:var(--text-positive,#1ed760); }
     .g4a-menu-button svg,.g4a-profile-button svg { width:16px; height:16px; flex:none; fill:currentColor; }
-    .g4a-preferences { position:fixed; inset:0; margin:auto; padding:24px; max-width:420px; width:calc(100vw - 40px); box-sizing:border-box; border:1px solid #777; border-radius:8px; color:var(--spice-text,#fff); background:var(--spice-main,#181818); font:14px/1.5 sans-serif; }
-    .g4a-preferences::backdrop { background:#0009; }
-    .g4a-preferences h2 { margin:0 0 12px; font:700 18px/1.3 sans-serif; }
-    .g4a-preferences label { display:flex; gap:10px; margin:14px 0; align-items:center; cursor:pointer; }
-    .g4a-preferences input { accent-color:#1ed760; }
-    .g4a-preferences-actions { display:flex; flex-wrap:wrap; gap:10px; margin-top:18px; }
+    .g4a-preferences { position:fixed; inset:0; margin:auto; padding:24px; max-width:460px; width:calc(100vw - 40px); max-height:calc(100vh - 40px); overflow-y:auto; box-sizing:border-box; border:1px solid #555; border-radius:10px; color:var(--spice-text,#fff); background:var(--spice-main,#181818); font:14px/1.45 sans-serif; box-shadow:0 20px 50px rgba(0,0,0,.65); }
+    .g4a-preferences::backdrop { background:#000a; }
+    .g4a-preferences h2 { margin:0 0 14px; font:700 18px/1.3 sans-serif; display:flex; align-items:center; justify-content:space-between; }
+    .g4a-preferences h3 { margin:16px 0 8px; font:600 12px/1.2 sans-serif; text-transform:uppercase; letter-spacing:.06em; color:var(--spice-subtext,#b3b3b3); }
+    .g4a-preferences label { display:flex; gap:10px; margin:10px 0; align-items:center; cursor:pointer; }
+    .g4a-preferences input[type="checkbox"] { accent-color:#1ed760; }
+    .g4a-preferences-field { display:flex; flex-direction:column; gap:5px; margin:10px 0 14px; }
+    .g4a-preferences-field span { font-size:12px; color:var(--spice-subtext,#ccc); }
+    .g4a-preferences-input { width:100%; box-sizing:border-box; padding:8px 10px; border:1px solid #555; border-radius:5px; background:#121212; color:var(--spice-text,#fff); font:13px/1.3 monospace,sans-serif; }
+    .g4a-preferences-input:focus { border-color:#1ed760; outline:none; }
+    .g4a-preferences-actions { display:flex; flex-wrap:wrap; gap:10px; margin-top:18px; justify-content:flex-end; }
     .g4a-preferences button { padding:8px 14px; color:inherit; background:transparent; border:1px solid #aaa; border-radius:4px; cursor:pointer; font:inherit; }
     .g4a-preferences button:hover { background:#ffffff14; }
   `;
@@ -2697,8 +3172,69 @@ async function startGenre4all() {
   const storage = makeStorage();
   function showPreferences() {
     preferences?.remove();
+    const cfg = service?.getConfig() || {};
     const d = node('dialog', null, { class: 'g4a-preferences', 'aria-label': 'Genre4all config' });
     d.append(node('h2', 'Genre4all config'));
+
+    d.append(node('h3', 'Fontes e Chaves de API (Discogs → MusicBrainz → Spotify)'));
+    for (const [providerKey, providerLabel] of [
+      ['discogs', 'Priorizar Discogs (Moldura Branca)'],
+      ['musicbrainz', 'Usar MusicBrainz + Spotify (Moldura Roxo/Laranja)'],
+      ['spotify', 'Usar Spotify (Complementar / Fallback)']
+    ]) {
+      const row = node('label', providerLabel);
+      const input = node('input', null, { type: 'checkbox', 'data-g4a-provider': providerKey });
+      input.checked = cfg.enabled?.[providerKey] !== false;
+      input.addEventListener('change', () => {
+        service?.configure({ enabled: { [providerKey]: input.checked } })
+          .catch(() => Spicetify.showNotification?.('Genre4all: não foi possível salvar a preferência.', true));
+      });
+      row.prepend(input);
+      d.append(row);
+    }
+
+    const discogsField = node('div', null, { class: 'g4a-preferences-field' });
+    discogsField.append(node('span', 'Chave da API do Discogs (Personal Access Token ou key:secret)'));
+    const discogsInput = node('input', null, {
+      type: 'password',
+      class: 'g4a-preferences-input',
+      name: 'discogsToken',
+      'data-g4a-field': 'discogsToken',
+      placeholder: 'Cole seu token do Discogs (discogs.com/settings/developers)',
+      autocomplete: 'off'
+    });
+    discogsInput.value = cfg.discogsToken || '';
+    discogsField.append(discogsInput);
+    d.append(discogsField);
+
+    const mbField = node('div', null, { class: 'g4a-preferences-field' });
+    mbField.append(node('span', 'Chave / Token da API do MusicBrainz (opcional)'));
+    const mbInput = node('input', null, {
+      type: 'password',
+      class: 'g4a-preferences-input',
+      name: 'musicbrainzToken',
+      'data-g4a-field': 'musicbrainzToken',
+      placeholder: 'Opcional (MusicBrainz já funciona sem chave)',
+      autocomplete: 'off'
+    });
+    mbInput.value = cfg.musicbrainzToken || '';
+    mbField.append(mbInput);
+    d.append(mbField);
+
+    const saveTokens = () => {
+      const current = service?.getConfig() || {};
+      const nextDiscogs = discogsInput.value.trim();
+      const nextMb = mbInput.value.trim();
+      if (nextDiscogs !== (current.discogsToken || '') || nextMb !== (current.musicbrainzToken || '')) {
+        return service?.configure({ discogsToken: nextDiscogs, musicbrainzToken: nextMb })
+          .catch(() => Spicetify.showNotification?.('Genre4all: não foi possível salvar a chave de API.', true));
+      }
+      return Promise.resolve();
+    };
+    discogsInput.addEventListener('change', saveTokens);
+    mbInput.addEventListener('change', saveTokens);
+
+    d.append(node('h3', 'Exibição'));
     for (const [key, label] of [['colors','Cores nos gêneros'],['showGenres','Mostrar gêneros principais'],['showStyles','Mostrar subgêneros e estilos']]) {
       const row = node('label', label), input = node('input', null, { type: 'checkbox' });
       input.checked = !!service?.getConfig()?.[key];
@@ -2708,10 +3244,16 @@ async function startGenre4all() {
     const actions = node('div', null, { class: 'g4a-preferences-actions' });
     const refresh = node('button', 'Atualizar gêneros', { type: 'button' });
     const done = node('button', 'Fechar', { type: 'button' });
-    const dismiss = () => { d.close(); d.remove(); if (preferences === d) preferences = null; };
+    const dismiss = () => {
+      saveTokens();
+      d.close(); d.remove();
+      if (preferences === d) preferences = null;
+    };
     refresh.addEventListener('click', () => {
-      dismiss();
-      service?.clearCache().catch(() => {});
+      saveTokens().finally(() => {
+        dismiss();
+        service?.clearCache().catch(() => {});
+      });
     });
     done.addEventListener('click', dismiss);
     d.addEventListener('cancel', e => { e.preventDefault(); dismiss(); });
@@ -3244,11 +3786,25 @@ async function startGenre4all() {
       profileMenuItem.register();
     }
   } catch { /* Fallback DOM injection handles profile menu. */ }
-  service = Genre4allGenres.createService({ storage, spotify: Genre4allTransport.createSpotifyAdapter(Genre4allGenres, getMetadataClient), validateSpotifyGenre: Genre4allCatalog.validate, formatSpotifyGenres: Genre4allCatalog.format });
+  service = Genre4allGenres.createService({
+    storage,
+    discogs: Genre4allTransport.createDiscogsAdapter(Genre4allGenres, () => service?.getConfig()),
+    musicbrainz: Genre4allTransport.createMusicBrainzAdapter(Genre4allGenres, () => service?.getConfig()),
+    spotify: Genre4allTransport.createSpotifyAdapter(Genre4allGenres, getMetadataClient),
+    validateSpotifyGenre: Genre4allCatalog.validate,
+    formatSpotifyGenres: Genre4allCatalog.format
+  });
   view = Genre4allColumn.createController(service, {
     getUri, getTrack: track, getContext: context, isEnabled: cell => visible && cell.matches('.g4a-data'),
     onConfigure: showPreferences,
-    describe: result => ({ SPOTIFY_METADATA_UNAVAILABLE: 'O serviço de metadados está indisponível nesta versão do Spotify. Atualize Spicetify/Spotify e tente novamente.', SPOTIFY_TIMEOUT: 'O Spotify não respondeu a tempo. Use Atualizar gêneros.', SPOTIFY_TRACK_REQUIRED: 'Gêneros disponíveis para faixas do catálogo do Spotify.', SPOTIFY_EXTENSION_MISSING: 'Esta versão do Spotify não disponibilizou os metadados de gênero.' }[result.errorCode] || result.errorCode || 'O Spotify não retornou gêneros para esta faixa.')
+    describe: result => ({
+      DISCOGS_TOKEN_REQUIRED: 'Configure sua chave de API do Discogs em Genre4all config.',
+      DISCOGS_AUTH_FAILED: 'Chave de API do Discogs inválida ou sem permissão.',
+      SPOTIFY_METADATA_UNAVAILABLE: 'O serviço de metadados está indisponível nesta versão do Spotify. Atualize Spicetify/Spotify e tente novamente.',
+      SPOTIFY_TIMEOUT: 'O Spotify não respondeu a tempo. Use Atualizar gêneros.',
+      SPOTIFY_TRACK_REQUIRED: 'Gêneros disponíveis para faixas do catálogo do Spotify.',
+      SPOTIFY_EXTENSION_MISSING: 'Esta versão do Spotify não disponibilizou os metadados de gênero.'
+    }[result.errorCode] || result.errorCode || 'Não foi possível obter gêneros para esta faixa.')
   });
   service.ready.catch(error => console.warn('[Genre4all] Falha ao iniciar cache.', error));
   unlisten = Spicetify.Platform.History?.listen?.(() => { view.reset(); invalidateLayouts(false); schedule(); });

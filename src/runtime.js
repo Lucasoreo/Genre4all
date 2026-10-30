@@ -19,7 +19,7 @@ async function startGenre4all() {
   } catch { /* Session preference still works. */ }
   const context = () => globalThis.Spicetify?.Platform?.History?.location?.pathname || location.pathname;
   const api = {
-    version: '1.0.0',
+    version: '1.1.0',
     get visible() { return visible; },
     get orderOffset() { return orderOffset; },
     get columnOrder() { return [...columnOrder]; },
@@ -53,6 +53,7 @@ async function startGenre4all() {
     .g4a-root .g4a-row:not([data-g4a-measure]) { grid-template-columns:var(--g4a-tracks) !important; min-width:var(--g4a-total) !important; }
     .g4a-root .g4a-row:not([data-g4a-measure]) > [data-g4a-position] { grid-column:var(--g4a-position) !important; min-width:0; }
     genre4all-column { display:flex; align-items:center; min-width:0; overflow:hidden; box-sizing:border-box; }
+    genre4all-column[data-kind=data] { overflow:visible; }
     genre4all-column[data-kind=header] { position:relative; justify-content:flex-start; justify-self:stretch; width:100%; height:100%; color:var(--text-subdued,var(--spice-subtext,#b3b3b3)); font-size:0.875rem; font-weight:400; line-height:normal; cursor:grab; user-select:none; }
     .g4a-root:not([data-sp-native-layout]) [role="columnheader"][data-g4a-col-key] { cursor:grab; user-select:none; }
     genre4all-column[data-kind=header].g4a-header-dragging,[role="columnheader"].g4a-header-dragging { cursor:grabbing !important; opacity:.75; z-index:3; }
@@ -75,12 +76,17 @@ async function startGenre4all() {
     .g4a-menu-button:hover,.g4a-menu-button:focus-visible,.g4a-profile-button:hover,.g4a-profile-button:focus-visible { background:#ffffff1a; outline-offset:-2px; }
     .g4a-menu-button[aria-checked=true] { color:var(--text-positive,#1ed760); }
     .g4a-menu-button svg,.g4a-profile-button svg { width:16px; height:16px; flex:none; fill:currentColor; }
-    .g4a-preferences { position:fixed; inset:0; margin:auto; padding:24px; max-width:420px; width:calc(100vw - 40px); box-sizing:border-box; border:1px solid #777; border-radius:8px; color:var(--spice-text,#fff); background:var(--spice-main,#181818); font:14px/1.5 sans-serif; }
-    .g4a-preferences::backdrop { background:#0009; }
-    .g4a-preferences h2 { margin:0 0 12px; font:700 18px/1.3 sans-serif; }
-    .g4a-preferences label { display:flex; gap:10px; margin:14px 0; align-items:center; cursor:pointer; }
-    .g4a-preferences input { accent-color:#1ed760; }
-    .g4a-preferences-actions { display:flex; flex-wrap:wrap; gap:10px; margin-top:18px; }
+    .g4a-preferences { position:fixed; inset:0; margin:auto; padding:24px; max-width:460px; width:calc(100vw - 40px); max-height:calc(100vh - 40px); overflow-y:auto; box-sizing:border-box; border:1px solid #555; border-radius:10px; color:var(--spice-text,#fff); background:var(--spice-main,#181818); font:14px/1.45 sans-serif; box-shadow:0 20px 50px rgba(0,0,0,.65); }
+    .g4a-preferences::backdrop { background:#000a; }
+    .g4a-preferences h2 { margin:0 0 14px; font:700 18px/1.3 sans-serif; display:flex; align-items:center; justify-content:space-between; }
+    .g4a-preferences h3 { margin:16px 0 8px; font:600 12px/1.2 sans-serif; text-transform:uppercase; letter-spacing:.06em; color:var(--spice-subtext,#b3b3b3); }
+    .g4a-preferences label { display:flex; gap:10px; margin:10px 0; align-items:center; cursor:pointer; }
+    .g4a-preferences input[type="checkbox"] { accent-color:#1ed760; }
+    .g4a-preferences-field { display:flex; flex-direction:column; gap:5px; margin:10px 0 14px; }
+    .g4a-preferences-field span { font-size:12px; color:var(--spice-subtext,#ccc); }
+    .g4a-preferences-input { width:100%; box-sizing:border-box; padding:8px 10px; border:1px solid #555; border-radius:5px; background:#121212; color:var(--spice-text,#fff); font:13px/1.3 monospace,sans-serif; }
+    .g4a-preferences-input:focus { border-color:#1ed760; outline:none; }
+    .g4a-preferences-actions { display:flex; flex-wrap:wrap; gap:10px; margin-top:18px; justify-content:flex-end; }
     .g4a-preferences button { padding:8px 14px; color:inherit; background:transparent; border:1px solid #aaa; border-radius:4px; cursor:pointer; font:inherit; }
     .g4a-preferences button:hover { background:#ffffff14; }
   `;
@@ -266,8 +272,69 @@ async function startGenre4all() {
   const storage = makeStorage();
   function showPreferences() {
     preferences?.remove();
+    const cfg = service?.getConfig() || {};
     const d = node('dialog', null, { class: 'g4a-preferences', 'aria-label': 'Genre4all config' });
     d.append(node('h2', 'Genre4all config'));
+
+    d.append(node('h3', 'Fontes e Chaves de API (Discogs → MusicBrainz → Spotify)'));
+    for (const [providerKey, providerLabel] of [
+      ['discogs', 'Priorizar Discogs (Moldura Branca)'],
+      ['musicbrainz', 'Usar MusicBrainz + Spotify (Moldura Roxo/Laranja)'],
+      ['spotify', 'Usar Spotify (Complementar / Fallback)']
+    ]) {
+      const row = node('label', providerLabel);
+      const input = node('input', null, { type: 'checkbox', 'data-g4a-provider': providerKey });
+      input.checked = cfg.enabled?.[providerKey] !== false;
+      input.addEventListener('change', () => {
+        service?.configure({ enabled: { [providerKey]: input.checked } })
+          .catch(() => Spicetify.showNotification?.('Genre4all: não foi possível salvar a preferência.', true));
+      });
+      row.prepend(input);
+      d.append(row);
+    }
+
+    const discogsField = node('div', null, { class: 'g4a-preferences-field' });
+    discogsField.append(node('span', 'Chave da API do Discogs (Personal Access Token ou key:secret)'));
+    const discogsInput = node('input', null, {
+      type: 'password',
+      class: 'g4a-preferences-input',
+      name: 'discogsToken',
+      'data-g4a-field': 'discogsToken',
+      placeholder: 'Cole seu token do Discogs (discogs.com/settings/developers)',
+      autocomplete: 'off'
+    });
+    discogsInput.value = cfg.discogsToken || '';
+    discogsField.append(discogsInput);
+    d.append(discogsField);
+
+    const mbField = node('div', null, { class: 'g4a-preferences-field' });
+    mbField.append(node('span', 'Chave / Token da API do MusicBrainz (opcional)'));
+    const mbInput = node('input', null, {
+      type: 'password',
+      class: 'g4a-preferences-input',
+      name: 'musicbrainzToken',
+      'data-g4a-field': 'musicbrainzToken',
+      placeholder: 'Opcional (MusicBrainz já funciona sem chave)',
+      autocomplete: 'off'
+    });
+    mbInput.value = cfg.musicbrainzToken || '';
+    mbField.append(mbInput);
+    d.append(mbField);
+
+    const saveTokens = () => {
+      const current = service?.getConfig() || {};
+      const nextDiscogs = discogsInput.value.trim();
+      const nextMb = mbInput.value.trim();
+      if (nextDiscogs !== (current.discogsToken || '') || nextMb !== (current.musicbrainzToken || '')) {
+        return service?.configure({ discogsToken: nextDiscogs, musicbrainzToken: nextMb })
+          .catch(() => Spicetify.showNotification?.('Genre4all: não foi possível salvar a chave de API.', true));
+      }
+      return Promise.resolve();
+    };
+    discogsInput.addEventListener('change', saveTokens);
+    mbInput.addEventListener('change', saveTokens);
+
+    d.append(node('h3', 'Exibição'));
     for (const [key, label] of [['colors','Cores nos gêneros'],['showGenres','Mostrar gêneros principais'],['showStyles','Mostrar subgêneros e estilos']]) {
       const row = node('label', label), input = node('input', null, { type: 'checkbox' });
       input.checked = !!service?.getConfig()?.[key];
@@ -277,10 +344,16 @@ async function startGenre4all() {
     const actions = node('div', null, { class: 'g4a-preferences-actions' });
     const refresh = node('button', 'Atualizar gêneros', { type: 'button' });
     const done = node('button', 'Fechar', { type: 'button' });
-    const dismiss = () => { d.close(); d.remove(); if (preferences === d) preferences = null; };
+    const dismiss = () => {
+      saveTokens();
+      d.close(); d.remove();
+      if (preferences === d) preferences = null;
+    };
     refresh.addEventListener('click', () => {
-      dismiss();
-      service?.clearCache().catch(() => {});
+      saveTokens().finally(() => {
+        dismiss();
+        service?.clearCache().catch(() => {});
+      });
     });
     done.addEventListener('click', dismiss);
     d.addEventListener('cancel', e => { e.preventDefault(); dismiss(); });
@@ -813,11 +886,25 @@ async function startGenre4all() {
       profileMenuItem.register();
     }
   } catch { /* Fallback DOM injection handles profile menu. */ }
-  service = Genre4allGenres.createService({ storage, spotify: Genre4allTransport.createSpotifyAdapter(Genre4allGenres, getMetadataClient), validateSpotifyGenre: Genre4allCatalog.validate, formatSpotifyGenres: Genre4allCatalog.format });
+  service = Genre4allGenres.createService({
+    storage,
+    discogs: Genre4allTransport.createDiscogsAdapter(Genre4allGenres, () => service?.getConfig()),
+    musicbrainz: Genre4allTransport.createMusicBrainzAdapter(Genre4allGenres, () => service?.getConfig()),
+    spotify: Genre4allTransport.createSpotifyAdapter(Genre4allGenres, getMetadataClient),
+    validateSpotifyGenre: Genre4allCatalog.validate,
+    formatSpotifyGenres: Genre4allCatalog.format
+  });
   view = Genre4allColumn.createController(service, {
     getUri, getTrack: track, getContext: context, isEnabled: cell => visible && cell.matches('.g4a-data'),
     onConfigure: showPreferences,
-    describe: result => ({ SPOTIFY_METADATA_UNAVAILABLE: 'O serviço de metadados está indisponível nesta versão do Spotify. Atualize Spicetify/Spotify e tente novamente.', SPOTIFY_TIMEOUT: 'O Spotify não respondeu a tempo. Use Atualizar gêneros.', SPOTIFY_TRACK_REQUIRED: 'Gêneros disponíveis para faixas do catálogo do Spotify.', SPOTIFY_EXTENSION_MISSING: 'Esta versão do Spotify não disponibilizou os metadados de gênero.' }[result.errorCode] || result.errorCode || 'O Spotify não retornou gêneros para esta faixa.')
+    describe: result => ({
+      DISCOGS_TOKEN_REQUIRED: 'Configure sua chave de API do Discogs em Genre4all config.',
+      DISCOGS_AUTH_FAILED: 'Chave de API do Discogs inválida ou sem permissão.',
+      SPOTIFY_METADATA_UNAVAILABLE: 'O serviço de metadados está indisponível nesta versão do Spotify. Atualize Spicetify/Spotify e tente novamente.',
+      SPOTIFY_TIMEOUT: 'O Spotify não respondeu a tempo. Use Atualizar gêneros.',
+      SPOTIFY_TRACK_REQUIRED: 'Gêneros disponíveis para faixas do catálogo do Spotify.',
+      SPOTIFY_EXTENSION_MISSING: 'Esta versão do Spotify não disponibilizou os metadados de gênero.'
+    }[result.errorCode] || result.errorCode || 'Não foi possível obter gêneros para esta faixa.')
   });
   service.ready.catch(error => console.warn('[Genre4all] Falha ao iniciar cache.', error));
   unlisten = Spicetify.Platform.History?.listen?.(() => { view.reset(); invalidateLayouts(false); schedule(); });

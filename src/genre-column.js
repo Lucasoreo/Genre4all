@@ -33,7 +33,9 @@ const Genre4allColumn = (() => {
       if (!value || typeof value !== 'object' || depth <= 0 || seen.has(value) || seen.size >= 300) return null;
       seen.add(value);
       if (value.uri === uri && typeof (value.name || value.title) === 'string') {
-        const source = Array.isArray(value.artists) ? value.artists : value.artists?.items;
+        const source = Array.isArray(value.artists)
+          ? value.artists
+          : [...(value.artists?.items || []), ...(value.firstArtist?.items || []), ...(value.otherArtists?.items || [])];
         const artists = (source || []).map(a => ({ name: typeof a === 'string' ? a : a.name || a.profile?.name || a.artist?.profile?.name })).filter(a => a.name);
         if (artists.length) return { ...value, uri, name: value.name || value.title, artists, album: value.album || value.albumOfTrack,
           duration_ms: value.duration_ms || value.duration?.totalMilliseconds || value.duration?.milliseconds };
@@ -54,10 +56,15 @@ const Genre4allColumn = (() => {
       const parentUri = fiber.return?.memoizedProps?.uri;
       if (parentUri?.startsWith('spotify:track:') && parentUri !== uri) break;
     }
+    const doc = row.ownerDocument || document;
     const titleCell = row.querySelector('[data-sp-layout-position="native:title"], .main-trackList-rowSectionStart, [role="gridcell"][aria-colindex="2"]');
     const title = (row.querySelector('.main-trackList-rowTitle, [data-testid="tracklist-row-title"], [data-testid="internal-track-link"]')
       || titleCell?.querySelector('[data-encore-id="text"][dir="auto"]'))?.textContent?.trim();
-    const artists = [...row.querySelectorAll('a[href*="/artist/"]')].map(a => ({ name: a.textContent.trim() })).filter(a => a.name);
+    let artists = [...row.querySelectorAll('a[href*="/artist/"]')].map(a => ({ name: a.textContent.trim() })).filter(a => a.name);
+    if (!artists.length) {
+      const pageArtist = doc.querySelector('[data-testid="creator-link"], main [data-testid="entityTitle"] ~ * a[href*="/artist/"]')?.textContent?.trim();
+      if (pageArtist) artists = [{ name: pageArtist }];
+    }
     const album = row.querySelector('a[href*="/album/"]')?.textContent?.trim();
     const duration = row.querySelector('.main-trackList-rowSectionEnd, [data-sp-layout-position="native:end"], [role="gridcell"]:last-of-type')?.textContent?.match(/\b(\d{1,2}):(\d{2})\b/u);
     return { uri, ...(title ? { name: title } : {}), artists: [...new Map(artists.map(a => [a.name, a])).values()], ...(album ? { album: { name: album } } : {}),
@@ -66,22 +73,32 @@ const Genre4allColumn = (() => {
   function sourceLink(result) {
     try {
       const url = new URL(result.sourceUrl);
-      const host = { spotify: 'open.spotify.com' }[result.selectedProvider || result.provider];
+      const host = {
+        discogs: 'www.discogs.com',
+        musicbrainz: 'musicbrainz.org',
+        spotify: 'open.spotify.com'
+      }[result.selectedProvider || result.provider];
       return host && url.protocol === 'https:' && url.hostname === host && !url.username && !url.password && !url.port ? url.href : null;
     } catch { return null; }
   }
   const CSS = `
-    .g4a-genre-gridcell { min-width:0 !important; overflow:hidden; }
-    .g4a-genre-host { display:flex !important; align-items:center; justify-content:flex-start; width:100%; min-width:0; max-width:100%; height:100%; overflow:hidden; font:12px/1.2 var(--font-family,CircularSp,sans-serif); }
-    .g4a-genre-chip { display:inline-block; flex:0 1 auto; min-width:0; max-width:100%; height:22px; box-sizing:border-box; border-radius:var(--encore-corner-radius-base,4px); padding:0 8px; font:700 12px/22px var(--font-family,CircularSp,sans-serif); letter-spacing:0.01em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; vertical-align:middle; color:var(--g4a-genre-ink,${INK}) !important; background:var(--g4a-genre-color,#ddd5e5); text-shadow:none; user-select:none; transition:transform .18s cubic-bezier(.22,1,.36,1),filter .18s ease; }
+    .g4a-genre-gridcell { min-width:0 !important; overflow:visible !important; }
+    .g4a-genre-host { display:flex !important; align-items:center; justify-content:flex-start; width:100%; min-width:0; max-width:100%; height:100%; padding:0 3px; box-sizing:border-box; overflow:visible; font:12px/1.2 var(--font-family,CircularSp,sans-serif); }
+    .g4a-genre-chip { display:inline-block; flex:0 1 auto; min-width:0; max-width:100%; height:22px; box-sizing:border-box; border:none; border-radius:5px; padding:0 8px; font:700 12px/22px var(--font-family,CircularSp,sans-serif); letter-spacing:0.01em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; vertical-align:middle; color:var(--g4a-genre-ink,${INK}) !important; background:var(--g4a-genre-color,#ddd5e5); text-shadow:none; user-select:none; transition:box-shadow .5s ease,transform .18s cubic-bezier(.22,1,.36,1),filter .18s ease; }
     .g4a-genre-chip[data-contrast="light"] { text-shadow:0 1px 1px rgba(0,0,0,.25); }
+    .g4a-genre-chip[data-provider="discogs"],.g4a-genre-fan .g4a-genre-chip[data-provider="discogs"] { border:1.5px solid rgb(255,255,255); line-height:19px; box-shadow:0 0 10px rgba(255,255,255,.78),0 0 3px rgba(255,255,255,.95); }
+    .g4a-genre-chip[data-provider="discogs"]:hover,.g4a-genre-chip[data-provider="discogs"]:focus-visible,.g4a-genre-fan .g4a-genre-chip[data-provider="discogs"]:hover { box-shadow:0 0 4px rgb(255,255,255),0 0 12px rgb(255,255,255),0 0 24px rgba(255,255,255,.92),0 0 44px rgba(255,255,255,.75); }
+    .g4a-genre-chip[data-provider="musicbrainz"],.g4a-genre-fan .g4a-genre-chip[data-provider="musicbrainz"] { border:1.5px solid transparent; line-height:19px; background:linear-gradient(var(--g4a-genre-color,#ddd5e5),var(--g4a-genre-color,#ddd5e5)) padding-box,linear-gradient(135deg,rgb(168,85,247) 0%,rgb(168,85,247) 48%,rgb(255,122,0) 52%,rgb(255,122,0) 100%) border-box; box-shadow:-2px -2px 9px rgba(168,85,247,.85),2px 2px 9px rgba(255,122,0,.85); }
+    .g4a-genre-chip[data-provider="musicbrainz"]:hover,.g4a-genre-chip[data-provider="musicbrainz"]:focus-visible,.g4a-genre-fan .g4a-genre-chip[data-provider="musicbrainz"]:hover { box-shadow:-1px -1px 4px rgb(168,85,247),-3px -3px 12px rgb(168,85,247),-5px -5px 24px rgba(168,85,247,.92),-8px -8px 42px rgba(168,85,247,.72),1px 1px 4px rgb(255,122,0),3px 3px 12px rgb(255,122,0),5px 5px 24px rgba(255,122,0,.92),8px 8px 42px rgba(255,122,0,.72); }
     .g4a-genre-primary[data-has-more="true"] { cursor:pointer; }
     .g4a-genre-primary:hover { filter:brightness(1.06); }
     .g4a-genre-state { color:var(--spice-subtext,#ddd); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:12px; }
-    .g4a-genre-host :focus-visible { outline:2px solid #7850a0; outline-offset:-2px; box-shadow:inset 0 0 0 2px #fff; }
-    .g4a-genre-fan { position:fixed; z-index:9999; display:flex; flex-direction:column; align-items:flex-start; gap:5px; margin:0; padding:2px 0; list-style:none; pointer-events:auto; }
+    .g4a-genre-state-action { cursor:pointer; text-decoration:underline; text-underline-offset:2px; }
+    .g4a-genre-host :focus-visible { outline:2px solid #7850a0; outline-offset:-2px; }
+    .g4a-genre-fan { position:fixed; z-index:9999; display:flex; flex-direction:column; align-items:flex-start; gap:6px; margin:0; padding:4px 6px; list-style:none; pointer-events:auto; }
     .g4a-genre-fan[data-direction="up"] { flex-direction:column-reverse; }
-    .g4a-genre-fan .g4a-genre-chip { flex:none; width:max-content; max-width:min(320px,calc(100vw - 24px)); box-shadow:0 8px 20px rgba(0,0,0,.48),0 2px 6px rgba(0,0,0,.32),inset 0 0 0 1px rgba(255,255,255,.14); transform-origin:top left; will-change:transform,opacity; animation:g4a-domino-down var(--g4a-dur,320ms) cubic-bezier(.42,0,.2,1) both; animation-delay:var(--g4a-delay,0ms); }
+    .g4a-genre-fan .g4a-genre-chip { flex:none; width:max-content; max-width:min(320px,calc(100vw - 24px)); transform-origin:top left; will-change:transform,opacity; animation:g4a-domino-down var(--g4a-dur,320ms) cubic-bezier(.42,0,.2,1) both; animation-delay:var(--g4a-delay,0ms); }
+    .g4a-genre-fan .g4a-genre-chip[data-provider="spotify"] { box-shadow:0 8px 20px rgba(0,0,0,.48),0 2px 6px rgba(0,0,0,.32),inset 0 0 0 1px rgba(255,255,255,.14); }
     .g4a-genre-fan[data-direction="up"] .g4a-genre-chip { transform-origin:bottom left; animation-name:g4a-domino-up; }
     .g4a-genre-fan.g4a-genre-fan-closing .g4a-genre-chip { animation:g4a-domino-out 130ms cubic-bezier(.4,0,1,1) both; }
     @keyframes g4a-domino-down {
@@ -131,11 +148,14 @@ const Genre4allColumn = (() => {
         }
       }
     }
-    function chip(label, tag = 'span') {
+    function chip(label, tag = 'span', fallbackProvider = 'spotify') {
       const bg = colorFor(label.key, service.getConfig().colors);
       const fg = textColorFor(bg);
+      const provider = label.provider || fallbackProvider || 'spotify';
       const n = node(tag, label.label, tag === 'li' ? {} : { role: 'listitem' });
       n.className = 'g4a-genre-chip';
+      n.dataset.provider = provider;
+      if (label.kind) n.dataset.kind = label.kind;
       n.style.setProperty('--g4a-genre-color', bg);
       n.style.setProperty('--g4a-genre-ink', fg);
       if (fg === LIGHT_INK) n.dataset.contrast = 'light';
@@ -171,10 +191,11 @@ const Genre4allColumn = (() => {
       clearTimeout(fanTimer); fanTimer = null;
       if (activeFan?.record === r && activeFan.element.isConnected && !activeFan.closing) return;
       closeFan(true);
+      const defaultProvider = r.result?.selectedProvider || r.result?.provider || 'spotify';
       const fan = node('ul', null, { class: 'g4a-genre-fan', role: 'list', 'aria-label': 'Gêneros e subgêneros associados' });
       let delay = 0;
       extra.forEach((label, i) => {
-        const item = chip(label, 'li');
+        const item = chip(label, 'li', defaultProvider);
         item.classList.add('g4a-genre-fan-chip');
         const dur = Math.max(190, Math.round(320 * Math.pow(0.88, i)));
         item.style.setProperty('--g4a-i', String(i));
@@ -184,15 +205,15 @@ const Genre4allColumn = (() => {
         fan.append(item);
       });
       const rect = anchor.getBoundingClientRect();
-      const estHeight = extra.length * 27 + 8;
+      const estHeight = extra.length * 28 + 10;
       const vh = win.innerHeight || 800;
       const spaceBelow = vh - rect.bottom - 12;
       const spaceAbove = rect.top - 12;
       const dir = spaceBelow < estHeight && spaceAbove > spaceBelow ? 'up' : 'down';
       fan.dataset.direction = dir;
-      fan.style.left = `${Math.max(8, Math.round(rect.left))}px`;
-      if (dir === 'down') fan.style.top = `${Math.round(rect.bottom + 5)}px`;
-      else fan.style.bottom = `${Math.round(vh - rect.top + 5)}px`;
+      fan.style.left = `${Math.max(4, Math.round(rect.left - 6))}px`;
+      if (dir === 'down') fan.style.top = `${Math.round(rect.bottom + 3)}px`;
+      else fan.style.bottom = `${Math.round(vh - rect.top + 3)}px`;
       fan.addEventListener('mouseenter', () => { clearTimeout(fanTimer); fanTimer = null; });
       fan.addEventListener('mouseleave', () => scheduleCloseFan(r));
       for (const type of ['click', 'dblclick', 'pointerdown', 'pointerup', 'contextmenu']) fan.addEventListener(type, e => e.stopPropagation());
@@ -207,7 +228,8 @@ const Genre4allColumn = (() => {
       r.cell.replaceChildren(); r.cell.classList.add('g4a-genre-host'); r.cell.dataset.genreState = r.state;
       r.cell.setAttribute('aria-busy', String(r.state === 'loading'));
       if (r.state === 'success' && r.result?.labels?.length) {
-        const primary = chip(r.result.labels[0]);
+        const defaultProvider = r.result.selectedProvider || r.result.provider || 'spotify';
+        const primary = chip(r.result.labels[0], 'span', defaultProvider);
         primary.classList.add('g4a-genre-primary');
         primary.tabIndex = 0;
         const hasMore = r.result.labels.length > 1;
@@ -223,9 +245,17 @@ const Genre4allColumn = (() => {
         });
         r.cell.append(primary);
       } else {
-        r.cell.append(node('span', stateLabel(r), { class: 'g4a-genre-state' }));
+        const st = node('span', stateLabel(r), { class: 'g4a-genre-state' });
+        if (r.state === 'not_configured' && typeof options.onConfigure === 'function') {
+          st.classList.add('g4a-genre-state-action');
+          st.tabIndex = 0;
+          st.setAttribute('role', 'button');
+          st.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); options.onConfigure(); });
+          st.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); options.onConfigure(); } });
+        }
+        r.cell.append(st);
       }
-      if (restore) r.cell.querySelector('.g4a-genre-primary')?.focus({ preventScroll: true });
+      if (restore) r.cell.querySelector('.g4a-genre-primary,.g4a-genre-state-action')?.focus({ preventScroll: true });
     }
     function release(cell) {
       const r = records.get(cell); if (!r) return;
@@ -355,7 +385,7 @@ const Genre4allColumn = (() => {
       if (doc.hidden || closed) return;
       let needsPump = false;
       for (const r of records.values()) {
-        if (isExpired(r) || (r.state === 'error' && ['SPOTIFY_TIMEOUT', 'SPOTIFY_METADATA_FAILED', 'SPOTIFY_METADATA_UNAVAILABLE'].includes(r.result?.errorCode))) {
+        if (isExpired(r) || (r.state === 'error' && ['SPOTIFY_TIMEOUT', 'SPOTIFY_METADATA_FAILED', 'SPOTIFY_METADATA_UNAVAILABLE', 'DISCOGS_TIMEOUT', 'MUSICBRAINZ_TIMEOUT'].includes(r.result?.errorCode))) {
           clearTimeout(r.expiry); r.expiry = null; r.result = null; r.state = 'queued';
           render(r); needsPump = true;
         } else if (r.result) {
