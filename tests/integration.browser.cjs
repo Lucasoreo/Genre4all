@@ -91,7 +91,7 @@ body{background:#121212;color:#eee;font:14px sans-serif;margin:20px}main{width:1
     });
     await page.addScriptTag({path:path.join(root,'Genre4all.js')});
     await page.locator('.g4a-data[data-genre-state=success]').waitFor();
-    assert.equal(await page.evaluate(()=>Genre4all.version),'1.1.0');
+    assert.equal(await page.evaluate(()=>Genre4all.version),'1.11.0');
     assert.equal(await page.locator('genre4all-column[data-kind=header]').count(),1);
     assert.equal(await page.locator('.g4a-genre-chip').filter({hasText:'happy'}).count(),0);
     assert.ok(await page.locator('.g4a-genre-chip').filter({hasText:'electro house'}).count());
@@ -160,6 +160,7 @@ body{background:#121212;color:#eee;font:14px sans-serif;margin:20px}main{width:1
     await page.locator('.g4a-genre-primary').hover();await page.locator('.g4a-genre-fan').waitFor();
     await page.evaluate(()=>openProfileMenu());
     await page.getByRole('menuitem',{name:'Genre4all config',exact:true}).click();await page.getByRole('dialog').waitFor();
+    assert.equal(await page.getByRole('button',{name:'Limpar cache'}).count(),1,'Clear cache button is present in settings');
     await page.getByRole('button',{name:'Atualizar gêneros'}).click();await page.locator('.g4a-data[data-genre-state=success]').waitFor();
     assert.ok(await page.evaluate(()=>calls.length)>=2,'refresh performs a fresh request');
     // Exact original Sort-Play-2 native functions, isolated from all unrelated features.

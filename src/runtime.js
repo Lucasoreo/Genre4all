@@ -19,7 +19,7 @@ async function startGenre4all() {
   } catch { /* Session preference still works. */ }
   const context = () => globalThis.Spicetify?.Platform?.History?.location?.pathname || location.pathname;
   const api = {
-    version: '1.1.0',
+    version: '1.11.0',
     get visible() { return visible; },
     get orderOffset() { return orderOffset; },
     get columnOrder() { return [...columnOrder]; },
@@ -341,8 +341,19 @@ async function startGenre4all() {
       input.addEventListener('change', () => service?.configure({ [key]: input.checked }).catch(() => Spicetify.showNotification?.('Genre4all: não foi possível salvar a preferência.', true)));
       row.prepend(input); d.append(row);
     }
+    d.append(node('h3', 'Cache leve (armazenamento rápido)'));
+    const cacheInfo = node('div', null, { class: 'g4a-preferences-field', 'data-g4a-cache-info': '' });
+    const updateCacheCount = () => {
+      const count = service?.stats()?.providerCache ?? 0;
+      cacheInfo.textContent = '';
+      cacheInfo.append(node('span', `Registros em cache local (TXT / IndexedDB): ${count}`));
+    };
+    updateCacheCount();
+    d.append(cacheInfo);
+
     const actions = node('div', null, { class: 'g4a-preferences-actions' });
     const refresh = node('button', 'Atualizar gêneros', { type: 'button' });
+    const clearCacheBtn = node('button', 'Limpar cache', { type: 'button', 'data-g4a-action': 'clear-cache' });
     const done = node('button', 'Fechar', { type: 'button' });
     const dismiss = () => {
       saveTokens();
@@ -355,10 +366,20 @@ async function startGenre4all() {
         service?.clearCache().catch(() => {});
       });
     });
+    clearCacheBtn.addEventListener('click', () => {
+      saveTokens()
+        .then(() => service?.clearCache())
+        .then(() => {
+          updateCacheCount();
+          clearCacheBtn.textContent = 'Cache limpo!';
+          globalThis.Spicetify?.showNotification?.('Genre4all: cache limpo com sucesso.');
+        })
+        .catch(() => globalThis.Spicetify?.showNotification?.('Genre4all: falha ao limpar cache.', true));
+    });
     done.addEventListener('click', dismiss);
     d.addEventListener('cancel', e => { e.preventDefault(); dismiss(); });
     for (const type of ['keydown', 'keyup', 'click', 'dblclick', 'pointerdown', 'pointerup', 'contextmenu']) d.addEventListener(type, e => e.stopPropagation());
-    actions.append(refresh, done);
+    actions.append(refresh, clearCacheBtn, done);
     d.append(actions);
     document.body.append(d); preferences = d; d.showModal(); done.focus();
   }

@@ -1,9 +1,87 @@
-/* Transport adapters (Discogs, MusicBrainz, Spotify MetadataService) and IndexedDB storage for Genre4all. */
+/* Transport adapters (Discogs, MusicBrainz, Spotify MetadataService) and compact persistent cache for Genre4all. */
 const Genre4allTransport = (() => {
   'use strict';
-  function createIndexedDBStorage(indexedDB = globalThis.indexedDB) {
+  const COMPACT_CACHE_KEY = 'genre4all-cache-txt-v11';
+  const COMPACT_MAX_LINES = 2000;
+
+  function encodeCompactCache(map) {
+    const lines = [];
+    for (const [id, entry] of map) {
+      if (!entry || !entry.value || !Number.isFinite(entry.expiresAt)) continue;
+      const v = entry.value;
+      if (!['success', 'empty', 'no_match'].includes(v.status)) continue;
+      const labelsPart = (v.labels || [])
+        .map(l => `${String(l.label || '').replace(/[\t\n\r;~]/gu, ' ')}~${l.kind || 'genre'}~${l.provider || v.provider || ''}`)
+        .join(';');
+      const safeId = String(id).replace(/[\t\n\r]/gu, ' ');
+      const provider = String(v.provider || '').replace(/[\t\n\r]/gu, '');
+      const status = String(v.status || 'empty');
+      const exp = Math.floor(entry.expiresAt).toString(36);
+      const ver = Number(entry.version || 2).toString(36);
+      lines.push(`${safeId}\t${provider}\t${status}\t${exp}\t${ver}\t${labelsPart}`);
+    }
+    return lines.slice(-COMPACT_MAX_LINES).join('\n');
+  }
+
+  function decodeCompactCache(text, now = Date.now()) {
+    const map = new Map();
+    if (!text || typeof text !== 'string') return map;
+    for (const line of text.split('\n')) {
+      if (!line) continue;
+      const parts = line.split('\t');
+      if (parts.length < 5) continue;
+      const [id, provider, status, exp36, ver36, labelsRaw = ''] = parts;
+      const expiresAt = parseInt(exp36, 36);
+      const version = parseInt(ver36, 36) || 2;
+      if (!Number.isFinite(expiresAt) || expiresAt <= now) continue;
+      const labels = labelsRaw
+        ? labelsRaw.split(';').filter(Boolean).map(item => {
+            const [label = '', kind = 'genre', itemProv = ''] = item.split('~');
+            const k = label.normalize('NFKC').trim().replace(/\s+/gu, ' ').toLocaleLowerCase('en-US');
+            return { key: k, label: label.trim(), kind, kinds: [kind], rawValue: label.trim(), ...(itemProv ? { provider: itemProv } : {}) };
+          }).filter(l => l.key)
+        : [];
+      map.set(id, {
+        version,
+        expiresAt,
+        value: {
+          provider,
+          status,
+          labels,
+          fetchedAt: now,
+          expiresAt
+        }
+      });
+    }
+    return map;
+  }
+
+  function createIndexedDBStorage(indexedDB = globalThis.indexedDB, localStore = globalThis.localStorage) {
     const spaces = ['settings', 'cache'];
+    const compactMap = (() => {
+      try { return decodeCompactCache(localStore?.getItem?.(COMPACT_CACHE_KEY)); }
+      catch { return new Map(); }
+    })();
+    let flushTimer = null;
+    function scheduleCompactFlush() {
+      if (!localStore || flushTimer !== null) return;
+      flushTimer = setTimeout(() => {
+        flushTimer = null;
+        try {
+          while (compactMap.size > COMPACT_MAX_LINES) {
+            const oldest = compactMap.keys().next().value;
+            compactMap.delete(oldest);
+          }
+          localStore.setItem(COMPACT_CACHE_KEY, encodeCompactCache(compactMap));
+        } catch { /* Quota or private mode; IndexedDB still persists. */ }
+      }, 120);
+      flushTimer.unref?.();
+    }
     const ready = new Promise((resolve, reject) => {
+      if (!indexedDB || typeof indexedDB.open !== 'function') {
+        reject(new Error('Genre storage unavailable'));
+        return;
+      }
       const request = indexedDB.open('Genre4allDB', 1);
       request.onupgradeneeded = () => { for (const space of spaces) if (!request.result.objectStoreNames.contains(space)) request.result.createObjectStore(space); };
       request.onsuccess = () => { const db = request.result; db.onversionchange = () => db.close(); resolve(db); };
@@ -20,12 +98,51 @@ const Genre4allTransport = (() => {
       });
     }
     return {
-      get: (s, k) => transaction(s, 'readonly', os => os.get(k)),
-      set: (s, k, v) => transaction(s, 'readwrite', os => os.put(v, k)),
-      remove: (s, k) => transaction(s, 'readwrite', os => os.delete(k)),
-      clear: s => transaction(s, 'readwrite', os => os.clear()),
-      entries: s => transaction(s, 'readonly', os => { const keys = os.getAllKeys(), values = os.getAll(); return () => keys.result.map((k, i) => [k, values.result[i]]); }),
-      async close() { (await ready).close(); }
+      async get(s, k) {
+        if (s === 'cache' && compactMap.has(k)) return compactMap.get(k);
+        try { return await transaction(s, 'readonly', os => os.get(k)); }
+        catch { return s === 'cache' ? compactMap.get(k) : undefined; }
+      },
+      async set(s, k, v) {
+        if (s === 'cache') {
+          compactMap.set(k, v);
+          scheduleCompactFlush();
+        }
+        return transaction(s, 'readwrite', os => os.put(v, k));
+      },
+      async remove(s, k) {
+        if (s === 'cache') {
+          compactMap.delete(k);
+          scheduleCompactFlush();
+        }
+        return transaction(s, 'readwrite', os => os.delete(k));
+      },
+      async clear(s) {
+        if (s === 'cache') {
+          compactMap.clear();
+          clearTimeout(flushTimer); flushTimer = null;
+          try { localStore?.removeItem?.(COMPACT_CACHE_KEY); } catch {}
+        }
+        return transaction(s, 'readwrite', os => os.clear());
+      },
+      async entries(s) {
+        try {
+          const idbEntries = await transaction(s, 'readonly', os => {
+            const keys = os.getAllKeys(), values = os.getAll();
+            return () => keys.result.map((k, i) => [k, values.result[i]]);
+          });
+          if (s === 'cache') {
+            const merged = new Map(compactMap);
+            for (const [k, v] of idbEntries) merged.set(k, v);
+            for (const [k, v] of merged) compactMap.set(k, v);
+            return [...merged.entries()];
+          }
+          return idbEntries;
+        } catch {
+          return s === 'cache' ? [...compactMap.entries()] : [];
+        }
+      },
+      async close() { clearTimeout(flushTimer); (await ready).close(); }
     };
   }
 
@@ -40,39 +157,74 @@ const Genre4allTransport = (() => {
   function escapeLucene(value) {
     return String(value || '').replace(/(["\\+\-&|!(){}[\]^~*?:\/])/gu, '\\$1');
   }
+  function waitAbortable(ms, signal, api) {
+    return new Promise((resolve, reject) => {
+      if (signal?.aborted) { reject(new api.GenreError('cancelled', 'CANCELLED')); return; }
+      const timer = setTimeout(() => {
+        signal?.removeEventListener('abort', onAbort);
+        resolve();
+      }, Math.max(0, ms));
+      function onAbort() {
+        clearTimeout(timer);
+        reject(new api.GenreError('cancelled', 'CANCELLED'));
+      }
+      signal?.addEventListener('abort', onAbort, { once: true });
+    });
+  }
 
-  async function fetchJson(api, fetchImpl, url, headers, signal, prefix) {
+  async function fetchJson(api, fetchImpl, url, headers, signal, prefix, runStep) {
     if (signal?.aborted) throw new api.GenreError('cancelled', 'CANCELLED');
     if (typeof fetchImpl !== 'function') throw new api.GenreError('unsupported', `${prefix}_FETCH_UNAVAILABLE`);
-    const controller = new AbortController();
-    let timedOut = false;
-    const timer = setTimeout(() => { timedOut = true; controller.abort(); }, 8000);
-    const onAbort = () => controller.abort();
-    signal?.addEventListener('abort', onAbort, { once: true });
-    try {
-      const res = await fetchImpl(url, { method: 'GET', headers: { Accept: 'application/json', ...headers }, signal: controller.signal });
+    const exec = typeof runStep === 'function' ? runStep : fn => fn();
+
+    for (let attempt = 0; attempt < 3; attempt++) {
       if (signal?.aborted) throw new api.GenreError('cancelled', 'CANCELLED');
-      if (res.status === 401 || res.status === 403) throw new api.GenreError('not_configured', `${prefix}_AUTH_FAILED`, Date.now() + 60000);
-      if (res.status === 429 || res.status === 503) {
-        throw new api.GenreError('rate_limited', `${prefix}_RATE_LIMITED`, api.retryTime(res.headers?.get?.('retry-after'), Date.now()));
+      try {
+        return await exec(async () => {
+          if (signal?.aborted) throw new api.GenreError('cancelled', 'CANCELLED');
+          const controller = new AbortController();
+          let timedOut = false;
+          const timer = setTimeout(() => { timedOut = true; controller.abort(); }, 10000);
+          const onAbort = () => controller.abort();
+          signal?.addEventListener('abort', onAbort, { once: true });
+          try {
+            const res = await fetchImpl(url, { method: 'GET', headers: { Accept: 'application/json', ...headers }, signal: controller.signal });
+            if (signal?.aborted) throw new api.GenreError('cancelled', 'CANCELLED');
+            if (res.status === 401 || res.status === 403) throw new api.GenreError('not_configured', `${prefix}_AUTH_FAILED`);
+            if (res.status === 429 || res.status === 503) {
+              const retryHeader = res.headers?.get?.('retry-after');
+              const retryAt = retryHeader ? api.retryTime(retryHeader, Date.now()) : (Date.now() + (attempt + 1) * 2500);
+              throw new api.GenreError('rate_limited', `${prefix}_RATE_LIMITED`, retryAt);
+            }
+            if (res.status === 404) return null;
+            if (!res.ok) throw new api.GenreError('error', `${prefix}_HTTP_${res.status}`);
+            const remHeader = res.headers?.get?.('x-discogs-ratelimit-remaining');
+            const remaining = remHeader !== null && remHeader !== undefined && String(remHeader).trim() !== '' ? Number(remHeader) : NaN;
+            const data = await res.json();
+            if (Number.isFinite(remaining) && remaining <= 1 && data && typeof data === 'object') {
+              data.__rateLimitLow = true;
+            }
+            return data;
+          } catch (err) {
+            if (err instanceof api.GenreError) throw err;
+            if (signal?.aborted) throw new api.GenreError('cancelled', 'CANCELLED');
+            if (timedOut) throw new api.GenreError('error', `${prefix}_TIMEOUT`);
+            throw new api.GenreError('error', `${prefix}_REQUEST_FAILED`);
+          } finally {
+            clearTimeout(timer);
+            signal?.removeEventListener('abort', onAbort);
+          }
+        });
+      } catch (err) {
+        if (err instanceof api.GenreError && err.status === 'rate_limited' && attempt < 2) {
+          const waitMs = Math.min(12000, Math.max(1500, (err.retryAt || (Date.now() + 2500)) - Date.now()));
+          await waitAbortable(waitMs, signal, api);
+          continue;
+        }
+        throw err;
       }
-      if (res.status === 404) return null;
-      if (!res.ok) throw new api.GenreError('error', `${prefix}_HTTP_${res.status}`, res.status >= 500 ? Date.now() + 20000 : undefined);
-      const remaining = Number(res.headers?.get?.('x-discogs-ratelimit-remaining'));
-      const data = await res.json();
-      if (Number.isFinite(remaining) && remaining <= 0 && data && typeof data === 'object') {
-        data.__rateLimitExhaustedUntil = Date.now() + 60000;
-      }
-      return data;
-    } catch (err) {
-      if (err instanceof api.GenreError) throw err;
-      if (signal?.aborted) throw new api.GenreError('cancelled', 'CANCELLED');
-      if (timedOut) throw new api.GenreError('error', `${prefix}_TIMEOUT`, Date.now() + 20000);
-      throw new api.GenreError('error', `${prefix}_REQUEST_FAILED`, Date.now() + 20000);
-    } finally {
-      clearTimeout(timer);
-      signal?.removeEventListener('abort', onAbort);
     }
+    return null;
   }
 
   function createDiscogsAdapter(api, getConfig, fetchImpl = globalThis.fetch) {
@@ -89,7 +241,7 @@ const Genre4allTransport = (() => {
       if (!Array.isArray(results) || !results.length) return null;
       const targetTitle = normText(identity.title);
       const targetClean = normText(cleanSearchTitle(identity.title));
-      const targetAlbum = normText(identity.album);
+      const targetAlbum = normText(cleanSearchTitle(identity.album));
       const targetArtists = (identity.artists || []).map(a => normText(String(a).replace(/\s*\(\d+\)$/u, ''))).filter(Boolean);
       let best = null, bestScore = -1;
       for (const item of results) {
@@ -115,46 +267,43 @@ const Genre4allTransport = (() => {
       }
       return best;
     }
-    const adapter = async (identity, signal) => {
+    const adapter = async (identity, signal, runStep) => {
       if (signal?.aborted) throw new api.GenreError('cancelled', 'CANCELLED');
       const cfg = typeof getConfig === 'function' ? getConfig() : (getConfig || {});
       const token = String(cfg?.discogsToken || '').trim();
       if (!token) throw new api.GenreError('not_configured', 'DISCOGS_TOKEN_REQUIRED');
       const title = cleanSearchTitle(identity?.title);
+      const album = cleanSearchTitle(identity?.album);
       const artists = Array.isArray(identity?.artists) ? identity.artists.filter(Boolean) : [];
       if (!title || !artists.length) throw new api.GenreError('unsupported', 'TRACK_METADATA_REQUIRED');
 
-      const params1 = new URLSearchParams({ artist: artists[0], track: title, per_page: '10' });
+      const q1 = `${artists[0]} ${title}`.trim();
+      const params1 = new URLSearchParams({ q: q1, per_page: '15' });
       applyAuth(params1, token);
-      const data1 = await fetchJson(api, fetchImpl, `https://api.discogs.com/database/search?${params1}`, {}, signal, 'DISCOGS');
+      const data1 = await fetchJson(api, fetchImpl, `https://api.discogs.com/database/search?${params1}`, {}, signal, 'DISCOGS', runStep);
       let best = pickBest(identity, data1?.results);
-      let exhaustedUntil = data1?.__rateLimitExhaustedUntil;
 
-      if (!best && !exhaustedUntil) {
-        const q = `${artists[0]} ${identity.album || title}`.trim();
-        const params2 = new URLSearchParams({ q, per_page: '10' });
+      if (!best && album && normText(album) !== normText(title)) {
+        const q2 = `${artists[0]} ${album}`.trim();
+        const params2 = new URLSearchParams({ q: q2, per_page: '10' });
         applyAuth(params2, token);
-        const data2 = await fetchJson(api, fetchImpl, `https://api.discogs.com/database/search?${params2}`, {}, signal, 'DISCOGS');
+        const data2 = await fetchJson(api, fetchImpl, `https://api.discogs.com/database/search?${params2}`, {}, signal, 'DISCOGS', runStep);
         best = pickBest(identity, data2?.results);
-        exhaustedUntil = data2?.__rateLimitExhaustedUntil;
       }
-      if (!best) {
-        if (exhaustedUntil) throw new api.GenreError('rate_limited', 'DISCOGS_RATE_LIMITED', exhaustedUntil);
-        return null;
-      }
+      if (!best) return null;
       return {
         genres: Array.isArray(best.genre) ? best.genre : [],
         styles: Array.isArray(best.style) ? best.style : [],
         entityType: best.type || 'release',
         entityId: String(best.id || ''),
-        sourceUrl: best.uri ? new URL(best.uri, 'https://www.discogs.com').href : 'https://www.discogs.com',
-        ...(exhaustedUntil ? { rateLimitExhaustedUntil: exhaustedUntil } : {})
+        sourceUrl: best.uri ? new URL(best.uri, 'https://www.discogs.com').href : 'https://www.discogs.com'
       };
     };
     adapter.isConfigured = () => {
       const cfg = typeof getConfig === 'function' ? getConfig() : (getConfig || {});
       return Boolean(String(cfg?.discogsToken || '').trim());
     };
+    adapter.usesStepLimiter = true;
     return adapter;
   }
 
@@ -210,7 +359,7 @@ const Genre4allTransport = (() => {
       }
       return null;
     }
-    return async (identity, signal) => {
+    const adapter = async (identity, signal, runStep) => {
       if (signal?.aborted) throw new api.GenreError('cancelled', 'CANCELLED');
       const cfg = typeof getConfig === 'function' ? getConfig() : (getConfig || {});
       const token = String(cfg?.musicbrainzToken || '').trim();
@@ -226,14 +375,14 @@ const Genre4allTransport = (() => {
       const query = parts.join(' OR ');
 
       const searchUrl = `https://musicbrainz.org/ws/2/recording?query=${encodeURIComponent(query)}&limit=8&fmt=json`;
-      const data = await fetchJson(api, fetchImpl, searchUrl, headers, signal, 'MUSICBRAINZ');
+      const data = await fetchJson(api, fetchImpl, searchUrl, headers, signal, 'MUSICBRAINZ', runStep);
       const matched = matchCandidate(identity, data?.recordings);
       if (!matched) return null;
 
       let { genres, tags } = collectBuckets(matched);
       if (!genres.length && !tags.length && matched.id) {
         const detailUrl = `https://musicbrainz.org/ws/2/recording/${encodeURIComponent(matched.id)}?inc=genres+tags+artists+release-groups&fmt=json`;
-        const detail = await fetchJson(api, fetchImpl, detailUrl, headers, signal, 'MUSICBRAINZ');
+        const detail = await fetchJson(api, fetchImpl, detailUrl, headers, signal, 'MUSICBRAINZ', runStep);
         if (detail) ({ genres, tags } = collectBuckets(detail));
       }
       return {
@@ -244,6 +393,8 @@ const Genre4allTransport = (() => {
         sourceUrl: matched.id ? `https://musicbrainz.org/recording/${matched.id}` : 'https://musicbrainz.org'
       };
     };
+    adapter.usesStepLimiter = true;
+    return adapter;
   }
 
   function createSpotifyAdapter(api, getClient) {
@@ -284,6 +435,6 @@ const Genre4allTransport = (() => {
     };
   }
 
-  return { createIndexedDBStorage, createSpotifyAdapter, createDiscogsAdapter, createMusicBrainzAdapter };
+  return { COMPACT_CACHE_KEY, encodeCompactCache, decodeCompactCache, createIndexedDBStorage, createSpotifyAdapter, createDiscogsAdapter, createMusicBrainzAdapter };
 })();
 if (typeof module !== 'undefined' && module.exports) module.exports = Genre4allTransport;

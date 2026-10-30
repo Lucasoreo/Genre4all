@@ -278,24 +278,35 @@ const Genre4allColumn = (() => {
         if (isExpired(r) && !r.task) { clearTimeout(r.expiry); r.expiry = null; r.result = null; r.state = 'queued'; render(r); }
         if (r.visible && r.state === 'queued' && !r.task) candidates.push(r);
       }
-      if (!candidates.length || active >= 8) return;
+      if (!candidates.length || active >= 24) return;
       if (candidates.length > 1) {
         const distances = new Map(candidates.map(r => [r, Math.abs(r.row.getBoundingClientRect().top)]));
         candidates.sort((a, b) => distances.get(a) - distances.get(b));
       }
-      for (const r of candidates) { if (active >= 8) break; start(r); }
+      for (const r of candidates) { if (active >= 24) break; start(r); }
     }
     async function start(r) {
       if (!valid(r) || r.task) return;
       clearTimeout(r.expiry); r.expiry = null; r.state = 'loading'; r.result = null; render(r);
       const task = new AbortController(); r.task = task; active++;
       try {
-        const result = await service.resolve(r.track, { signal: task.signal });
+        const result = await service.resolve(r.track, {
+          signal: task.signal,
+          onPreview: preview => {
+            if (!valid(r) || task.signal.aborted || preview.configVersion !== r.revision) return;
+            if (r.state === 'loading' || r.result?.isPreview) {
+              r.result = preview;
+              r.state = preview.status;
+              render(r);
+            }
+          }
+        });
         if (!valid(r) || task.signal.aborted || result.configVersion !== r.revision) return;
         r.result = result; r.state = result.status;
         render(r);
-        if (['success', 'empty', 'no_match'].includes(result.status) && result.expiresAt) {
-          const delay = Math.max(50, Math.min(result.expiresAt - Date.now(), 2147483647));
+        const expiryTime = result.expiresAt || result.retryAt;
+        if (['success', 'empty', 'no_match', 'rate_limited', 'error'].includes(result.status) && expiryTime) {
+          const delay = Math.max(50, Math.min(expiryTime - Date.now(), 2147483647));
           r.expiry = setTimeout(() => {
             if (!valid(r)) return;
             r.expiry = null; r.result = null; r.state = 'queued';
@@ -303,7 +314,7 @@ const Genre4allColumn = (() => {
           }, delay);
         }
       } catch { if (valid(r) && !task.signal.aborted) { r.result = { status: 'error', errorCode: 'GENRE_VIEW_FAILED' }; r.state = 'error'; render(r); } }
-      finally { if (r.task === task) r.task = null; active--; if (valid(r) && r.state === 'loading' && task.signal.aborted) r.state = 'queued'; schedule(); }
+      finally { if (r.task === task) r.task = null; active--; if (valid(r) && (r.state === 'loading' || r.result?.isPreview) && task.signal.aborted) { r.result = null; r.state = 'queued'; } schedule(); }
     }
     const observer = typeof win.IntersectionObserver === 'function' ? new win.IntersectionObserver(entries => {
       for (const entry of entries) {
@@ -311,7 +322,7 @@ const Genre4allColumn = (() => {
         if (!rowSet) continue;
         for (const r of rowSet) {
           r.visible = entry.isIntersecting;
-          if (!r.visible && r.task) { r.task.abort(); r.state = 'queued'; render(r); }
+          if (!r.visible && r.task) { r.task.abort(); r.result = null; r.state = 'queued'; render(r); }
         }
       }
       schedule();

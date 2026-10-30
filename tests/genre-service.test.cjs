@@ -2,7 +2,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const api = require('../src/genre-service.js');
-const { createSpotifyAdapter, createDiscogsAdapter, createMusicBrainzAdapter } = require('../src/genre-transport.js');
+const { createSpotifyAdapter, createDiscogsAdapter, createMusicBrainzAdapter, encodeCompactCache, decodeCompactCache } = require('../src/genre-transport.js');
 const TRACK = { uri: 'spotify:track:aaaaaaaaaaaaaaaaaaaaaa', name: 'Real Thing', artists: [{ name: 'Artist A' }], album: { name: 'Release A' }, duration_ms: 240000, external_ids: { isrc: 'TEST12345678' } };
 
 function storage() {
@@ -414,5 +414,81 @@ test('rate-limit exhaustion or connection failure automatically descends in prio
   assert.equal(dcCalls, 1);
   assert.equal(mbCalls, 2, 'MusicBrainz was skipped immediately due to active connection-failure cooldown');
   assert.equal(spCalls, 3);
+  service.close();
+});
+
+test('v1.11: legacy v1 saved order ["spotify"] automatically migrates to ["discogs", "musicbrainz", "spotify"] when all 3 are enabled', async () => {
+  const store = storage();
+  // Simulate v1.0.0 persisted settings where order only had ['spotify']
+  await store.set('settings', 'genre-selector-v1', {
+    version: 1,
+    order: ['spotify'],
+    enabled: { spotify: true },
+    discogsToken: 'dc-token'
+  });
+  let dcCalled = 0, spCalled = 0;
+  const dcAdapter = async () => { dcCalled++; return { genres: ['Electronic'], styles: ['Techno'] }; };
+  dcAdapter.isConfigured = () => true;
+  const service = api.createService({
+    storage: store,
+    discogsInterval: 1,
+    discogs: dcAdapter,
+    spotify: async () => { spCalled++; return [{ name: 'Dance', score: 0.9 }]; }
+  });
+  await service.ready;
+  assert.deepEqual(service.getConfig().order, ['discogs', 'musicbrainz', 'spotify']);
+  const res = await service.resolve(TRACK);
+  assert.equal(res.selectedProvider, 'discogs');
+  assert.equal(dcCalled, 1);
+  assert.equal(spCalled, 0, 'Must not return directly from Spotify when all 3 sources are enabled');
+  service.close();
+});
+
+test('v1.11: Discogs missing CORS rate-limit header does not block subsequent tracks and compact TXT cache round-trips', async () => {
+  const cfg = { discogsToken: 'valid-token' };
+  let fetchCount = 0;
+  const discogs = createDiscogsAdapter(api, () => cfg, async () => {
+    fetchCount++;
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: () => null }, // Browser CORS hides X-Discogs-Ratelimit-Remaining -> returns null
+      async json() {
+        return {
+          results: [{ id: fetchCount, type: 'master', title: 'Artist A - Real Thing', genre: ['Electronic'], style: ['House'] }]
+        };
+      }
+    };
+  });
+  let time = 1000;
+  const store = storage();
+  const service = api.createService({
+    now: () => time,
+    wait: async ms => { time += ms; if (ms >= 100) await new Promise(r => setImmediate(r)); },
+    storage: store,
+    discogsInterval: 1100,
+    discogs,
+    spotify: async () => [{ name: 'Fallback Pop', score: 0.9 }],
+    validateSpotifyGenre: () => true
+  });
+  const track2 = { ...TRACK, uri: 'spotify:track:bbbbbbbbbbbbbbbbbbbbbb', name: 'Real Thing', external_ids: { isrc: 'TEST87654321' } };
+  const previews = [];
+  const [r1, r2] = await Promise.all([
+    service.resolve(TRACK),
+    service.resolve(track2, { onPreview: p => previews.push(p) })
+  ]);
+  assert.equal(r1.status, 'success');
+  assert.equal(r1.selectedProvider, 'discogs');
+  assert.equal(r2.status, 'success', 'Second track must also succeed via Discogs and not fail with rate_limited');
+  assert.equal(r2.selectedProvider, 'discogs');
+  assert.equal(previews.length, 1, 'Queued second track receives fast fallback preview while waiting for paced Discogs slot');
+  assert.equal(previews[0].selectedProvider, 'spotify');
+
+  // Verify compact TXT cache round-trip
+  const entriesMap = new Map(await store.entries('cache'));
+  const txt = encodeCompactCache(entriesMap, time);
+  assert.ok(txt.includes('provider:discogs:'), 'Compact TXT format serializes provider cache lines');
+  const decoded = decodeCompactCache(txt, time);
+  assert.equal(decoded.size, entriesMap.size);
   service.close();
 });

@@ -27,13 +27,13 @@ SOFTWARE.
 */
 (function () {
 "use strict";
-/* Genre4all genre resolver (v1.1). Priority: Discogs -> MusicBrainz (+ Spotify) -> Spotify. */
+/* Genre4all genre resolver (v1.11). Priority: Discogs -> MusicBrainz (+ Spotify) -> Spotify. */
 const Genre4allGenres = (() => {
   'use strict';
   const PROVIDERS = Object.freeze(['discogs', 'musicbrainz', 'spotify']);
   const STATUSES = Object.freeze(['success', 'empty', 'no_match', 'not_configured', 'unsupported', 'rate_limited', 'error', 'cancelled']);
   const HOUR = 3600000;
-  const TTL = { discogs: 24 * HOUR, musicbrainz: 24 * HOUR, spotify: HOUR };
+  const TTL = { discogs: 30 * 24 * HOUR, musicbrainz: 30 * 24 * HOUR, spotify: HOUR };
   const CACHE_VERSION = 2;
   const CACHE_LIMIT = 2000;
   const clone = typeof structuredClone === 'function' ? value => structuredClone(value) : value => JSON.parse(JSON.stringify(value));
@@ -41,7 +41,7 @@ const Genre4allGenres = (() => {
   const key = value => String(value || '').normalize('NFKC').trim().replace(/\s+/gu, ' ').toLocaleLowerCase('en-US');
   const matchText = value => key(value).replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
   const defaultConfig = () => ({
-    version: 1,
+    version: 2,
     order: [...PROVIDERS],
     enabled: Object.fromEntries(PROVIDERS.map(p => [p, true])),
     showGenres: true,
@@ -53,9 +53,10 @@ const Genre4allGenres = (() => {
   function configFrom(value) {
     const v = value && typeof value === 'object' ? value : {};
     const defaults = defaultConfig();
+    const validOrder = v.version >= 2 && Array.isArray(v.order) ? v.order.filter(p => PROVIDERS.includes(p)) : [];
     return {
       ...defaults,
-      order: [...new Set([...(Array.isArray(v.order) ? v.order : []).filter(p => PROVIDERS.includes(p)), ...PROVIDERS])],
+      order: [...new Set([...validOrder, ...PROVIDERS])],
       enabled: Object.fromEntries(PROVIDERS.map(p => [p, typeof v.enabled?.[p] === 'boolean' ? v.enabled[p] : true])),
       showGenres: v.showGenres !== false,
       showStyles: v.showStyles !== false,
@@ -207,6 +208,9 @@ const Genre4allGenres = (() => {
     return {
       block(until) { if (Number.isFinite(until)) blockedUntil = Math.max(blockedUntil, until); },
       unblock() { blockedUntil = 0; },
+      isBlocked() { return now() < blockedUntil; },
+      isBusy() { return pending > 0 || nextAt > now() + 50; },
+      get blockedUntil() { return blockedUntil; },
       setSpacing(ms) { if (Number.isFinite(ms) && ms > 0) { spacing = Math.max(interval, ms); nextAt = Math.max(nextAt, now() + spacing); } },
       async run(work, signal) {
         checkAbort(signal);
@@ -310,7 +314,7 @@ const Genre4allGenres = (() => {
     const now = options.now || (() => Date.now());
     const storage = options.storage || { async get() {}, async set() {}, async remove() {}, async clear() {}, async entries() { return []; } };
     const providerCache = new Map(), resolved = new Map(), inflight = new Map();
-    const intervals = { discogs: options.discogsInterval ?? 1000, musicbrainz: options.musicbrainzInterval ?? 1000, spotify: options.spotifyInterval ?? 25 };
+    const intervals = { discogs: options.discogsInterval ?? 1100, musicbrainz: options.musicbrainzInterval ?? 1150, spotify: options.spotifyInterval ?? 25 };
     const limiters = Object.fromEntries(PROVIDERS.map(p => [p, createLimiter(intervals[p] ?? 25, { now, wait: options.wait, maxQueue: 256 })]));
     let config = defaultConfig(), revision = 1, closed = false;
     let persistence = Promise.resolve(), cacheMutation = Promise.resolve(), expiryTimer = null;
@@ -318,7 +322,9 @@ const Genre4allGenres = (() => {
     function write(space, id, value) { const operation = persistence.then(() => storage.set(space, id, clone(value))); persistence = operation.catch(() => {}); return operation; }
     function remove(space, id) { const operation = persistence.then(() => storage.remove(space, id)); persistence = operation.catch(() => {}); return operation; }
     const ready = (async () => {
-      config = configFrom(await storage.get('settings', 'genre-selector-v1'));
+      const savedConfig = await storage.get('settings', 'genre-selector-v1');
+      config = configFrom(savedConfig);
+      if (savedConfig && savedConfig.version !== config.version) write('settings', 'genre-selector-v1', config);
       for (const [id, entry] of await storage.entries('cache')) {
         if (entry?.version === CACHE_VERSION && entry.value && typeof entry.value === 'object' && Number.isFinite(entry.expiresAt) && entry.expiresAt > now() && PROVIDERS.some(p => id.startsWith(`provider:${p}:`))) {
           providerCache.set(id, entry);
@@ -375,7 +381,8 @@ const Genre4allGenres = (() => {
     }
     function failure(provider, error) {
       const e = error instanceof GenreError ? error : new GenreError('error', 'REQUEST_FAILED');
-      return { provider, status: e.status, labels: [], errorCode: e.code, ...(e.retryAt ? { retryAt: e.retryAt } : {}) };
+      const retryAt = e.retryAt || (provider && limiters[provider]?.blockedUntil > now() ? limiters[provider].blockedUntil : undefined);
+      return { provider, status: e.status, labels: [], errorCode: e.code, ...(retryAt ? { retryAt } : {}) };
     }
     function response(provider, state, labels = [], fields = {}) {
       return { provider, status: state, labels: dedupeLabels(labels), fetchedAt: now(), expiresAt: now() + (TTL[provider] || HOUR), ...fields };
@@ -397,16 +404,28 @@ const Genre4allGenres = (() => {
       if (!identity.title || !identity.artists?.length) return failure('discogs', new GenreError('unsupported', 'TRACK_METADATA_REQUIRED'));
       let data;
       try {
-        data = await limiters.discogs.run(async () => {
+        const runStep = work => limiters.discogs.run(work, signal);
+        if (options.discogs.usesStepLimiter) {
+          if (limiters.discogs.isBlocked()) throw new GenreError('rate_limited', 'RATE_LIMITED', limiters.discogs.blockedUntil);
           try {
-            const res = await options.discogs(identity, signal);
-            if (res?.rateLimitExhaustedUntil) limiters.discogs.block(res.rateLimitExhaustedUntil);
-            return res;
+            data = await options.discogs(identity, signal, runStep);
+            if (data?.rateLimitExhaustedUntil) limiters.discogs.block(data.rateLimitExhaustedUntil);
           } catch (err) {
             blockOnError(limiters.discogs, err);
             throw err;
           }
-        }, signal);
+        } else {
+          data = await limiters.discogs.run(async () => {
+            try {
+              const res = await options.discogs(identity, signal);
+              if (res?.rateLimitExhaustedUntil) limiters.discogs.block(res.rateLimitExhaustedUntil);
+              return res;
+            } catch (err) {
+              blockOnError(limiters.discogs, err);
+              throw err;
+            }
+          }, signal);
+        }
       } catch (e) {
         throw e instanceof GenreError ? e : new GenreError('error', 'DISCOGS_REQUEST_FAILED');
       }
@@ -441,14 +460,25 @@ const Genre4allGenres = (() => {
       if (!identity.isrc && (!identity.title || !identity.artists?.length)) return failure('musicbrainz', new GenreError('unsupported', 'TRACK_METADATA_REQUIRED'));
       let data;
       try {
-        data = await limiters.musicbrainz.run(async () => {
+        const runStep = work => limiters.musicbrainz.run(work, signal);
+        if (options.musicbrainz.usesStepLimiter) {
+          if (limiters.musicbrainz.isBlocked()) throw new GenreError('rate_limited', 'RATE_LIMITED', limiters.musicbrainz.blockedUntil);
           try {
-            return await options.musicbrainz(identity, signal);
+            data = await options.musicbrainz(identity, signal, runStep);
           } catch (err) {
             blockOnError(limiters.musicbrainz, err);
             throw err;
           }
-        }, signal);
+        } else {
+          data = await limiters.musicbrainz.run(async () => {
+            try {
+              return await options.musicbrainz(identity, signal);
+            } catch (err) {
+              blockOnError(limiters.musicbrainz, err);
+              throw err;
+            }
+          }, signal);
+        }
       } catch (e) {
         throw e instanceof GenreError ? e : new GenreError('error', 'MUSICBRAINZ_REQUEST_FAILED');
       }
@@ -538,7 +568,7 @@ const Genre4allGenres = (() => {
         .filter(l => (l.kinds || [l.kind]).some(kind => kind === 'style' ? policy.showStyles : policy.showGenres));
       return provider === 'spotify' ? filtered : sortLabelsByKind(filtered);
     }
-    async function resolve(track, { signal } = {}) {
+    async function resolve(track, { signal, onPreview } = {}) {
       try { await ready; await cacheMutation; } catch { return { ...failure(null, new GenreError('error', 'STORAGE_UNAVAILABLE')), configVersion: revision, attempts: [] }; }
       const identity = identityFor(track), currentRevision = revision, policy = clone(config);
       if (closed || signal?.aborted) return { status: 'cancelled', labels: [], configVersion: currentRevision, attempts: [] };
@@ -548,8 +578,43 @@ const Genre4allGenres = (() => {
         if (cached.expiresAt > now()) return clone(cached);
         resolved.delete(id);
       }
+      let mainDone = false;
+      if (typeof onPreview === 'function') {
+        (async () => {
+          try {
+            const enabled = policy.order.filter(p => policy.enabled[p]);
+            if (enabled.length < 2 || !identity.uri?.startsWith('spotify:track:')) return;
+            const isDiscogsReady = Boolean(options.providers?.discogs || (options.discogs && (typeof options.discogs.isConfigured !== 'function' || options.discogs.isConfigured())));
+            const isMbReady = Boolean(options.providers?.musicbrainz || (options.musicbrainz && (typeof options.musicbrainz.isConfigured !== 'function' || options.musicbrainz.isConfigured())));
+            const activeEnabled = enabled.filter(p => (p !== 'discogs' || isDiscogsReady) && (p !== 'musicbrainz' || isMbReady));
+            if (activeEnabled.length < 2) return;
+            const top = activeEnabled[0];
+            if (top === 'spotify') return;
+            const topCached = await cacheGet(providerCache, `provider:${top}:${identity.key}`);
+            if (topCached?.status === 'success') return;
+            await Promise.resolve();
+            await Promise.resolve();
+            if (!limiters[top]?.isBusy()) await (options.wait || sleep)(180, signal);
+            if (mainDone || signal?.aborted || revision !== currentRevision) return;
+            if (activeEnabled.includes('spotify')) {
+              const spRaw = await runProvider('spotify', identity, signal);
+              if (mainDone || signal?.aborted || revision !== currentRevision) return;
+              const spLabels = filterByPolicy(spRaw.labels, policy, 'spotify');
+              if (spRaw.status === 'success' && spLabels.length) {
+                onPreview({
+                  ...spRaw,
+                  labels: dedupeLabels(spLabels),
+                  selectedProvider: 'spotify',
+                  isPreview: true,
+                  configVersion: currentRevision
+                });
+              }
+            }
+          } catch { /* Preview is best-effort while paced APIs resolve. */ }
+        })();
+      }
       try {
-        return clone(await subscribe(inflight, id, async sharedSignal => {
+        const out = await subscribe(inflight, id, async sharedSignal => {
           const attempts = [], enabled = policy.order.filter(p => policy.enabled[p]);
           if (!enabled.length) return { status: 'empty', reason: 'SOURCES_DISABLED', labels: [], attempts, configVersion: currentRevision };
           if (!identity.uri || !identity.uri.startsWith('spotify:track:')) return { status: 'unsupported', errorCode: 'SPOTIFY_TRACK_REQUIRED', labels: [], attempts, configVersion: currentRevision };
@@ -625,8 +690,10 @@ const Genre4allGenres = (() => {
                 : { status: 'empty', reason: 'ALL_SOURCES_EMPTY', labels: [], selectedProvider: null };
             }
           }
-          const validExpiries = attempts.map(r => r.expiresAt).filter(Number.isFinite);
-          const expiresAt = Number.isFinite(final.expiresAt) ? final.expiresAt : (validExpiries.length ? Math.min(...validExpiries) : now() + HOUR);
+          const retryTimes = attempts.filter(r => ['rate_limited', 'error'].includes(r.status) && Number.isFinite(r.retryAt) && r.retryAt > now()).map(r => r.retryAt);
+          const validExpiries = [...attempts.map(r => r.expiresAt).filter(Number.isFinite), ...retryTimes];
+          const baseExpiry = Number.isFinite(final.expiresAt) ? final.expiresAt : (validExpiries.length ? Math.min(...validExpiries) : now() + HOUR);
+          const expiresAt = retryTimes.length ? Math.min(baseExpiry, ...retryTimes) : baseExpiry;
           const result = { ...final, identityKey: identity.key, configVersion: currentRevision, attempts, expiresAt };
           if (['success', 'empty'].includes(result.status) && expiresAt > now()) {
             resolved.set(id, result);
@@ -634,8 +701,10 @@ const Genre4allGenres = (() => {
           }
           while (resolved.size > CACHE_LIMIT) resolved.delete(resolved.keys().next().value);
           return result;
-        }, signal));
-      } catch (e) { return { ...failure(null, e), configVersion: currentRevision, attempts: [] }; }
+        }, signal);
+        mainDone = true;
+        return clone(out);
+      } catch (e) { mainDone = true; return { ...failure(null, e), configVersion: currentRevision, attempts: [] }; }
     }
     return {
       ready, resolve, identityFor,
@@ -718,12 +787,90 @@ const Genre4allGenres = (() => {
   return { PROVIDERS, STATUSES, TTL, GenreError, defaultConfig, configFrom, labelsFrom, dedupeLabels, sortLabelsByKind, identityFor, versionOf, matchRecording, createLimiter, subscribe, decodeConcepts, createService, retryTime };
 })();
 
-/* Transport adapters (Discogs, MusicBrainz, Spotify MetadataService) and IndexedDB storage for Genre4all. */
+/* Transport adapters (Discogs, MusicBrainz, Spotify MetadataService) and compact persistent cache for Genre4all. */
 const Genre4allTransport = (() => {
   'use strict';
-  function createIndexedDBStorage(indexedDB = globalThis.indexedDB) {
+  const COMPACT_CACHE_KEY = 'genre4all-cache-txt-v11';
+  const COMPACT_MAX_LINES = 2000;
+
+  function encodeCompactCache(map) {
+    const lines = [];
+    for (const [id, entry] of map) {
+      if (!entry || !entry.value || !Number.isFinite(entry.expiresAt)) continue;
+      const v = entry.value;
+      if (!['success', 'empty', 'no_match'].includes(v.status)) continue;
+      const labelsPart = (v.labels || [])
+        .map(l => `${String(l.label || '').replace(/[\t\n\r;~]/gu, ' ')}~${l.kind || 'genre'}~${l.provider || v.provider || ''}`)
+        .join(';');
+      const safeId = String(id).replace(/[\t\n\r]/gu, ' ');
+      const provider = String(v.provider || '').replace(/[\t\n\r]/gu, '');
+      const status = String(v.status || 'empty');
+      const exp = Math.floor(entry.expiresAt).toString(36);
+      const ver = Number(entry.version || 2).toString(36);
+      lines.push(`${safeId}\t${provider}\t${status}\t${exp}\t${ver}\t${labelsPart}`);
+    }
+    return lines.slice(-COMPACT_MAX_LINES).join('\n');
+  }
+
+  function decodeCompactCache(text, now = Date.now()) {
+    const map = new Map();
+    if (!text || typeof text !== 'string') return map;
+    for (const line of text.split('\n')) {
+      if (!line) continue;
+      const parts = line.split('\t');
+      if (parts.length < 5) continue;
+      const [id, provider, status, exp36, ver36, labelsRaw = ''] = parts;
+      const expiresAt = parseInt(exp36, 36);
+      const version = parseInt(ver36, 36) || 2;
+      if (!Number.isFinite(expiresAt) || expiresAt <= now) continue;
+      const labels = labelsRaw
+        ? labelsRaw.split(';').filter(Boolean).map(item => {
+            const [label = '', kind = 'genre', itemProv = ''] = item.split('~');
+            const k = label.normalize('NFKC').trim().replace(/\s+/gu, ' ').toLocaleLowerCase('en-US');
+            return { key: k, label: label.trim(), kind, kinds: [kind], rawValue: label.trim(), ...(itemProv ? { provider: itemProv } : {}) };
+          }).filter(l => l.key)
+        : [];
+      map.set(id, {
+        version,
+        expiresAt,
+        value: {
+          provider,
+          status,
+          labels,
+          fetchedAt: now,
+          expiresAt
+        }
+      });
+    }
+    return map;
+  }
+
+  function createIndexedDBStorage(indexedDB = globalThis.indexedDB, localStore = globalThis.localStorage) {
     const spaces = ['settings', 'cache'];
+    const compactMap = (() => {
+      try { return decodeCompactCache(localStore?.getItem?.(COMPACT_CACHE_KEY)); }
+      catch { return new Map(); }
+    })();
+    let flushTimer = null;
+    function scheduleCompactFlush() {
+      if (!localStore || flushTimer !== null) return;
+      flushTimer = setTimeout(() => {
+        flushTimer = null;
+        try {
+          while (compactMap.size > COMPACT_MAX_LINES) {
+            const oldest = compactMap.keys().next().value;
+            compactMap.delete(oldest);
+          }
+          localStore.setItem(COMPACT_CACHE_KEY, encodeCompactCache(compactMap));
+        } catch { /* Quota or private mode; IndexedDB still persists. */ }
+      }, 120);
+      flushTimer.unref?.();
+    }
     const ready = new Promise((resolve, reject) => {
+      if (!indexedDB || typeof indexedDB.open !== 'function') {
+        reject(new Error('Genre storage unavailable'));
+        return;
+      }
       const request = indexedDB.open('Genre4allDB', 1);
       request.onupgradeneeded = () => { for (const space of spaces) if (!request.result.objectStoreNames.contains(space)) request.result.createObjectStore(space); };
       request.onsuccess = () => { const db = request.result; db.onversionchange = () => db.close(); resolve(db); };
@@ -740,12 +887,51 @@ const Genre4allTransport = (() => {
       });
     }
     return {
-      get: (s, k) => transaction(s, 'readonly', os => os.get(k)),
-      set: (s, k, v) => transaction(s, 'readwrite', os => os.put(v, k)),
-      remove: (s, k) => transaction(s, 'readwrite', os => os.delete(k)),
-      clear: s => transaction(s, 'readwrite', os => os.clear()),
-      entries: s => transaction(s, 'readonly', os => { const keys = os.getAllKeys(), values = os.getAll(); return () => keys.result.map((k, i) => [k, values.result[i]]); }),
-      async close() { (await ready).close(); }
+      async get(s, k) {
+        if (s === 'cache' && compactMap.has(k)) return compactMap.get(k);
+        try { return await transaction(s, 'readonly', os => os.get(k)); }
+        catch { return s === 'cache' ? compactMap.get(k) : undefined; }
+      },
+      async set(s, k, v) {
+        if (s === 'cache') {
+          compactMap.set(k, v);
+          scheduleCompactFlush();
+        }
+        return transaction(s, 'readwrite', os => os.put(v, k));
+      },
+      async remove(s, k) {
+        if (s === 'cache') {
+          compactMap.delete(k);
+          scheduleCompactFlush();
+        }
+        return transaction(s, 'readwrite', os => os.delete(k));
+      },
+      async clear(s) {
+        if (s === 'cache') {
+          compactMap.clear();
+          clearTimeout(flushTimer); flushTimer = null;
+          try { localStore?.removeItem?.(COMPACT_CACHE_KEY); } catch {}
+        }
+        return transaction(s, 'readwrite', os => os.clear());
+      },
+      async entries(s) {
+        try {
+          const idbEntries = await transaction(s, 'readonly', os => {
+            const keys = os.getAllKeys(), values = os.getAll();
+            return () => keys.result.map((k, i) => [k, values.result[i]]);
+          });
+          if (s === 'cache') {
+            const merged = new Map(compactMap);
+            for (const [k, v] of idbEntries) merged.set(k, v);
+            for (const [k, v] of merged) compactMap.set(k, v);
+            return [...merged.entries()];
+          }
+          return idbEntries;
+        } catch {
+          return s === 'cache' ? [...compactMap.entries()] : [];
+        }
+      },
+      async close() { clearTimeout(flushTimer); (await ready).close(); }
     };
   }
 
@@ -760,39 +946,74 @@ const Genre4allTransport = (() => {
   function escapeLucene(value) {
     return String(value || '').replace(/(["\\+\-&|!(){}[\]^~*?:\/])/gu, '\\$1');
   }
+  function waitAbortable(ms, signal, api) {
+    return new Promise((resolve, reject) => {
+      if (signal?.aborted) { reject(new api.GenreError('cancelled', 'CANCELLED')); return; }
+      const timer = setTimeout(() => {
+        signal?.removeEventListener('abort', onAbort);
+        resolve();
+      }, Math.max(0, ms));
+      function onAbort() {
+        clearTimeout(timer);
+        reject(new api.GenreError('cancelled', 'CANCELLED'));
+      }
+      signal?.addEventListener('abort', onAbort, { once: true });
+    });
+  }
 
-  async function fetchJson(api, fetchImpl, url, headers, signal, prefix) {
+  async function fetchJson(api, fetchImpl, url, headers, signal, prefix, runStep) {
     if (signal?.aborted) throw new api.GenreError('cancelled', 'CANCELLED');
     if (typeof fetchImpl !== 'function') throw new api.GenreError('unsupported', `${prefix}_FETCH_UNAVAILABLE`);
-    const controller = new AbortController();
-    let timedOut = false;
-    const timer = setTimeout(() => { timedOut = true; controller.abort(); }, 8000);
-    const onAbort = () => controller.abort();
-    signal?.addEventListener('abort', onAbort, { once: true });
-    try {
-      const res = await fetchImpl(url, { method: 'GET', headers: { Accept: 'application/json', ...headers }, signal: controller.signal });
+    const exec = typeof runStep === 'function' ? runStep : fn => fn();
+
+    for (let attempt = 0; attempt < 3; attempt++) {
       if (signal?.aborted) throw new api.GenreError('cancelled', 'CANCELLED');
-      if (res.status === 401 || res.status === 403) throw new api.GenreError('not_configured', `${prefix}_AUTH_FAILED`, Date.now() + 60000);
-      if (res.status === 429 || res.status === 503) {
-        throw new api.GenreError('rate_limited', `${prefix}_RATE_LIMITED`, api.retryTime(res.headers?.get?.('retry-after'), Date.now()));
+      try {
+        return await exec(async () => {
+          if (signal?.aborted) throw new api.GenreError('cancelled', 'CANCELLED');
+          const controller = new AbortController();
+          let timedOut = false;
+          const timer = setTimeout(() => { timedOut = true; controller.abort(); }, 10000);
+          const onAbort = () => controller.abort();
+          signal?.addEventListener('abort', onAbort, { once: true });
+          try {
+            const res = await fetchImpl(url, { method: 'GET', headers: { Accept: 'application/json', ...headers }, signal: controller.signal });
+            if (signal?.aborted) throw new api.GenreError('cancelled', 'CANCELLED');
+            if (res.status === 401 || res.status === 403) throw new api.GenreError('not_configured', `${prefix}_AUTH_FAILED`);
+            if (res.status === 429 || res.status === 503) {
+              const retryHeader = res.headers?.get?.('retry-after');
+              const retryAt = retryHeader ? api.retryTime(retryHeader, Date.now()) : (Date.now() + (attempt + 1) * 2500);
+              throw new api.GenreError('rate_limited', `${prefix}_RATE_LIMITED`, retryAt);
+            }
+            if (res.status === 404) return null;
+            if (!res.ok) throw new api.GenreError('error', `${prefix}_HTTP_${res.status}`);
+            const remHeader = res.headers?.get?.('x-discogs-ratelimit-remaining');
+            const remaining = remHeader !== null && remHeader !== undefined && String(remHeader).trim() !== '' ? Number(remHeader) : NaN;
+            const data = await res.json();
+            if (Number.isFinite(remaining) && remaining <= 1 && data && typeof data === 'object') {
+              data.__rateLimitLow = true;
+            }
+            return data;
+          } catch (err) {
+            if (err instanceof api.GenreError) throw err;
+            if (signal?.aborted) throw new api.GenreError('cancelled', 'CANCELLED');
+            if (timedOut) throw new api.GenreError('error', `${prefix}_TIMEOUT`);
+            throw new api.GenreError('error', `${prefix}_REQUEST_FAILED`);
+          } finally {
+            clearTimeout(timer);
+            signal?.removeEventListener('abort', onAbort);
+          }
+        });
+      } catch (err) {
+        if (err instanceof api.GenreError && err.status === 'rate_limited' && attempt < 2) {
+          const waitMs = Math.min(12000, Math.max(1500, (err.retryAt || (Date.now() + 2500)) - Date.now()));
+          await waitAbortable(waitMs, signal, api);
+          continue;
+        }
+        throw err;
       }
-      if (res.status === 404) return null;
-      if (!res.ok) throw new api.GenreError('error', `${prefix}_HTTP_${res.status}`, res.status >= 500 ? Date.now() + 20000 : undefined);
-      const remaining = Number(res.headers?.get?.('x-discogs-ratelimit-remaining'));
-      const data = await res.json();
-      if (Number.isFinite(remaining) && remaining <= 0 && data && typeof data === 'object') {
-        data.__rateLimitExhaustedUntil = Date.now() + 60000;
-      }
-      return data;
-    } catch (err) {
-      if (err instanceof api.GenreError) throw err;
-      if (signal?.aborted) throw new api.GenreError('cancelled', 'CANCELLED');
-      if (timedOut) throw new api.GenreError('error', `${prefix}_TIMEOUT`, Date.now() + 20000);
-      throw new api.GenreError('error', `${prefix}_REQUEST_FAILED`, Date.now() + 20000);
-    } finally {
-      clearTimeout(timer);
-      signal?.removeEventListener('abort', onAbort);
     }
+    return null;
   }
 
   function createDiscogsAdapter(api, getConfig, fetchImpl = globalThis.fetch) {
@@ -809,7 +1030,7 @@ const Genre4allTransport = (() => {
       if (!Array.isArray(results) || !results.length) return null;
       const targetTitle = normText(identity.title);
       const targetClean = normText(cleanSearchTitle(identity.title));
-      const targetAlbum = normText(identity.album);
+      const targetAlbum = normText(cleanSearchTitle(identity.album));
       const targetArtists = (identity.artists || []).map(a => normText(String(a).replace(/\s*\(\d+\)$/u, ''))).filter(Boolean);
       let best = null, bestScore = -1;
       for (const item of results) {
@@ -835,46 +1056,43 @@ const Genre4allTransport = (() => {
       }
       return best;
     }
-    const adapter = async (identity, signal) => {
+    const adapter = async (identity, signal, runStep) => {
       if (signal?.aborted) throw new api.GenreError('cancelled', 'CANCELLED');
       const cfg = typeof getConfig === 'function' ? getConfig() : (getConfig || {});
       const token = String(cfg?.discogsToken || '').trim();
       if (!token) throw new api.GenreError('not_configured', 'DISCOGS_TOKEN_REQUIRED');
       const title = cleanSearchTitle(identity?.title);
+      const album = cleanSearchTitle(identity?.album);
       const artists = Array.isArray(identity?.artists) ? identity.artists.filter(Boolean) : [];
       if (!title || !artists.length) throw new api.GenreError('unsupported', 'TRACK_METADATA_REQUIRED');
 
-      const params1 = new URLSearchParams({ artist: artists[0], track: title, per_page: '10' });
+      const q1 = `${artists[0]} ${title}`.trim();
+      const params1 = new URLSearchParams({ q: q1, per_page: '15' });
       applyAuth(params1, token);
-      const data1 = await fetchJson(api, fetchImpl, `https://api.discogs.com/database/search?${params1}`, {}, signal, 'DISCOGS');
+      const data1 = await fetchJson(api, fetchImpl, `https://api.discogs.com/database/search?${params1}`, {}, signal, 'DISCOGS', runStep);
       let best = pickBest(identity, data1?.results);
-      let exhaustedUntil = data1?.__rateLimitExhaustedUntil;
 
-      if (!best && !exhaustedUntil) {
-        const q = `${artists[0]} ${identity.album || title}`.trim();
-        const params2 = new URLSearchParams({ q, per_page: '10' });
+      if (!best && album && normText(album) !== normText(title)) {
+        const q2 = `${artists[0]} ${album}`.trim();
+        const params2 = new URLSearchParams({ q: q2, per_page: '10' });
         applyAuth(params2, token);
-        const data2 = await fetchJson(api, fetchImpl, `https://api.discogs.com/database/search?${params2}`, {}, signal, 'DISCOGS');
+        const data2 = await fetchJson(api, fetchImpl, `https://api.discogs.com/database/search?${params2}`, {}, signal, 'DISCOGS', runStep);
         best = pickBest(identity, data2?.results);
-        exhaustedUntil = data2?.__rateLimitExhaustedUntil;
       }
-      if (!best) {
-        if (exhaustedUntil) throw new api.GenreError('rate_limited', 'DISCOGS_RATE_LIMITED', exhaustedUntil);
-        return null;
-      }
+      if (!best) return null;
       return {
         genres: Array.isArray(best.genre) ? best.genre : [],
         styles: Array.isArray(best.style) ? best.style : [],
         entityType: best.type || 'release',
         entityId: String(best.id || ''),
-        sourceUrl: best.uri ? new URL(best.uri, 'https://www.discogs.com').href : 'https://www.discogs.com',
-        ...(exhaustedUntil ? { rateLimitExhaustedUntil: exhaustedUntil } : {})
+        sourceUrl: best.uri ? new URL(best.uri, 'https://www.discogs.com').href : 'https://www.discogs.com'
       };
     };
     adapter.isConfigured = () => {
       const cfg = typeof getConfig === 'function' ? getConfig() : (getConfig || {});
       return Boolean(String(cfg?.discogsToken || '').trim());
     };
+    adapter.usesStepLimiter = true;
     return adapter;
   }
 
@@ -930,7 +1148,7 @@ const Genre4allTransport = (() => {
       }
       return null;
     }
-    return async (identity, signal) => {
+    const adapter = async (identity, signal, runStep) => {
       if (signal?.aborted) throw new api.GenreError('cancelled', 'CANCELLED');
       const cfg = typeof getConfig === 'function' ? getConfig() : (getConfig || {});
       const token = String(cfg?.musicbrainzToken || '').trim();
@@ -946,14 +1164,14 @@ const Genre4allTransport = (() => {
       const query = parts.join(' OR ');
 
       const searchUrl = `https://musicbrainz.org/ws/2/recording?query=${encodeURIComponent(query)}&limit=8&fmt=json`;
-      const data = await fetchJson(api, fetchImpl, searchUrl, headers, signal, 'MUSICBRAINZ');
+      const data = await fetchJson(api, fetchImpl, searchUrl, headers, signal, 'MUSICBRAINZ', runStep);
       const matched = matchCandidate(identity, data?.recordings);
       if (!matched) return null;
 
       let { genres, tags } = collectBuckets(matched);
       if (!genres.length && !tags.length && matched.id) {
         const detailUrl = `https://musicbrainz.org/ws/2/recording/${encodeURIComponent(matched.id)}?inc=genres+tags+artists+release-groups&fmt=json`;
-        const detail = await fetchJson(api, fetchImpl, detailUrl, headers, signal, 'MUSICBRAINZ');
+        const detail = await fetchJson(api, fetchImpl, detailUrl, headers, signal, 'MUSICBRAINZ', runStep);
         if (detail) ({ genres, tags } = collectBuckets(detail));
       }
       return {
@@ -964,6 +1182,8 @@ const Genre4allTransport = (() => {
         sourceUrl: matched.id ? `https://musicbrainz.org/recording/${matched.id}` : 'https://musicbrainz.org'
       };
     };
+    adapter.usesStepLimiter = true;
+    return adapter;
   }
 
   function createSpotifyAdapter(api, getClient) {
@@ -1004,7 +1224,7 @@ const Genre4allTransport = (() => {
     };
   }
 
-  return { createIndexedDBStorage, createSpotifyAdapter, createDiscogsAdapter, createMusicBrainzAdapter };
+  return { COMPACT_CACHE_KEY, encodeCompactCache, decodeCompactCache, createIndexedDBStorage, createSpotifyAdapter, createDiscogsAdapter, createMusicBrainzAdapter };
 })();
 
 /* Native extra-column view. All genre data and request caching belong to genre-service.js. */
@@ -1287,24 +1507,35 @@ const Genre4allColumn = (() => {
         if (isExpired(r) && !r.task) { clearTimeout(r.expiry); r.expiry = null; r.result = null; r.state = 'queued'; render(r); }
         if (r.visible && r.state === 'queued' && !r.task) candidates.push(r);
       }
-      if (!candidates.length || active >= 8) return;
+      if (!candidates.length || active >= 24) return;
       if (candidates.length > 1) {
         const distances = new Map(candidates.map(r => [r, Math.abs(r.row.getBoundingClientRect().top)]));
         candidates.sort((a, b) => distances.get(a) - distances.get(b));
       }
-      for (const r of candidates) { if (active >= 8) break; start(r); }
+      for (const r of candidates) { if (active >= 24) break; start(r); }
     }
     async function start(r) {
       if (!valid(r) || r.task) return;
       clearTimeout(r.expiry); r.expiry = null; r.state = 'loading'; r.result = null; render(r);
       const task = new AbortController(); r.task = task; active++;
       try {
-        const result = await service.resolve(r.track, { signal: task.signal });
+        const result = await service.resolve(r.track, {
+          signal: task.signal,
+          onPreview: preview => {
+            if (!valid(r) || task.signal.aborted || preview.configVersion !== r.revision) return;
+            if (r.state === 'loading' || r.result?.isPreview) {
+              r.result = preview;
+              r.state = preview.status;
+              render(r);
+            }
+          }
+        });
         if (!valid(r) || task.signal.aborted || result.configVersion !== r.revision) return;
         r.result = result; r.state = result.status;
         render(r);
-        if (['success', 'empty', 'no_match'].includes(result.status) && result.expiresAt) {
-          const delay = Math.max(50, Math.min(result.expiresAt - Date.now(), 2147483647));
+        const expiryTime = result.expiresAt || result.retryAt;
+        if (['success', 'empty', 'no_match', 'rate_limited', 'error'].includes(result.status) && expiryTime) {
+          const delay = Math.max(50, Math.min(expiryTime - Date.now(), 2147483647));
           r.expiry = setTimeout(() => {
             if (!valid(r)) return;
             r.expiry = null; r.result = null; r.state = 'queued';
@@ -1312,7 +1543,7 @@ const Genre4allColumn = (() => {
           }, delay);
         }
       } catch { if (valid(r) && !task.signal.aborted) { r.result = { status: 'error', errorCode: 'GENRE_VIEW_FAILED' }; r.state = 'error'; render(r); } }
-      finally { if (r.task === task) r.task = null; active--; if (valid(r) && r.state === 'loading' && task.signal.aborted) r.state = 'queued'; schedule(); }
+      finally { if (r.task === task) r.task = null; active--; if (valid(r) && (r.state === 'loading' || r.result?.isPreview) && task.signal.aborted) { r.result = null; r.state = 'queued'; } schedule(); }
     }
     const observer = typeof win.IntersectionObserver === 'function' ? new win.IntersectionObserver(entries => {
       for (const entry of entries) {
@@ -1320,7 +1551,7 @@ const Genre4allColumn = (() => {
         if (!rowSet) continue;
         for (const r of rowSet) {
           r.visible = entry.isIntersecting;
-          if (!r.visible && r.task) { r.task.abort(); r.state = 'queued'; render(r); }
+          if (!r.visible && r.task) { r.task.abort(); r.result = null; r.state = 'queued'; render(r); }
         }
       }
       schedule();
@@ -2919,7 +3150,7 @@ async function startGenre4all() {
   } catch { /* Session preference still works. */ }
   const context = () => globalThis.Spicetify?.Platform?.History?.location?.pathname || location.pathname;
   const api = {
-    version: '1.1.0',
+    version: '1.11.0',
     get visible() { return visible; },
     get orderOffset() { return orderOffset; },
     get columnOrder() { return [...columnOrder]; },
@@ -3241,8 +3472,19 @@ async function startGenre4all() {
       input.addEventListener('change', () => service?.configure({ [key]: input.checked }).catch(() => Spicetify.showNotification?.('Genre4all: não foi possível salvar a preferência.', true)));
       row.prepend(input); d.append(row);
     }
+    d.append(node('h3', 'Cache leve (armazenamento rápido)'));
+    const cacheInfo = node('div', null, { class: 'g4a-preferences-field', 'data-g4a-cache-info': '' });
+    const updateCacheCount = () => {
+      const count = service?.stats()?.providerCache ?? 0;
+      cacheInfo.textContent = '';
+      cacheInfo.append(node('span', `Registros em cache local (TXT / IndexedDB): ${count}`));
+    };
+    updateCacheCount();
+    d.append(cacheInfo);
+
     const actions = node('div', null, { class: 'g4a-preferences-actions' });
     const refresh = node('button', 'Atualizar gêneros', { type: 'button' });
+    const clearCacheBtn = node('button', 'Limpar cache', { type: 'button', 'data-g4a-action': 'clear-cache' });
     const done = node('button', 'Fechar', { type: 'button' });
     const dismiss = () => {
       saveTokens();
@@ -3255,10 +3497,20 @@ async function startGenre4all() {
         service?.clearCache().catch(() => {});
       });
     });
+    clearCacheBtn.addEventListener('click', () => {
+      saveTokens()
+        .then(() => service?.clearCache())
+        .then(() => {
+          updateCacheCount();
+          clearCacheBtn.textContent = 'Cache limpo!';
+          globalThis.Spicetify?.showNotification?.('Genre4all: cache limpo com sucesso.');
+        })
+        .catch(() => globalThis.Spicetify?.showNotification?.('Genre4all: falha ao limpar cache.', true));
+    });
     done.addEventListener('click', dismiss);
     d.addEventListener('cancel', e => { e.preventDefault(); dismiss(); });
     for (const type of ['keydown', 'keyup', 'click', 'dblclick', 'pointerdown', 'pointerup', 'contextmenu']) d.addEventListener(type, e => e.stopPropagation());
-    actions.append(refresh, done);
+    actions.append(refresh, clearCacheBtn, done);
     d.append(actions);
     document.body.append(d); preferences = d; d.showModal(); done.focus();
   }
