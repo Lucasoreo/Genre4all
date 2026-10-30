@@ -19,7 +19,7 @@ async function startGenre4all() {
   } catch { /* Session preference still works. */ }
   const context = () => globalThis.Spicetify?.Platform?.History?.location?.pathname || location.pathname;
   const api = {
-    version: '1.11.0',
+    version: '1.12.0',
     get visible() { return visible; },
     get orderOffset() { return orderOffset; },
     get columnOrder() { return [...columnOrder]; },
@@ -386,7 +386,7 @@ async function startGenre4all() {
 
   function cells(container, checkComputed = false) {
     return [...container.children].filter(c => {
-      if (!c.matches(CELL) || c.style.display === 'none' || c.hidden) return false;
+      if (c.tagName === 'GENRE4ALL-COLUMN' || !c.matches(CELL) || c.style.display === 'none' || c.hidden) return false;
       return !checkComputed || getComputedStyle(c).display !== 'none';
     });
   }
@@ -414,12 +414,14 @@ async function startGenre4all() {
     const items = [];
     for (let m = 0; m < midCount; m++) {
       const cell = foreignHeader ? foreignHeader[minInsert + m] : null;
-      let k = cell ? colKeyForHeader(cell, m) : `col-${m}`;
+      if (!cell || cell.tagName === 'GENRE4ALL-COLUMN') continue;
+      let k = colKeyForHeader(cell, m);
+      if (k === '__genre__') continue;
       if (seenKeys.has(k)) k = `${k}#${m}`;
       seenKeys.add(k);
       items.push({ type: 'native', index: minInsert + m, key: k });
     }
-    const genreDefaultIdx = Math.max(0, Math.min(midCount, midCount - orderOffset));
+    const genreDefaultIdx = Math.max(0, Math.min(items.length, items.length - orderOffset));
     items.splice(genreDefaultIdx, 0, { type: 'genre', index: -1, key: '__genre__' });
     if (columnOrder.length >= 2) {
       const rank = new Map(columnOrder.map((k, idx) => [k, idx]));
