@@ -26,24 +26,35 @@ const Genre4allColumn = (() => {
   }
   const STATES = { queued: 'Aguardando', loading: 'Carregando…', success: 'Gêneros', empty: 'Sem gêneros', no_match: 'Sem correspondência', not_configured: 'Configurar gêneros', unsupported: 'Indisponível', rate_limited: 'Limite da fonte', error: 'Falha nos gêneros', cancelled: 'Cancelado', expired: 'Carregando…' };
   const stateLabel = r => r.result?.reason === 'SOURCES_DISABLED' ? 'Fontes desativadas' : STATES[r.state] || STATES.error;
+  const TRACK_SEARCH_KEYS = ['item', 'track', 'data', 'value', 'content', 'node', 'props', 'children'];
   function trackFromRow(row, uri, legacy) {
     if (legacy?.uri === uri && (legacy.name || legacy.title || legacy.metadata?.title)) return legacy;
-    const seen = new Set();
-    function find(value, depth = 10) {
-      if (!value || typeof value !== 'object' || depth <= 0 || seen.has(value) || seen.size >= 300) return null;
-      seen.add(value);
-      if (value.uri === uri && typeof (value.name || value.title) === 'string') {
-        const source = Array.isArray(value.artists)
-          ? value.artists
-          : [...(value.artists?.items || []), ...(value.firstArtist?.items || []), ...(value.otherArtists?.items || [])];
-        const artists = (source || []).map(a => ({ name: typeof a === 'string' ? a : a.name || a.profile?.name || a.artist?.profile?.name })).filter(a => a.name);
-        if (artists.length) return { ...value, uri, name: value.name || value.title, artists, album: value.album || value.albumOfTrack,
-          duration_ms: value.duration_ms || value.duration?.totalMilliseconds || value.duration?.milliseconds };
+    function find(rootVal, maxDepth = 10) {
+      if (!rootVal || typeof rootVal !== 'object') return null;
+      const seen = new Set();
+      function walk(value, depth) {
+        if (!value || typeof value !== 'object' || depth <= 0 || seen.has(value) || seen.size >= 300) return null;
+        seen.add(value);
+        if (value.uri === uri && typeof (value.name || value.title) === 'string') {
+          const source = Array.isArray(value.artists)
+            ? value.artists
+            : [...(value.artists?.items || []), ...(value.firstArtist?.items || []), ...(value.otherArtists?.items || [])];
+          const artists = (source || []).map(a => ({ name: typeof a === 'string' ? a : a.name || a.profile?.name || a.artist?.profile?.name })).filter(a => a.name);
+          if (artists.length) return { ...value, uri, name: value.name || value.title, artists, album: value.album || value.albumOfTrack,
+            duration_ms: value.duration_ms || value.duration?.totalMilliseconds || value.duration?.milliseconds };
+        }
+        if (Array.isArray(value)) {
+          for (let i = 0; i < value.length; i++) {
+            const found = walk(value[i], depth - 1); if (found) return found;
+          }
+          return null;
+        }
+        for (const k of TRACK_SEARCH_KEYS) if (k in value) {
+          const found = walk(value[k], depth - 1); if (found) return found;
+        }
+        return null;
       }
-      for (const k of Object.keys(value)) if (['children', 'props', 'value', 'item', 'track', 'data', 'content', 'node'].includes(k) || /^\d+$/u.test(k)) {
-        const found = find(value[k], depth - 1); if (found) return found;
-      }
-      return null;
+      return walk(rootVal, maxDepth);
     }
     const propsKey = row.__g4aPropsKey ?? (row.__g4aPropsKey = Object.keys(row).find(k => k.startsWith('__reactProps$')) || '');
     if (propsKey) {
@@ -130,10 +141,10 @@ const Genre4allColumn = (() => {
       return n;
     }
     function valid(r) {
-      return !closed && records.get(r.cell) === r && r.cell.isConnected && r.row.contains(r.cell)
-        && options.getUri(r.row) === r.uri && options.getContext() === r.context && options.isEnabled(r.cell, r.row)
-        && service.identityFor(options.getTrack(r.row)).key === r.identityKey
-        && service.revision === r.revision;
+      if (closed || service.revision !== r.revision || records.get(r.cell) !== r || !r.cell.isConnected || !r.row.contains(r.cell)) return false;
+      if (options.getContext() !== r.context || !options.isEnabled(r.cell, r.row) || options.getUri(r.row) !== r.uri) return false;
+      const currentTrack = options.getTrack(r.row);
+      return currentTrack === r.track || service.identityFor(currentTrack).key === r.identityKey;
     }
     function isExpired(r) {
       return r.state === 'expired' || (['success', 'empty', 'no_match'].includes(r.state) && r.result?.expiresAt && r.result.expiresAt <= Date.now());

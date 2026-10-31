@@ -337,9 +337,10 @@ const Genre4allGenres = (() => {
     function armExpiry() {
       clearTimeout(expiryTimer);
       if (closed) return;
-      const expiries = [...providerCache.values(), ...resolved.values()].map(v => v.expiresAt).filter(Number.isFinite);
-      if (!expiries.length) return;
-      const expiry = Math.min(...expiries);
+      let expiry = Infinity;
+      for (const v of providerCache.values()) if (Number.isFinite(v.expiresAt) && v.expiresAt < expiry) expiry = v.expiresAt;
+      for (const v of resolved.values()) if (Number.isFinite(v.expiresAt) && v.expiresAt < expiry) expiry = v.expiresAt;
+      if (!Number.isFinite(expiry)) return;
       expiryTimer = setTimeout(async () => {
         let expiredAny = false;
         try {
@@ -570,7 +571,7 @@ const Genre4allGenres = (() => {
     }
     async function resolve(track, { signal, onPreview } = {}) {
       try { await ready; await cacheMutation; } catch { return { ...failure(null, new GenreError('error', 'STORAGE_UNAVAILABLE')), configVersion: revision, attempts: [] }; }
-      const identity = identityFor(track), currentRevision = revision, policy = clone(config);
+      const identity = identityFor(track), currentRevision = revision, policy = config;
       if (closed || signal?.aborted) return { status: 'cancelled', labels: [], configVersion: currentRevision, attempts: [] };
       const id = `${identity.key}:${currentRevision}`;
       const cached = resolved.get(id);
@@ -1255,24 +1256,35 @@ const Genre4allColumn = (() => {
   }
   const STATES = { queued: 'Aguardando', loading: 'Carregando…', success: 'Gêneros', empty: 'Sem gêneros', no_match: 'Sem correspondência', not_configured: 'Configurar gêneros', unsupported: 'Indisponível', rate_limited: 'Limite da fonte', error: 'Falha nos gêneros', cancelled: 'Cancelado', expired: 'Carregando…' };
   const stateLabel = r => r.result?.reason === 'SOURCES_DISABLED' ? 'Fontes desativadas' : STATES[r.state] || STATES.error;
+  const TRACK_SEARCH_KEYS = ['item', 'track', 'data', 'value', 'content', 'node', 'props', 'children'];
   function trackFromRow(row, uri, legacy) {
     if (legacy?.uri === uri && (legacy.name || legacy.title || legacy.metadata?.title)) return legacy;
-    const seen = new Set();
-    function find(value, depth = 10) {
-      if (!value || typeof value !== 'object' || depth <= 0 || seen.has(value) || seen.size >= 300) return null;
-      seen.add(value);
-      if (value.uri === uri && typeof (value.name || value.title) === 'string') {
-        const source = Array.isArray(value.artists)
-          ? value.artists
-          : [...(value.artists?.items || []), ...(value.firstArtist?.items || []), ...(value.otherArtists?.items || [])];
-        const artists = (source || []).map(a => ({ name: typeof a === 'string' ? a : a.name || a.profile?.name || a.artist?.profile?.name })).filter(a => a.name);
-        if (artists.length) return { ...value, uri, name: value.name || value.title, artists, album: value.album || value.albumOfTrack,
-          duration_ms: value.duration_ms || value.duration?.totalMilliseconds || value.duration?.milliseconds };
+    function find(rootVal, maxDepth = 10) {
+      if (!rootVal || typeof rootVal !== 'object') return null;
+      const seen = new Set();
+      function walk(value, depth) {
+        if (!value || typeof value !== 'object' || depth <= 0 || seen.has(value) || seen.size >= 300) return null;
+        seen.add(value);
+        if (value.uri === uri && typeof (value.name || value.title) === 'string') {
+          const source = Array.isArray(value.artists)
+            ? value.artists
+            : [...(value.artists?.items || []), ...(value.firstArtist?.items || []), ...(value.otherArtists?.items || [])];
+          const artists = (source || []).map(a => ({ name: typeof a === 'string' ? a : a.name || a.profile?.name || a.artist?.profile?.name })).filter(a => a.name);
+          if (artists.length) return { ...value, uri, name: value.name || value.title, artists, album: value.album || value.albumOfTrack,
+            duration_ms: value.duration_ms || value.duration?.totalMilliseconds || value.duration?.milliseconds };
+        }
+        if (Array.isArray(value)) {
+          for (let i = 0; i < value.length; i++) {
+            const found = walk(value[i], depth - 1); if (found) return found;
+          }
+          return null;
+        }
+        for (const k of TRACK_SEARCH_KEYS) if (k in value) {
+          const found = walk(value[k], depth - 1); if (found) return found;
+        }
+        return null;
       }
-      for (const k of Object.keys(value)) if (['children', 'props', 'value', 'item', 'track', 'data', 'content', 'node'].includes(k) || /^\d+$/u.test(k)) {
-        const found = find(value[k], depth - 1); if (found) return found;
-      }
-      return null;
+      return walk(rootVal, maxDepth);
     }
     const propsKey = row.__g4aPropsKey ?? (row.__g4aPropsKey = Object.keys(row).find(k => k.startsWith('__reactProps$')) || '');
     if (propsKey) {
@@ -1359,10 +1371,10 @@ const Genre4allColumn = (() => {
       return n;
     }
     function valid(r) {
-      return !closed && records.get(r.cell) === r && r.cell.isConnected && r.row.contains(r.cell)
-        && options.getUri(r.row) === r.uri && options.getContext() === r.context && options.isEnabled(r.cell, r.row)
-        && service.identityFor(options.getTrack(r.row)).key === r.identityKey
-        && service.revision === r.revision;
+      if (closed || service.revision !== r.revision || records.get(r.cell) !== r || !r.cell.isConnected || !r.row.contains(r.cell)) return false;
+      if (options.getContext() !== r.context || !options.isEnabled(r.cell, r.row) || options.getUri(r.row) !== r.uri) return false;
+      const currentTrack = options.getTrack(r.row);
+      return currentTrack === r.track || service.identityFor(currentTrack).key === r.identityKey;
     }
     function isExpired(r) {
       return r.state === 'expired' || (['success', 'empty', 'no_match'].includes(r.state) && r.result?.expiresAt && r.result.expiresAt <= Date.now());
@@ -3150,7 +3162,7 @@ async function startGenre4all() {
   } catch { /* Session preference still works. */ }
   const context = () => globalThis.Spicetify?.Platform?.History?.location?.pathname || location.pathname;
   const api = {
-    version: '1.12.0',
+    version: '1.12.1',
     get visible() { return visible; },
     get orderOffset() { return orderOffset; },
     get columnOrder() { return [...columnOrder]; },
@@ -3181,8 +3193,9 @@ async function startGenre4all() {
   style.id = 'genre4all-runtime-style';
   style.textContent = `
     /* Role lives in ElementInternals: other extensions' [role=gridcell] scans ignore our shell. */
-    .g4a-root .g4a-row:not([data-g4a-measure]) { grid-template-columns:var(--g4a-tracks) !important; min-width:var(--g4a-total) !important; }
-    .g4a-root .g4a-row:not([data-g4a-measure]) > [data-g4a-position] { grid-column:var(--g4a-position) !important; min-width:0; }
+    .g4a-root :is(.g4a-row,[data-g4a-row],:has(> genre4all-column)):not([data-g4a-measure]) { grid-template-columns:var(--g4a-tracks) !important; min-width:var(--g4a-total) !important; }
+    .g4a-root :is(.g4a-row,[data-g4a-row],:has(> genre4all-column)):not([data-g4a-measure]) > * { grid-column:auto !important; grid-row:1 !important; min-width:0; }
+    .g4a-root :is(.g4a-row,[data-g4a-row],:has(> genre4all-column)):not([data-g4a-measure]) > [data-g4a-position] { grid-column:var(--g4a-position,auto) !important; grid-row:1 !important; min-width:0; }
     genre4all-column { display:flex; align-items:center; min-width:0; overflow:hidden; box-sizing:border-box; }
     genre4all-column[data-kind=data] { overflow:visible; }
     genre4all-column[data-kind=header] { position:relative; justify-content:flex-start; justify-self:stretch; width:100%; height:100%; color:var(--text-subdued,var(--spice-subtext,#b3b3b3)); font-size:0.875rem; font-weight:400; line-height:normal; cursor:grab; user-select:none; }
@@ -3233,15 +3246,23 @@ async function startGenre4all() {
     if (n.style.getPropertyValue(name) !== value) n.style.setProperty(name, value);
   }
   function schedule() { if (!closed && frame === null) frame = requestAnimationFrame(sync); }
-  function invalidateLayouts(resetWeights = false) {
+  function invalidateLayouts(resetWeights = false, resetOrder = false) {
     for (const rootState of roots.values()) {
       rootState.measured = null;
-      rootState.midOrder = null;
-      rootState.headerForeign = null;
-      rootState.midOrderCount = -1;
+      if (resetOrder) {
+        rootState.midOrder = null;
+        rootState.headerForeign = null;
+        rootState.midOrderCount = -1;
+      }
       if (resetWeights) rootState.weights = null;
     }
     for (const state of layouts.values()) state.appliedKey = null;
+  }
+  function clearRootStyles(root) {
+    root.classList.remove('g4a-root');
+    root.removeAttribute('data-g4a-overflow');
+    root.style.removeProperty('--g4a-tracks');
+    root.style.removeProperty('--g4a-total');
   }
   function setVisible(value) {
     visible = !!value;
@@ -3249,10 +3270,9 @@ async function startGenre4all() {
     if (!visible) {
       view?.reset();
       for (const row of [...layouts.keys()]) releaseRow(row);
-      for (const root of roots.keys()) { root.classList.remove('g4a-root'); root.removeAttribute('data-g4a-overflow'); }
+      for (const root of roots.keys()) clearRootStyles(root);
     }
-    invalidateLayouts(false);
-    for (const rootState of roots.values()) { rootState.midOrder = null; rootState.headerForeign = null; rootState.midOrderCount = -1; }
+    invalidateLayouts(false, true);
     updateMenus(); schedule();
   }
   function setOrderOffset(value) {
@@ -3266,7 +3286,7 @@ async function startGenre4all() {
       columnOrder = withoutGenre;
       try { localStorage.setItem(COLUMNS_KEY, JSON.stringify(columnOrder)); } catch { /* Keep session usable. */ }
     }
-    invalidateLayouts(true);
+    invalidateLayouts(true, true);
     sync();
   }
   function setColumnOrder(order) {
@@ -3278,8 +3298,7 @@ async function startGenre4all() {
       orderOffset = Math.max(0, (columnOrder.length - 1) - genreIdx);
       try { localStorage.setItem(ORDER_KEY, String(orderOffset)); } catch { /* Keep session usable. */ }
     }
-    invalidateLayouts(false);
-    for (const rootState of roots.values()) { rootState.midOrder = null; rootState.headerForeign = null; rootState.midOrderCount = -1; }
+    invalidateLayouts(false, true);
     sync();
   }
 
@@ -3324,16 +3343,27 @@ async function startGenre4all() {
   }
 
   const validUri = uri => typeof uri === 'string' && /^spotify:(track|local):/.test(uri);
+  const URI_SEARCH_KEYS = ['item', 'track', 'data', 'value', 'content', 'node', 'spec', '_path', 'props', 'children'];
   function computeUri(row, rowProps, firstProps, fiber, dataUri, fallbackHref) {
-    const seen = new Set();
-    function find(value, depth = 10) {
-      if (!value || typeof value !== 'object' || !depth || seen.has(value) || seen.size > 300) return null;
-      seen.add(value);
-      if (validUri(value.uri)) return value.uri;
-      for (const key of Object.keys(value)) if (['children','props','value','item','track','data','content','node','spec','_path'].includes(key) || /^\d+$/.test(key)) {
-        const uri = find(value[key], depth - 1); if (uri) return uri;
+    function find(rootVal, maxDepth = 10) {
+      if (!rootVal || typeof rootVal !== 'object') return null;
+      const seen = new Set();
+      function walk(value, depth) {
+        if (!value || typeof value !== 'object' || depth <= 0 || seen.has(value) || seen.size > 300) return null;
+        seen.add(value);
+        if (validUri(value.uri)) return value.uri;
+        if (Array.isArray(value)) {
+          for (let i = 0; i < value.length; i++) {
+            const uri = walk(value[i], depth - 1); if (uri) return uri;
+          }
+          return null;
+        }
+        for (const key of URI_SEARCH_KEYS) if (key in value) {
+          const uri = walk(value[key], depth - 1); if (uri) return uri;
+        }
+        return null;
       }
-      return null;
+      return walk(rootVal, maxDepth);
     }
     // React identity wins over a stale DOM link in a recycled row.
     for (const props of [rowProps, firstProps]) {
@@ -3369,8 +3399,10 @@ async function startGenre4all() {
       && cached.rowIndex === rowIndex && cached.dataUri === dataUri && cached.itemUri === itemUri && cached.href === href) {
       return cached;
     }
-    const uri = computeUri(row, rowProps, firstProps, fiber, dataUri, href);
-    const entry = { rowProps, firstProps, fiberProps, rowIndex, dataUri, itemUri, href, uri, track: null };
+    const resolvedUri = validUri(itemUri) ? itemUri : computeUri(row, rowProps, firstProps, fiber, dataUri, href);
+    const uri = resolvedUri || (cached && cached.rowIndex && cached.rowIndex === rowIndex ? cached.uri : null);
+    const prevTrack = cached && cached.uri === uri && cached.track?.uri === uri ? cached.track : null;
+    const entry = { rowProps, firstProps, fiberProps, rowIndex, dataUri, itemUri, href, uri, track: prevTrack };
     rowCache.set(row, entry);
     return entry;
   }
@@ -3526,9 +3558,18 @@ async function startGenre4all() {
       .filter(c => (c.matches(CELL) || c.tagName === 'GENRE4ALL-COLUMN') && c.style.display !== 'none' && !c.hidden && getComputedStyle(c).display !== 'none')
       .sort((a, b) => (parseInt(a.style.getPropertyValue('--g4a-position'), 10) || 0) - (parseInt(b.style.getPropertyValue('--g4a-position'), 10) || 0));
   }
+  function hasDirectCells(el) {
+    if (!el) return false;
+    for (const c of el.children) {
+      if (c.tagName !== 'GENRE4ALL-COLUMN' && !c.hidden && c.style.display !== 'none' && c.matches(CELL)) return true;
+    }
+    return false;
+  }
   function rowContainer(row) {
-    if (cells(row).length) return row;
-    if (row.children.length === 1 && cells(row.firstElementChild).length) return row.firstElementChild;
+    if (hasDirectCells(row)) return row;
+    for (const child of row.children) {
+      if (hasDirectCells(child)) return child;
+    }
     return null;
   }
   function colKeyForHeader(cell, m) {
@@ -3539,14 +3580,14 @@ async function startGenre4all() {
     const raw = normalize((textEl ? textEl.textContent : cell.textContent) || cell.getAttribute('aria-label') || '').trim();
     return raw || `col-${m}`;
   }
-  function buildMidOrder(foreignHeader, minInsert, endIndex) {
+  function buildMidOrder(foreignHeader, minInsert, endIndex, fallbackKeys = null) {
     const midCount = Math.max(0, endIndex - minInsert);
     const seenKeys = new Set();
     const items = [];
     for (let m = 0; m < midCount; m++) {
       const cell = foreignHeader ? foreignHeader[minInsert + m] : null;
-      if (!cell || cell.tagName === 'GENRE4ALL-COLUMN') continue;
-      let k = colKeyForHeader(cell, m);
+      if (cell && (!cell || cell.tagName === 'GENRE4ALL-COLUMN')) continue;
+      let k = cell ? colKeyForHeader(cell, m) : (fallbackKeys?.[m] || `col-${m}`);
       if (k === '__genre__') continue;
       if (seenKeys.has(k)) k = `${k}#${m}`;
       seenKeys.add(k);
@@ -3681,7 +3722,7 @@ async function startGenre4all() {
             orderOffset = Math.max(0, (keys.length - 1) - genreIdx);
             try { localStorage.setItem(ORDER_KEY, String(orderOffset)); } catch { /* Keep session usable. */ }
           }
-          invalidateLayouts(false);
+          invalidateLayouts(false, true);
           sync();
         }
       };
@@ -3719,7 +3760,7 @@ async function startGenre4all() {
     view?.release(state.host); state.shell.remove(); state.prevSep?.remove();
     state.prevHost?.removeAttribute('data-g4a-prev-sep');
     layouts.delete(row);
-    row.classList.remove('g4a-row'); row.removeAttribute('data-g4a-measure');
+    row.classList.remove('g4a-row'); row.removeAttribute('data-g4a-row'); row.removeAttribute('data-g4a-measure');
     row.style.removeProperty('--g4a-tracks'); row.style.removeProperty('--g4a-total');
     for (const c of state.positions) {
       c.removeAttribute('data-g4a-position');
@@ -3795,9 +3836,12 @@ async function startGenre4all() {
       for (let i = minInsert; i < endIndex; i++) midOrder.push({ type: 'native', index: i, key: `col-${i}` });
       midOrder.push({ type: 'genre', index: -1, key: '__genre__' });
     } else if (header || !rootState.midOrder || rootState.midOrderCount !== endIndex - minInsert) {
-      midOrder = buildMidOrder(header ? foreign : rootState.headerForeign, minInsert, endIndex);
       if (header) {
         rootState.headerForeign = foreign;
+        rootState.headerColKeys = foreign.slice(minInsert, endIndex).map((c, idx) => colKeyForHeader(c, idx));
+      }
+      midOrder = buildMidOrder(header ? foreign : rootState.headerForeign, minInsert, endIndex, rootState.headerColKeys);
+      if (header || !rootState.midOrder) {
         rootState.midOrder = midOrder;
         rootState.midOrderCount = endIndex - minInsert;
       }
@@ -3810,11 +3854,6 @@ async function startGenre4all() {
     const spTracks = root.style.getPropertyValue('--sp-layout-tracks') || container.style.getPropertyValue('--sp-layout-tracks') || '';
     const weightsKey = rootState.weights ? rootState.weights.map(w => Math.round(w)).join(',') : '';
     const measureKey = `${isNativeLayout}|${rootWidth}|${foreign.length}|${endIndex}|${inlineGrid}|${spTracks}|${weightsKey}|${orderSignature}`;
-
-    if (!header && state.appliedKey === measureKey && state.shell.parentElement === container && rootState.measured?.key === measureKey) {
-      rootState.maxTotal = Math.max(rootState.maxTotal || 0, rootState.measured.total);
-      return;
-    }
 
     const midCells = midOrder.map(item => item.type === 'genre' ? state.shell : foreign[item.index]).filter(Boolean);
     const all = [...foreign.slice(0, minInsert), ...midCells, ...foreign.slice(endIndex)];
@@ -3862,6 +3901,10 @@ async function startGenre4all() {
       if (!inlineGrid) rootState.measured = measured;
     }
 
+    if (!inlineGrid) {
+      ownProperty(root, '--g4a-tracks', measured.template);
+      ownProperty(root, '--g4a-total', `${measured.total}px`);
+    }
     ownProperty(container, '--g4a-tracks', measured.template);
     ownProperty(container, '--g4a-total', `${measured.total}px`);
     rootState.maxTotal = Math.max(rootState.maxTotal || 0, measured.total);
@@ -3877,7 +3920,8 @@ async function startGenre4all() {
     });
     const colIdx = String(genreVisualIdx + 1);
     if (state.shell.getAttribute('aria-colindex') !== colIdx) state.shell.setAttribute('aria-colindex', colIdx);
-    container.classList.add('g4a-row');
+    if (!container.classList.contains('g4a-row')) container.classList.add('g4a-row');
+    if (!container.hasAttribute('data-g4a-row')) container.setAttribute('data-g4a-row', '');
     state.appliedKey = measureKey;
   }
 
@@ -3954,14 +3998,19 @@ async function startGenre4all() {
     if (records.some(m => {
       const target = m.target.nodeType === 1 ? m.target : m.target.parentElement;
       if (!target || target.closest?.('genre4all-column,[data-g4a-menu-item],[data-g4a-profile-item],[data-g4a-sep],.g4a-genre-fan,.g4a-preferences')) return false;
+      const inRelevant = !!target.closest?.(`${ROOT},[role="menu"],.main-contextMenu-menu`);
       if (m.type === 'childList') {
-        return [...m.addedNodes, ...m.removedNodes].some(n => n.nodeType === 1 && !n.matches('genre4all-column,[data-g4a-menu-item],[data-g4a-profile-item],[data-g4a-sep],.g4a-genre-fan'));
+        return [...m.addedNodes, ...m.removedNodes].some(n => {
+          if (n.nodeType !== 1 || n.matches('genre4all-column,[data-g4a-menu-item],[data-g4a-profile-item],[data-g4a-sep],.g4a-genre-fan,.g4a-preferences')) return false;
+          if (inRelevant) return true;
+          return n.matches?.(`${ROOT},${ROW},[role="menu"],.main-contextMenu-menu`) || !!n.querySelector?.(`${ROOT},${ROW},[role="menu"],.main-contextMenu-menu`);
+        });
       }
-      return !!target.closest?.(`${ROOT},[role="menu"],.main-contextMenu-menu`);
+      return inRelevant;
     })) schedule();
   });
   observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['aria-rowindex','data-uri','href','style','class'], characterData: true });
-  const resize = typeof ResizeObserver === 'function' ? new ResizeObserver(() => { invalidateLayouts(false); schedule(); }) : null;
+  const resize = typeof ResizeObserver === 'function' ? new ResizeObserver(() => { invalidateLayouts(false, false); schedule(); }) : null;
 
   function sync() {
     frame = null; if (closed) return;
@@ -3976,7 +4025,7 @@ async function startGenre4all() {
         found.add(root);
         let rootState = roots.get(root);
         if (!rootState) {
-          rootState = { events: new AbortController(), weights: null, measured: null, midOrder: null, midOrderCount: -1, headerForeign: null, maxTotal: 0, activeDrag: null };
+          rootState = { events: new AbortController(), weights: null, measured: null, midOrder: null, midOrderCount: -1, headerForeign: null, headerColKeys: null, maxTotal: 0, activeDrag: null };
           roots.set(root, rootState);
           attachResize(root, rootState);
           resize?.observe(root);
@@ -3987,7 +4036,7 @@ async function startGenre4all() {
           const headerRows = [], dataRows = [];
           for (const row of rows) {
             if (row.querySelector('[role="columnheader"]')) headerRows.push(row);
-            else if (getUri(row)) dataRows.push(row);
+            else if (getUri(row) || row.querySelector('genre4all-column') || layouts.has(row)) dataRows.push(row);
           }
           for (const row of headerRows) layout(row, true, root, rootState);
           for (const row of dataRows) layout(row, false, root, rootState);
@@ -3997,14 +4046,14 @@ async function startGenre4all() {
             root.removeAttribute('data-g4a-overflow');
           }
           view?.sync(root, [{ type: 'genre', dataSelector: '.g4a-data' }]);
-        } else if (root.hasAttribute('data-g4a-overflow')) {
-          root.removeAttribute('data-g4a-overflow');
+        } else {
+          clearRootStyles(root);
         }
       }
       for (const [row, state] of layouts) if (!row.isConnected || !found.has(state.root) || !row.contains(state.shell)) releaseRow(row);
       for (const [root, rootState] of roots) if (!found.has(root)) {
         rootState.events.abort(); roots.delete(root);
-        root.classList.remove('g4a-root'); root.removeAttribute('data-g4a-overflow');
+        clearRootStyles(root);
         resize?.unobserve(root);
       }
       view?.prune();
@@ -4015,12 +4064,14 @@ async function startGenre4all() {
   function close() {
     if (closed) return;
     closed = true; lifecycle.abort(); observer.disconnect(); resize?.disconnect(); unlisten?.();
+    try { globalThis.Spicetify?.Player?.removeEventListener?.('onplaypause', schedule); } catch {}
+    try { globalThis.Spicetify?.Player?.removeEventListener?.('songchange', schedule); } catch {}
     try { profileMenuItem?.deregister?.(); } catch { /* Ignore menu cleanup errors. */ }
     if (frame !== null) cancelAnimationFrame(frame);
     for (const row of [...layouts.keys()]) releaseRow(row);
     for (const [root, rootState] of roots) {
       rootState.events.abort();
-      root.classList.remove('g4a-root'); root.removeAttribute('data-g4a-overflow');
+      clearRootStyles(root);
     }
     roots.clear();
     view?.close(); service?.close(); storage.close(); preferences?.remove();
@@ -4028,12 +4079,16 @@ async function startGenre4all() {
     if (globalThis.Genre4all === api) delete globalThis.Genre4all;
   }
   window.addEventListener('pagehide', close, { once: true, signal: lifecycle.signal });
-  window.addEventListener('resize', () => { invalidateLayouts(false); schedule(); }, { signal: lifecycle.signal });
+  window.addEventListener('resize', () => { invalidateLayouts(false, false); schedule(); }, { signal: lifecycle.signal });
   // React may replace metadata on a recycled DOM node without any attribute mutation.
   const recheck = setInterval(() => { if (!document.hidden) schedule(); }, 1500);
   lifecycle.signal.addEventListener('abort', () => clearInterval(recheck), { once: true });
   while (!closed && !globalThis.Spicetify?.Platform) await new Promise(resolve => setTimeout(resolve, 250));
   if (closed) return;
+  try {
+    globalThis.Spicetify?.Player?.addEventListener?.('onplaypause', schedule);
+    globalThis.Spicetify?.Player?.addEventListener?.('songchange', schedule);
+  } catch {}
   try {
     if (globalThis.Spicetify?.Menu?.Item) {
       profileMenuItem = new Spicetify.Menu.Item('Genre4all config', false, () => showPreferences(), CONFIG_ICON);
@@ -4061,7 +4116,7 @@ async function startGenre4all() {
     }[result.errorCode] || result.errorCode || 'Não foi possível obter gêneros para esta faixa.')
   });
   service.ready.catch(error => console.warn('[Genre4all] Falha ao iniciar cache.', error));
-  unlisten = Spicetify.Platform.History?.listen?.(() => { view.reset(); invalidateLayouts(false); schedule(); });
+  unlisten = Spicetify.Platform.History?.listen?.(() => { view.reset(); invalidateLayouts(false, true); schedule(); });
   schedule();
 }
 if (typeof document !== 'undefined') startGenre4all().catch(error => console.error('[Genre4all] Falha na inicialização.', error));

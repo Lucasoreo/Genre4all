@@ -308,9 +308,10 @@ const Genre4allGenres = (() => {
     function armExpiry() {
       clearTimeout(expiryTimer);
       if (closed) return;
-      const expiries = [...providerCache.values(), ...resolved.values()].map(v => v.expiresAt).filter(Number.isFinite);
-      if (!expiries.length) return;
-      const expiry = Math.min(...expiries);
+      let expiry = Infinity;
+      for (const v of providerCache.values()) if (Number.isFinite(v.expiresAt) && v.expiresAt < expiry) expiry = v.expiresAt;
+      for (const v of resolved.values()) if (Number.isFinite(v.expiresAt) && v.expiresAt < expiry) expiry = v.expiresAt;
+      if (!Number.isFinite(expiry)) return;
       expiryTimer = setTimeout(async () => {
         let expiredAny = false;
         try {
@@ -541,7 +542,7 @@ const Genre4allGenres = (() => {
     }
     async function resolve(track, { signal, onPreview } = {}) {
       try { await ready; await cacheMutation; } catch { return { ...failure(null, new GenreError('error', 'STORAGE_UNAVAILABLE')), configVersion: revision, attempts: [] }; }
-      const identity = identityFor(track), currentRevision = revision, policy = clone(config);
+      const identity = identityFor(track), currentRevision = revision, policy = config;
       if (closed || signal?.aborted) return { status: 'cancelled', labels: [], configVersion: currentRevision, attempts: [] };
       const id = `${identity.key}:${currentRevision}`;
       const cached = resolved.get(id);

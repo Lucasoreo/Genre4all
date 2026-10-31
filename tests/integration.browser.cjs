@@ -91,7 +91,7 @@ body{background:#121212;color:#eee;font:14px sans-serif;margin:20px}main{width:1
     });
     await page.addScriptTag({path:path.join(root,'Genre4all.js')});
     await page.locator('.g4a-data[data-genre-state=success]').waitFor();
-    assert.equal(await page.evaluate(()=>Genre4all.version),'1.12.0');
+    assert.equal(await page.evaluate(()=>Genre4all.version),'1.12.1');
     assert.equal(await page.locator('genre4all-column[data-kind=header]').count(),1);
     assert.equal(await page.locator('.g4a-genre-chip').filter({hasText:'happy'}).count(),0);
     assert.ok(await page.locator('.g4a-genre-chip').filter({hasText:'electro house'}).count());
@@ -117,10 +117,108 @@ body{background:#121212;color:#eee;font:14px sans-serif;margin:20px}main{width:1
       assert.ok(addedBoxAfter.x < albumBoxAfter.x, 'Dragging native column Adicionada em moves it to the left of Álbum');
       const rowOrderAfterNativeDrag = await page.evaluate(() => {
         const cells = [...row.children].sort((a, b) => a.getBoundingClientRect().x - b.getBoundingClientRect().x);
-        return cells.map(c => c.textContent.trim());
+        const tops = cells.map(c => Math.round(c.getBoundingClientRect().top));
+        return { texts: cells.map(c => c.textContent.trim()), sameRow: tops.every(t => Math.abs(t - tops[0]) <= 4) };
       });
-      assert.equal(rowOrderAfterNativeDrag[2], 'há 2 dias', 'Track row data cell for Adicionada em also moved to slot 2');
-      assert.equal(rowOrderAfterNativeDrag[3], 'Real Thing', 'Track row data cell for Álbum shifted to slot 3');
+      assert.equal(rowOrderAfterNativeDrag.texts[2], 'há 2 dias', 'Track row data cell for Adicionada em also moved to slot 2');
+      assert.equal(rowOrderAfterNativeDrag.texts[3], 'Real Thing', 'Track row data cell for Álbum shifted to slot 3');
+      assert.ok(rowOrderAfterNativeDrag.sameRow, 'Reordered native columns remain on grid row 1 without wrapping');
+
+      // Regression test: pressing Play on Track 1, Track 2, reload, then Track 3 when Gênero is moved between Título and Álbum
+      await page.evaluate(() => {
+        Genre4all.setColumnOrder(['__genre__', 'album', 'adicionada em']);
+        // Add rows 2 and 3 to simulate a multi-track playlist
+        for (const [idx, title, album, added, dur, uri] of [
+          [3, 'Mysterious', 'Mysterious', 'há 1 semana', '5:47', 'spotify:track:fixture2'],
+          [4, 'Vision', 'Dimension', 'há 1 semana', '6:20', 'spotify:track:fixture3']
+        ]) {
+          const r = document.createElement('div');
+          r.className = 'main-trackList-trackListRow';
+          r.setAttribute('role', 'row');
+          r.setAttribute('aria-rowindex', String(idx));
+          [String(idx - 1), title, album, added, dur].forEach((text, i) => {
+            const c = document.createElement('div');
+            c.setAttribute('role', 'gridcell');
+            c.setAttribute('aria-colindex', String(i + 1));
+            c.className = i === 4 ? 'main-trackList-rowSectionEnd' : i === 1 ? 'main-trackList-rowSectionStart' : i === 0 ? 'main-trackList-rowSectionIndex' : 'main-trackList-rowSectionVariable';
+            c.textContent = text;
+            r.append(c);
+          });
+          r.__reactProps$fixture = { item: { uri, name: title, artists: [{ name: 'Fixture Artist' }] } };
+          grid.append(r);
+        }
+        Genre4all.sync();
+      });
+      await page.waitForFunction(() => document.querySelectorAll('.main-trackList-trackListRow .g4a-data[data-genre-state="success"]').length === 3);
+
+      // Simulate React re-rendering Row 1 on Play, then Row 2 on Play, then Row 3 on Play (wiping className & inline styles on active + previous rows)
+      const playAlignment = await page.evaluate(async () => {
+        const header = grid.querySelector('.main-trackList-trackListHeaderRow');
+        const hCells = [...header.children].sort((a, b) => a.getBoundingClientRect().x - b.getBoundingClientRect().x);
+        const headerX = hCells.map(c => Math.round(c.getBoundingClientRect().x));
+        const trackRows = [...grid.querySelectorAll('.main-trackList-trackListRow')];
+
+        function simulateReactPlay(newIdx, prevIdx) {
+          for (const idx of [prevIdx, newIdx].filter(i => i != null)) {
+            const r = trackRows[idx];
+            // React overwrites className (stripping g4a-row) and updates inline style / VDOM props
+            r.className = idx === newIdx
+              ? 'main-trackList-trackListRow main-trackList-trackListRowGrid main-trackList-trackListRow--active'
+              : 'main-trackList-trackListRow main-trackList-trackListRowGrid';
+            r.style.removeProperty('--g4a-tracks');
+            r.style.removeProperty('--g4a-total');
+            const firstCell = r.querySelector('.main-trackList-rowSectionIndex');
+            if (firstCell) firstCell.innerHTML = idx === newIdx ? '<span class="equalizer">||.|</span>' : String(idx + 1);
+            r.__reactProps$fixture = { ...r.__reactProps$fixture, isPlaying: idx === newIdx };
+          }
+        }
+
+        function verifyAllRowsAligned() {
+          return trackRows.every(r => {
+            const vis = [...r.children].filter(c => getComputedStyle(c).display !== 'none').sort((a, b) => a.getBoundingClientRect().x - b.getBoundingClientRect().x);
+            if (vis.length !== 6) return false;
+            const rowTop = r.getBoundingClientRect().top;
+            const rowBottom = r.getBoundingClientRect().bottom;
+            const xMatch = vis.every((c, i) => Math.abs(Math.round(c.getBoundingClientRect().x) - headerX[i]) <= 2);
+            const yMatch = vis.every(c => {
+              const box = c.getBoundingClientRect();
+              return box.top >= rowTop - 2 && box.bottom <= rowBottom + 2;
+            });
+            return xMatch && yMatch;
+          });
+        }
+
+        // Step 1: Play Row 0 (Track 1)
+        simulateReactPlay(0, null);
+        const syncAfterPlay1Immediate = verifyAllRowsAligned();
+        await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+        const syncAfterPlay1Frame = verifyAllRowsAligned();
+
+        // Step 2: Play Row 1 (Track 2) -> React mutates Row 0 (prev) and Row 1 (current)
+        simulateReactPlay(1, 0);
+        const syncAfterPlay2Immediate = verifyAllRowsAligned();
+        await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+        const syncAfterPlay2Frame = verifyAllRowsAligned();
+
+        // Step 3: Play Row 2 (Track 3) -> React mutates Row 1 (prev) and Row 2 (current)
+        simulateReactPlay(2, 1);
+        const syncAfterPlay3Immediate = verifyAllRowsAligned();
+        await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+        const syncAfterPlay3Frame = verifyAllRowsAligned();
+
+        // Cleanup extra test rows
+        trackRows.slice(1).forEach(r => r.remove());
+        return {
+          syncAfterPlay1Immediate, syncAfterPlay1Frame,
+          syncAfterPlay2Immediate, syncAfterPlay2Frame,
+          syncAfterPlay3Immediate, syncAfterPlay3Frame
+        };
+      });
+      assert.deepEqual(playAlignment, {
+        syncAfterPlay1Immediate: true, syncAfterPlay1Frame: true,
+        syncAfterPlay2Immediate: true, syncAfterPlay2Frame: true,
+        syncAfterPlay3Immediate: true, syncAfterPlay3Frame: true
+      }, 'Pressing Play never shifts Gênero/Álbum/Adicionada em or wraps Duração onto the next track row');
 
       // Reset column order back to default for subsequent tests
       await page.evaluate(() => { Genre4all.setColumnOrder([]); Genre4all.setOrderOffset(0); });
