@@ -120,3 +120,4 @@ test('Genre4allPlayerWaveform: toggles enabled state and persists in storage', (
     Genre4allPlayerWaveform.setEnabled(original);
   }
 });
+
