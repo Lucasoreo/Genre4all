@@ -19,17 +19,19 @@ async function startGenre4all() {
   } catch { /* Session preference still works. */ }
   const context = () => globalThis.Spicetify?.Platform?.History?.location?.pathname || location.pathname;
   const api = {
-    version: '1.12.2',
+    version: '1.13.0',
     get visible() { return visible; },
     get orderOffset() { return orderOffset; },
     get columnOrder() { return [...columnOrder]; },
+    get playerWaveform() { return typeof Genre4allPlayerWaveform !== 'undefined' ? Genre4allPlayerWaveform.enabled : false; },
     setVisible,
     setOrderOffset,
     setColumnOrder,
+    setPlayerWaveform: val => { if (typeof Genre4allPlayerWaveform !== 'undefined') Genre4allPlayerWaveform.setEnabled(val); },
     openConfig: showPreferences,
     sync: schedule,
     close,
-    diagnostics: () => ({ version: api.version, visible, orderOffset, columnOrder: [...columnOrder], context: context(), roots: roots.size, rows: layouts.size, service: service?.stats(), view: view?.stats(), metadataAvailable: !!metadataClient })
+    diagnostics: () => ({ version: api.version, visible, orderOffset, columnOrder: [...columnOrder], playerWaveform: api.playerWaveform, context: context(), roots: roots.size, rows: layouts.size, service: service?.stats(), view: view?.stats(), metadataAvailable: !!metadataClient })
   };
   // One instance even if Marketplace and a manual installation both load the file.
   globalThis.Genre4all?.close?.();
@@ -92,6 +94,24 @@ async function startGenre4all() {
     .g4a-preferences-actions { display:flex; flex-wrap:wrap; gap:10px; margin-top:18px; justify-content:flex-end; }
     .g4a-preferences button { padding:8px 14px; color:inherit; background:transparent; border:1px solid #aaa; border-radius:4px; cursor:pointer; font:inherit; }
     .g4a-preferences button:hover { background:#ffffff14; }
+
+    /* Player Waveform & Apple-style Dynamic Island */
+    .g4a-waveform-player { display:flex; align-items:center; gap:12px; width:100%; height:46px; position:relative; user-select:none; box-sizing:border-box; }
+    .g4a-waveform-meta { display:flex; flex-direction:column; justify-content:center; width:86px; min-width:86px; flex-shrink:0; font-family:var(--font-family,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif); line-height:1.35; text-align:left; user-select:none; }
+    .g4a-meta-time { font-size:11px; font-weight:700; color:var(--spice-text,#ffffff); font-variant-numeric:tabular-nums; letter-spacing:-0.01em; }
+    .g4a-meta-bpm { font-size:11px; font-weight:500; color:var(--spice-subtext,rgba(255,255,255,0.72)); white-space:nowrap; }
+    .g4a-meta-key { font-size:11px; font-weight:500; color:var(--spice-subtext,rgba(255,255,255,0.72)); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .g4a-waveform-track { position:relative; flex:1; height:42px; min-width:120px; cursor:pointer; display:flex; align-items:center; }
+    .g4a-waveform-canvas { width:100%; height:100%; display:block; }
+    .g4a-waveform-tooltip { position:absolute; top:-26px; transform:translateX(-50%); background:rgba(18,18,18,0.92); color:#fff; padding:2px 7px; border-radius:4px; font-size:10.5px; font-weight:600; pointer-events:none; white-space:nowrap; box-shadow:0 4px 12px rgba(0,0,0,0.4); border:1px solid rgba(255,255,255,0.15); font-variant-numeric:tabular-nums; opacity:0; transition:opacity 0.15s ease; z-index:100; }
+    .g4a-waveform-tooltip.visible { opacity:1; }
+    .g4a-badge-experimental { font-size:10px; font-weight:700; padding:2px 6px; border-radius:10px; background:#e91429; color:#fff; letter-spacing:0.04em; }
+
+    [data-g4a-player-waveform="true"] .playback-bar > :is([data-testid="playback-position"],[data-testid="playback-duration"],.EwWvIxEwsX4OCTm8USco) { display:none !important; }
+    [data-g4a-player-waveform="true"] .playback-bar :is([data-testid="progress-bar"],.progress-bar,.x-progressBar-progressBar) { display:none !important; }
+    [data-g4a-player-waveform="true"] .main-nowPlayingBar-center { position:relative !important; display:flex !important; flex-direction:column !important; justify-content:center !important; overflow:visible !important; }
+    [data-g4a-player-waveform="true"] .player-controls { position:absolute !important; left:50% !important; bottom:calc(100% + 8px) !important; transform:translateX(-50%) translateY(8px) scale(0.92) !important; opacity:0 !important; pointer-events:none !important; background:rgba(22,22,24,0.88) !important; backdrop-filter:blur(24px) saturate(190%) !important; -webkit-backdrop-filter:blur(24px) saturate(190%) !important; border:1px solid rgba(255,255,255,0.14) !important; border-radius:9999px !important; padding:4px 14px !important; margin-bottom:0 !important; box-shadow:0 16px 36px rgba(0,0,0,0.65), 0 2px 10px rgba(0,0,0,0.4) !important; z-index:1000 !important; transition:transform 0.42s cubic-bezier(0.16,1,0.3,1), opacity 0.32s cubic-bezier(0.16,1,0.3,1), box-shadow 0.42s ease !important; }
+    [data-g4a-player-waveform="true"] .main-nowPlayingBar-center:hover .player-controls, [data-g4a-player-waveform="true"] .main-nowPlayingBar-center:focus-within .player-controls, [data-g4a-player-waveform="true"] .main-nowPlayingBar-center.g4a-island-pinned .player-controls { opacity:1 !important; pointer-events:auto !important; transform:translateX(-50%) translateY(0) scale(1) !important; box-shadow:0 20px 45px rgba(0,0,0,0.75), 0 4px 14px rgba(0,0,0,0.5) !important; }
   `;
   document.head.append(style);
 
@@ -363,6 +383,26 @@ async function startGenre4all() {
       input.addEventListener('change', () => service?.configure({ [key]: input.checked }).catch(() => Spicetify.showNotification?.('Genre4all: não foi possível salvar a preferência.', true)));
       row.prepend(input); d.append(row);
     }
+
+    d.append(node('h3', 'Player & Soundwave'));
+    const waveField = node('div', null, { class: 'g4a-preferences-field' });
+    const waveLabel = node('label', null, { style: 'display:flex;align-items:flex-start;gap:10px;cursor:pointer;margin:0;' });
+    const waveInput = node('input', null, { type: 'checkbox', style: 'margin-top:3px;' });
+    waveInput.checked = typeof Genre4allPlayerWaveform !== 'undefined' ? Genre4allPlayerWaveform.enabled : false;
+    waveInput.addEventListener('change', () => {
+      if (typeof Genre4allPlayerWaveform !== 'undefined') {
+        Genre4allPlayerWaveform.setEnabled(waveInput.checked);
+      }
+    });
+    const waveTextWrap = node('div', null, { style: 'display:flex;flex-direction:column;gap:3px;' });
+    const waveTitleRow = node('div', null, { style: 'display:flex;align-items:center;gap:8px;' });
+    waveTitleRow.append(node('span', 'Onda sonora no player (Soundwave)', { style: 'font-weight:600;font-size:13.5px;color:#fff;' }));
+    waveTitleRow.append(node('span', 'EXPERIMENTAL', { class: 'g4a-badge-experimental' }));
+    const waveDesc = node('span', 'Substitui a barra de progresso por uma soundwave interativa estilo Beatport com kicks e drops nítidos, metadados (tempo, BPM e Tom) e controles em ilha dinâmica Apple style.', { style: 'font-size:12px;color:var(--spice-subtext,#b3b3b3);line-height:1.4;' });
+    waveTextWrap.append(waveTitleRow, waveDesc);
+    waveLabel.append(waveInput, waveTextWrap);
+    waveField.append(waveLabel);
+    d.append(waveField);
     d.append(node('h3', 'Cache leve (armazenamento rápido)'));
     const cacheInfo = node('div', null, { class: 'g4a-preferences-field', 'data-g4a-cache-info': '' });
     const updateCacheCount = () => {
@@ -945,6 +985,7 @@ async function startGenre4all() {
     }
     roots.clear();
     view?.close(); service?.close(); storage.close(); preferences?.remove();
+    Genre4allPlayerWaveform?.teardown?.();
     document.querySelectorAll('[data-g4a-menu-item],[data-g4a-profile-item]').forEach(n => n.remove()); style.remove();
     if (globalThis.Genre4all === api) delete globalThis.Genre4all;
   }
@@ -988,5 +1029,6 @@ async function startGenre4all() {
   service.ready.catch(error => console.warn('[Genre4all] Falha ao iniciar cache.', error));
   unlisten = Spicetify.Platform.History?.listen?.(() => { view.reset(); invalidateLayouts(false, true); schedule(); });
   schedule();
+  Genre4allPlayerWaveform?.init?.();
 }
 if (typeof document !== 'undefined') startGenre4all().catch(error => console.error('[Genre4all] Falha na inicialização.', error));
