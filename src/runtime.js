@@ -19,7 +19,7 @@ async function startGenre4all() {
   } catch { /* Session preference still works. */ }
   const context = () => globalThis.Spicetify?.Platform?.History?.location?.pathname || location.pathname;
   const api = {
-    version: '1.12.1',
+    version: '1.12.2',
     get visible() { return visible; },
     get orderOffset() { return orderOffset; },
     get columnOrder() { return [...columnOrder]; },
@@ -51,8 +51,10 @@ async function startGenre4all() {
   style.textContent = `
     /* Role lives in ElementInternals: other extensions' [role=gridcell] scans ignore our shell. */
     .g4a-root :is(.g4a-row,[data-g4a-row],:has(> genre4all-column)):not([data-g4a-measure]) { grid-template-columns:var(--g4a-tracks) !important; min-width:var(--g4a-total) !important; }
-    .g4a-root :is(.g4a-row,[data-g4a-row],:has(> genre4all-column)):not([data-g4a-measure]) > * { grid-column:auto !important; grid-row:1 !important; min-width:0; }
+    .g4a-root :is(.g4a-row,[data-g4a-row],:has(> genre4all-column)):not([data-g4a-measure]) > :not([aria-colspan]):not([class*="FullWidthCell"]):not([class*="trackListRowFullWidthCell"]):not(.PoSfoROJK6lwVe6ZtR0U) { grid-column:auto !important; grid-row:1 !important; min-width:0; }
     .g4a-root :is(.g4a-row,[data-g4a-row],:has(> genre4all-column)):not([data-g4a-measure]) > [data-g4a-position] { grid-column:var(--g4a-position,auto) !important; grid-row:1 !important; min-width:0; }
+    .g4a-root :is(.g4a-row,[data-g4a-row],:has(> genre4all-column)):not([data-g4a-measure]) > :is([aria-colspan],[class*="FullWidthCell"],[class*="trackListRowFullWidthCell"],.PoSfoROJK6lwVe6ZtR0U) { grid-column:1 / -1 !important; grid-row:auto !important; width:100% !important; min-width:0 !important; }
+    .g4a-root :is(.main-trackList-trackListHeader,.rrn0EjHTu7eCxn9G0Rrc,[class*="trackListHeader"]):is(.main-trackList-trackListHeaderStuck,.iPo4a2lbrsxW9Iedav3h,[class*="trackListHeaderStuck"]) { background-color:var(--spice-main,var(--background-base,#121212)) !important; }
     genre4all-column { display:flex; align-items:center; min-width:0; overflow:hidden; box-sizing:border-box; }
     genre4all-column[data-kind=data] { overflow:visible; }
     genre4all-column[data-kind=header] { position:relative; justify-content:flex-start; justify-self:stretch; width:100%; height:100%; color:var(--text-subdued,var(--spice-subtext,#b3b3b3)); font-size:0.875rem; font-weight:400; line-height:normal; cursor:grab; user-select:none; }
@@ -404,21 +406,26 @@ async function startGenre4all() {
     document.body.append(d); preferences = d; d.showModal(); done.focus();
   }
 
+  function isFullWidthCell(c) {
+    if (!c || c.nodeType !== 1) return false;
+    return c.hasAttribute('aria-colspan')
+      || c.matches('[class*="trackListRowFullWidthCell"],[class*="FullWidthCell"],[class*="fullWidth"],[data-testid="tracklist-row-full-width"],.PoSfoROJK6lwVe6ZtR0U');
+  }
   function cells(container, checkComputed = false) {
     return [...container.children].filter(c => {
-      if (c.tagName === 'GENRE4ALL-COLUMN' || !c.matches(CELL) || c.style.display === 'none' || c.hidden) return false;
+      if (c.tagName === 'GENRE4ALL-COLUMN' || isFullWidthCell(c) || !c.matches(CELL) || c.style.display === 'none' || c.hidden) return false;
       return !checkComputed || getComputedStyle(c).display !== 'none';
     });
   }
   function visualCells(container) {
     return [...container.children]
-      .filter(c => (c.matches(CELL) || c.tagName === 'GENRE4ALL-COLUMN') && c.style.display !== 'none' && !c.hidden && getComputedStyle(c).display !== 'none')
+      .filter(c => !isFullWidthCell(c) && (c.matches(CELL) || c.tagName === 'GENRE4ALL-COLUMN') && c.style.display !== 'none' && !c.hidden && getComputedStyle(c).display !== 'none')
       .sort((a, b) => (parseInt(a.style.getPropertyValue('--g4a-position'), 10) || 0) - (parseInt(b.style.getPropertyValue('--g4a-position'), 10) || 0));
   }
   function hasDirectCells(el) {
     if (!el) return false;
     for (const c of el.children) {
-      if (c.tagName !== 'GENRE4ALL-COLUMN' && !c.hidden && c.style.display !== 'none' && c.matches(CELL)) return true;
+      if (c.tagName !== 'GENRE4ALL-COLUMN' && !isFullWidthCell(c) && !c.hidden && c.style.display !== 'none' && c.matches(CELL)) return true;
     }
     return false;
   }
@@ -769,6 +776,12 @@ async function startGenre4all() {
       c.removeAttribute('data-g4a-position');
       c.style.removeProperty('--g4a-position');
       state.positions.delete(c);
+    }
+    const fullWidth = container.querySelector('[aria-colspan],[class*="FullWidthCell"],[class*="trackListRowFullWidthCell"],.PoSfoROJK6lwVe6ZtR0U');
+    if (fullWidth && (fullWidth.hasAttribute('data-g4a-position') || fullWidth.style.getPropertyValue('--g4a-position'))) {
+      fullWidth.removeAttribute('data-g4a-position');
+      fullWidth.style.removeProperty('--g4a-position');
+      state.positions.delete(fullWidth);
     }
     all.forEach((c, i) => {
       if (!c.hasAttribute('data-g4a-position')) c.setAttribute('data-g4a-position', '');
