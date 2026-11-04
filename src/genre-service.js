@@ -288,7 +288,7 @@ const Genre4allGenres = (() => {
     const intervals = { discogs: options.discogsInterval ?? 1100, musicbrainz: options.musicbrainzInterval ?? 1150, spotify: options.spotifyInterval ?? 25 };
     const limiters = Object.fromEntries(PROVIDERS.map(p => [p, createLimiter(intervals[p] ?? 25, { now, wait: options.wait, maxQueue: 256 })]));
     let config = defaultConfig(), revision = 1, closed = false;
-    let persistence = Promise.resolve(), cacheMutation = Promise.resolve(), expiryTimer = null;
+    let persistence = Promise.resolve(), cacheMutation = Promise.resolve(), expiryTimer = null, nextExpiryAt = Infinity;
     const changes = new Set();
     function write(space, id, value) { const operation = persistence.then(() => storage.set(space, id, clone(value))); persistence = operation.catch(() => {}); return operation; }
     function remove(space, id) { const operation = persistence.then(() => storage.remove(space, id)); persistence = operation.catch(() => {}); return operation; }
@@ -305,14 +305,20 @@ const Genre4allGenres = (() => {
       armExpiry();
     })();
     function notify() { for (const fn of changes) fn(); }
-    function armExpiry() {
-      clearTimeout(expiryTimer);
+    function armExpiry(candidateExpiry) {
       if (closed) return;
+      if (Number.isFinite(candidateExpiry) && expiryTimer !== null && candidateExpiry >= nextExpiryAt) return;
+      clearTimeout(expiryTimer);
+      expiryTimer = null;
+      nextExpiryAt = Infinity;
       let expiry = Infinity;
       for (const v of providerCache.values()) if (Number.isFinite(v.expiresAt) && v.expiresAt < expiry) expiry = v.expiresAt;
       for (const v of resolved.values()) if (Number.isFinite(v.expiresAt) && v.expiresAt < expiry) expiry = v.expiresAt;
       if (!Number.isFinite(expiry)) return;
+      nextExpiryAt = expiry;
       expiryTimer = setTimeout(async () => {
+        expiryTimer = null;
+        nextExpiryAt = Infinity;
         let expiredAny = false;
         try {
           for (const [id, entry] of providerCache) if (entry.expiresAt <= now()) {
@@ -343,7 +349,7 @@ const Genre4allGenres = (() => {
       map.set(id, entry);
       while (map.size > CACHE_LIMIT) { const oldest = map.keys().next().value; map.delete(oldest); remove('cache', oldest); }
       write('cache', id, entry);
-      armExpiry();
+      armExpiry(expiresAt);
     }
     async function cacheGet(map, id) {
       const item = map.get(id);
@@ -669,7 +675,7 @@ const Genre4allGenres = (() => {
           const result = { ...final, identityKey: identity.key, configVersion: currentRevision, attempts, expiresAt };
           if (['success', 'empty'].includes(result.status) && expiresAt > now()) {
             resolved.set(id, result);
-            armExpiry();
+            armExpiry(expiresAt);
           }
           while (resolved.size > CACHE_LIMIT) resolved.delete(resolved.keys().next().value);
           return result;

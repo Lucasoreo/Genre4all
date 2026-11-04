@@ -27,22 +27,52 @@ const Genre4allColumn = (() => {
   const STATES = { queued: 'Aguardando', loading: 'Carregando…', success: 'Gêneros', empty: 'Sem gêneros', no_match: 'Sem correspondência', not_configured: 'Configurar gêneros', unsupported: 'Indisponível', rate_limited: 'Limite da fonte', error: 'Falha nos gêneros', cancelled: 'Cancelado', expired: 'Carregando…' };
   const stateLabel = r => r.result?.reason === 'SOURCES_DISABLED' ? 'Fontes desativadas' : STATES[r.state] || STATES.error;
   const TRACK_SEARCH_KEYS = ['item', 'track', 'data', 'value', 'content', 'node', 'props', 'children'];
+  const SKIP_HOST_TAGS = new Set(['svg', 'path', 'img', 'button', 'input']);
+  function extractTrackCandidate(value, uri) {
+    if (!value || typeof value !== 'object' || value.uri !== uri || typeof (value.name || value.title) !== 'string') return null;
+    const source = Array.isArray(value.artists)
+      ? value.artists
+      : [...(value.artists?.items || []), ...(value.firstArtist?.items || []), ...(value.otherArtists?.items || [])];
+    const artists = (source || []).map(a => ({ name: typeof a === 'string' ? a : a.name || a.profile?.name || a.artist?.profile?.name })).filter(a => a.name);
+    if (!artists.length) return null;
+    return {
+      ...value,
+      uri,
+      name: value.name || value.title,
+      artists,
+      album: value.album || value.albumOfTrack,
+      duration_ms: value.duration_ms || value.duration?.totalMilliseconds || value.duration?.milliseconds
+    };
+  }
+  function directTrackFromProps(p, uri) {
+    if (!p || typeof p !== 'object') return null;
+    return extractTrackCandidate(p, uri)
+      || extractTrackCandidate(p.item, uri)
+      || extractTrackCandidate(p.track, uri)
+      || extractTrackCandidate(p.data, uri)
+      || extractTrackCandidate(p.children?.props?.item, uri)
+      || extractTrackCandidate(p.children?.props?.track, uri);
+  }
   function trackFromRow(row, uri, legacy) {
     if (legacy?.uri === uri && (legacy.name || legacy.title || legacy.metadata?.title)) return legacy;
-    function find(rootVal, maxDepth = 10) {
+    const propsKey = row.__g4aPropsKey ?? (row.__g4aPropsKey = Object.keys(row).find(k => k.startsWith('__reactProps$')) || '');
+    const fiberKey = row.__g4aFiberKey ?? (row.__g4aFiberKey = Object.keys(row).find(k => k.startsWith('__reactFiber$')) || '');
+    if (propsKey) {
+      const fast = directTrackFromProps(row[propsKey], uri); if (fast) return fast;
+    }
+    for (let f = fiberKey ? row[fiberKey] : null, depth = 0; f && depth < 8; depth++, f = f.return) {
+      const fast = directTrackFromProps(f.memoizedProps, uri) || directTrackFromProps(f.pendingProps, uri);
+      if (fast) return fast;
+    }
+    function find(rootVal, maxDepth = 8) {
       if (!rootVal || typeof rootVal !== 'object') return null;
       const seen = new Set();
       function walk(value, depth) {
-        if (!value || typeof value !== 'object' || depth <= 0 || seen.has(value) || seen.size >= 300) return null;
+        if (!value || typeof value !== 'object' || depth <= 0 || seen.has(value) || seen.size >= 140) return null;
+        if (typeof value.type === 'string' && SKIP_HOST_TAGS.has(value.type)) return null;
         seen.add(value);
-        if (value.uri === uri && typeof (value.name || value.title) === 'string') {
-          const source = Array.isArray(value.artists)
-            ? value.artists
-            : [...(value.artists?.items || []), ...(value.firstArtist?.items || []), ...(value.otherArtists?.items || [])];
-          const artists = (source || []).map(a => ({ name: typeof a === 'string' ? a : a.name || a.profile?.name || a.artist?.profile?.name })).filter(a => a.name);
-          if (artists.length) return { ...value, uri, name: value.name || value.title, artists, album: value.album || value.albumOfTrack,
-            duration_ms: value.duration_ms || value.duration?.totalMilliseconds || value.duration?.milliseconds };
-        }
+        const candidate = extractTrackCandidate(value, uri);
+        if (candidate) return candidate;
         if (Array.isArray(value)) {
           for (let i = 0; i < value.length; i++) {
             const found = walk(value[i], depth - 1); if (found) return found;
@@ -56,11 +86,9 @@ const Genre4allColumn = (() => {
       }
       return walk(rootVal, maxDepth);
     }
-    const propsKey = row.__g4aPropsKey ?? (row.__g4aPropsKey = Object.keys(row).find(k => k.startsWith('__reactProps$')) || '');
     if (propsKey) {
       const fromProps = find(row[propsKey]); if (fromProps) return fromProps;
     }
-    const fiberKey = row.__g4aFiberKey ?? (row.__g4aFiberKey = Object.keys(row).find(k => k.startsWith('__reactFiber$')) || '');
     let fiber = fiberKey ? row[fiberKey] : null;
     for (let depth = 0; fiber && depth < 8; depth++, fiber = fiber.return) {
       const found = find(fiber.memoizedProps) || find(fiber.pendingProps); if (found) return found;
@@ -159,8 +187,8 @@ const Genre4allColumn = (() => {
         }
       }
     }
-    function chip(label, tag = 'span', fallbackProvider = 'spotify') {
-      const bg = colorFor(label.key, service.getConfig().colors);
+    function chip(label, tag = 'span', fallbackProvider = 'spotify', useColors = service.getConfig().colors) {
+      const bg = colorFor(label.key, useColors);
       const fg = textColorFor(bg);
       const provider = label.provider || fallbackProvider || 'spotify';
       const n = node(tag, label.label, tag === 'li' ? {} : { role: 'listitem' });
@@ -203,10 +231,11 @@ const Genre4allColumn = (() => {
       if (activeFan?.record === r && activeFan.element.isConnected && !activeFan.closing) return;
       closeFan(true);
       const defaultProvider = r.result?.selectedProvider || r.result?.provider || 'spotify';
+      const useColors = service.getConfig().colors;
       const fan = node('ul', null, { class: 'g4a-genre-fan', role: 'list', 'aria-label': 'Gêneros e subgêneros associados' });
       let delay = 0;
       extra.forEach((label, i) => {
-        const item = chip(label, 'li', defaultProvider);
+        const item = chip(label, 'li', defaultProvider, useColors);
         item.classList.add('g4a-genre-fan-chip');
         const dur = Math.max(190, Math.round(320 * Math.pow(0.88, i)));
         item.style.setProperty('--g4a-i', String(i));
@@ -343,18 +372,22 @@ const Genre4allColumn = (() => {
       const desired = new Set(), pendingMounts = [];
       const genreConfigs = configs.filter(c => c.type === 'genre');
       const context = options.getContext();
+      const rev = service.revision;
       for (const row of container.querySelectorAll('.main-trackList-trackListRow, [role="row"]')) {
         if (row.querySelector('[role="columnheader"]')) continue;
         for (const config of genreConfigs) {
           const cell = row.querySelector(config.dataSelector); if (!cell || cell.closest('.main-trackList-trackListRow, [role="row"]') !== row) continue;
           const uri = options.getUri(row); if (!uri) continue;
           desired.add(cell);
-          const track = options.getTrack(row), identityKey = service.identityFor(track).key;
           const previous = records.get(cell);
-          if (previous && valid(previous) && previous.identityKey === identityKey && previous.cell.firstChild) {
-            if (isExpired(previous)) expire(previous);
-            continue;
+          if (previous && !closed && previous.revision === rev && previous.row === row && previous.context === context && previous.uri === uri && previous.cell.firstChild && options.isEnabled(cell, row)) {
+            const currentTrack = options.getTrack(row);
+            if (currentTrack === previous.track || service.identityFor(currentTrack).key === previous.identityKey) {
+              if (isExpired(previous)) expire(previous);
+              continue;
+            }
           }
+          const track = options.getTrack(row), identityKey = service.identityFor(track).key;
           pendingMounts.push({ cell, row, track, identityKey, uri, context });
         }
       }
@@ -383,7 +416,13 @@ const Genre4allColumn = (() => {
         }
       }
       for (const r of records.values()) if (container.contains(r.cell) && !desired.has(r.cell)) release(r.cell);
-      prune(); fallbackVisibility(); schedule();
+      fallbackVisibility();
+      if (pendingMounts.length) schedule();
+      else {
+        for (const r of records.values()) {
+          if ((r.visible && r.state === 'queued' && !r.task) || isExpired(r)) { schedule(); break; }
+        }
+      }
     }
     const unsubscribe = service.onChange(() => {
       for (const r of [...records.values()]) {

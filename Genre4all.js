@@ -317,7 +317,7 @@ const Genre4allGenres = (() => {
     const intervals = { discogs: options.discogsInterval ?? 1100, musicbrainz: options.musicbrainzInterval ?? 1150, spotify: options.spotifyInterval ?? 25 };
     const limiters = Object.fromEntries(PROVIDERS.map(p => [p, createLimiter(intervals[p] ?? 25, { now, wait: options.wait, maxQueue: 256 })]));
     let config = defaultConfig(), revision = 1, closed = false;
-    let persistence = Promise.resolve(), cacheMutation = Promise.resolve(), expiryTimer = null;
+    let persistence = Promise.resolve(), cacheMutation = Promise.resolve(), expiryTimer = null, nextExpiryAt = Infinity;
     const changes = new Set();
     function write(space, id, value) { const operation = persistence.then(() => storage.set(space, id, clone(value))); persistence = operation.catch(() => {}); return operation; }
     function remove(space, id) { const operation = persistence.then(() => storage.remove(space, id)); persistence = operation.catch(() => {}); return operation; }
@@ -334,14 +334,20 @@ const Genre4allGenres = (() => {
       armExpiry();
     })();
     function notify() { for (const fn of changes) fn(); }
-    function armExpiry() {
-      clearTimeout(expiryTimer);
+    function armExpiry(candidateExpiry) {
       if (closed) return;
+      if (Number.isFinite(candidateExpiry) && expiryTimer !== null && candidateExpiry >= nextExpiryAt) return;
+      clearTimeout(expiryTimer);
+      expiryTimer = null;
+      nextExpiryAt = Infinity;
       let expiry = Infinity;
       for (const v of providerCache.values()) if (Number.isFinite(v.expiresAt) && v.expiresAt < expiry) expiry = v.expiresAt;
       for (const v of resolved.values()) if (Number.isFinite(v.expiresAt) && v.expiresAt < expiry) expiry = v.expiresAt;
       if (!Number.isFinite(expiry)) return;
+      nextExpiryAt = expiry;
       expiryTimer = setTimeout(async () => {
+        expiryTimer = null;
+        nextExpiryAt = Infinity;
         let expiredAny = false;
         try {
           for (const [id, entry] of providerCache) if (entry.expiresAt <= now()) {
@@ -372,7 +378,7 @@ const Genre4allGenres = (() => {
       map.set(id, entry);
       while (map.size > CACHE_LIMIT) { const oldest = map.keys().next().value; map.delete(oldest); remove('cache', oldest); }
       write('cache', id, entry);
-      armExpiry();
+      armExpiry(expiresAt);
     }
     async function cacheGet(map, id) {
       const item = map.get(id);
@@ -698,7 +704,7 @@ const Genre4allGenres = (() => {
           const result = { ...final, identityKey: identity.key, configVersion: currentRevision, attempts, expiresAt };
           if (['success', 'empty'].includes(result.status) && expiresAt > now()) {
             resolved.set(id, result);
-            armExpiry();
+            armExpiry(expiresAt);
           }
           while (resolved.size > CACHE_LIMIT) resolved.delete(resolved.keys().next().value);
           return result;
@@ -794,21 +800,35 @@ const Genre4allTransport = (() => {
   const COMPACT_CACHE_KEY = 'genre4all-cache-txt-v11';
   const COMPACT_MAX_LINES = 2000;
 
+  function encodeCompactEntry(id, entry) {
+    if (!entry || !entry.value || !Number.isFinite(entry.expiresAt)) return '';
+    const v = entry.value;
+    if (!['success', 'empty', 'no_match'].includes(v.status)) return '';
+    if (entry.__compactLine && entry.__compactId === id && entry.__compactExp === entry.expiresAt) return entry.__compactLine;
+    const labelsPart = (v.labels || [])
+      .map(l => `${String(l.label || '').replace(/[\t\n\r;~]/gu, ' ')}~${l.kind || 'genre'}~${l.provider || v.provider || ''}`)
+      .join(';');
+    const safeId = String(id).replace(/[\t\n\r]/gu, ' ');
+    const provider = String(v.provider || '').replace(/[\t\n\r]/gu, '');
+    const status = String(v.status || 'empty');
+    const exp = Math.floor(entry.expiresAt).toString(36);
+    const ver = Number(entry.version || 2).toString(36);
+    const line = `${safeId}\t${provider}\t${status}\t${exp}\t${ver}\t${labelsPart}`;
+    try {
+      Object.defineProperties(entry, {
+        __compactLine: { value: line, configurable: true },
+        __compactId: { value: id, configurable: true },
+        __compactExp: { value: entry.expiresAt, configurable: true }
+      });
+    } catch { /* Frozen entry fallback. */ }
+    return line;
+  }
+
   function encodeCompactCache(map) {
     const lines = [];
     for (const [id, entry] of map) {
-      if (!entry || !entry.value || !Number.isFinite(entry.expiresAt)) continue;
-      const v = entry.value;
-      if (!['success', 'empty', 'no_match'].includes(v.status)) continue;
-      const labelsPart = (v.labels || [])
-        .map(l => `${String(l.label || '').replace(/[\t\n\r;~]/gu, ' ')}~${l.kind || 'genre'}~${l.provider || v.provider || ''}`)
-        .join(';');
-      const safeId = String(id).replace(/[\t\n\r]/gu, ' ');
-      const provider = String(v.provider || '').replace(/[\t\n\r]/gu, '');
-      const status = String(v.status || 'empty');
-      const exp = Math.floor(entry.expiresAt).toString(36);
-      const ver = Number(entry.version || 2).toString(36);
-      lines.push(`${safeId}\t${provider}\t${status}\t${exp}\t${ver}\t${labelsPart}`);
+      const line = encodeCompactEntry(id, entry);
+      if (line) lines.push(line);
     }
     return lines.slice(-COMPACT_MAX_LINES).join('\n');
   }
@@ -1257,22 +1277,52 @@ const Genre4allColumn = (() => {
   const STATES = { queued: 'Aguardando', loading: 'Carregando…', success: 'Gêneros', empty: 'Sem gêneros', no_match: 'Sem correspondência', not_configured: 'Configurar gêneros', unsupported: 'Indisponível', rate_limited: 'Limite da fonte', error: 'Falha nos gêneros', cancelled: 'Cancelado', expired: 'Carregando…' };
   const stateLabel = r => r.result?.reason === 'SOURCES_DISABLED' ? 'Fontes desativadas' : STATES[r.state] || STATES.error;
   const TRACK_SEARCH_KEYS = ['item', 'track', 'data', 'value', 'content', 'node', 'props', 'children'];
+  const SKIP_HOST_TAGS = new Set(['svg', 'path', 'img', 'button', 'input']);
+  function extractTrackCandidate(value, uri) {
+    if (!value || typeof value !== 'object' || value.uri !== uri || typeof (value.name || value.title) !== 'string') return null;
+    const source = Array.isArray(value.artists)
+      ? value.artists
+      : [...(value.artists?.items || []), ...(value.firstArtist?.items || []), ...(value.otherArtists?.items || [])];
+    const artists = (source || []).map(a => ({ name: typeof a === 'string' ? a : a.name || a.profile?.name || a.artist?.profile?.name })).filter(a => a.name);
+    if (!artists.length) return null;
+    return {
+      ...value,
+      uri,
+      name: value.name || value.title,
+      artists,
+      album: value.album || value.albumOfTrack,
+      duration_ms: value.duration_ms || value.duration?.totalMilliseconds || value.duration?.milliseconds
+    };
+  }
+  function directTrackFromProps(p, uri) {
+    if (!p || typeof p !== 'object') return null;
+    return extractTrackCandidate(p, uri)
+      || extractTrackCandidate(p.item, uri)
+      || extractTrackCandidate(p.track, uri)
+      || extractTrackCandidate(p.data, uri)
+      || extractTrackCandidate(p.children?.props?.item, uri)
+      || extractTrackCandidate(p.children?.props?.track, uri);
+  }
   function trackFromRow(row, uri, legacy) {
     if (legacy?.uri === uri && (legacy.name || legacy.title || legacy.metadata?.title)) return legacy;
-    function find(rootVal, maxDepth = 10) {
+    const propsKey = row.__g4aPropsKey ?? (row.__g4aPropsKey = Object.keys(row).find(k => k.startsWith('__reactProps$')) || '');
+    const fiberKey = row.__g4aFiberKey ?? (row.__g4aFiberKey = Object.keys(row).find(k => k.startsWith('__reactFiber$')) || '');
+    if (propsKey) {
+      const fast = directTrackFromProps(row[propsKey], uri); if (fast) return fast;
+    }
+    for (let f = fiberKey ? row[fiberKey] : null, depth = 0; f && depth < 8; depth++, f = f.return) {
+      const fast = directTrackFromProps(f.memoizedProps, uri) || directTrackFromProps(f.pendingProps, uri);
+      if (fast) return fast;
+    }
+    function find(rootVal, maxDepth = 8) {
       if (!rootVal || typeof rootVal !== 'object') return null;
       const seen = new Set();
       function walk(value, depth) {
-        if (!value || typeof value !== 'object' || depth <= 0 || seen.has(value) || seen.size >= 300) return null;
+        if (!value || typeof value !== 'object' || depth <= 0 || seen.has(value) || seen.size >= 140) return null;
+        if (typeof value.type === 'string' && SKIP_HOST_TAGS.has(value.type)) return null;
         seen.add(value);
-        if (value.uri === uri && typeof (value.name || value.title) === 'string') {
-          const source = Array.isArray(value.artists)
-            ? value.artists
-            : [...(value.artists?.items || []), ...(value.firstArtist?.items || []), ...(value.otherArtists?.items || [])];
-          const artists = (source || []).map(a => ({ name: typeof a === 'string' ? a : a.name || a.profile?.name || a.artist?.profile?.name })).filter(a => a.name);
-          if (artists.length) return { ...value, uri, name: value.name || value.title, artists, album: value.album || value.albumOfTrack,
-            duration_ms: value.duration_ms || value.duration?.totalMilliseconds || value.duration?.milliseconds };
-        }
+        const candidate = extractTrackCandidate(value, uri);
+        if (candidate) return candidate;
         if (Array.isArray(value)) {
           for (let i = 0; i < value.length; i++) {
             const found = walk(value[i], depth - 1); if (found) return found;
@@ -1286,11 +1336,9 @@ const Genre4allColumn = (() => {
       }
       return walk(rootVal, maxDepth);
     }
-    const propsKey = row.__g4aPropsKey ?? (row.__g4aPropsKey = Object.keys(row).find(k => k.startsWith('__reactProps$')) || '');
     if (propsKey) {
       const fromProps = find(row[propsKey]); if (fromProps) return fromProps;
     }
-    const fiberKey = row.__g4aFiberKey ?? (row.__g4aFiberKey = Object.keys(row).find(k => k.startsWith('__reactFiber$')) || '');
     let fiber = fiberKey ? row[fiberKey] : null;
     for (let depth = 0; fiber && depth < 8; depth++, fiber = fiber.return) {
       const found = find(fiber.memoizedProps) || find(fiber.pendingProps); if (found) return found;
@@ -1389,8 +1437,8 @@ const Genre4allColumn = (() => {
         }
       }
     }
-    function chip(label, tag = 'span', fallbackProvider = 'spotify') {
-      const bg = colorFor(label.key, service.getConfig().colors);
+    function chip(label, tag = 'span', fallbackProvider = 'spotify', useColors = service.getConfig().colors) {
+      const bg = colorFor(label.key, useColors);
       const fg = textColorFor(bg);
       const provider = label.provider || fallbackProvider || 'spotify';
       const n = node(tag, label.label, tag === 'li' ? {} : { role: 'listitem' });
@@ -1433,10 +1481,11 @@ const Genre4allColumn = (() => {
       if (activeFan?.record === r && activeFan.element.isConnected && !activeFan.closing) return;
       closeFan(true);
       const defaultProvider = r.result?.selectedProvider || r.result?.provider || 'spotify';
+      const useColors = service.getConfig().colors;
       const fan = node('ul', null, { class: 'g4a-genre-fan', role: 'list', 'aria-label': 'Gêneros e subgêneros associados' });
       let delay = 0;
       extra.forEach((label, i) => {
-        const item = chip(label, 'li', defaultProvider);
+        const item = chip(label, 'li', defaultProvider, useColors);
         item.classList.add('g4a-genre-fan-chip');
         const dur = Math.max(190, Math.round(320 * Math.pow(0.88, i)));
         item.style.setProperty('--g4a-i', String(i));
@@ -1573,18 +1622,22 @@ const Genre4allColumn = (() => {
       const desired = new Set(), pendingMounts = [];
       const genreConfigs = configs.filter(c => c.type === 'genre');
       const context = options.getContext();
+      const rev = service.revision;
       for (const row of container.querySelectorAll('.main-trackList-trackListRow, [role="row"]')) {
         if (row.querySelector('[role="columnheader"]')) continue;
         for (const config of genreConfigs) {
           const cell = row.querySelector(config.dataSelector); if (!cell || cell.closest('.main-trackList-trackListRow, [role="row"]') !== row) continue;
           const uri = options.getUri(row); if (!uri) continue;
           desired.add(cell);
-          const track = options.getTrack(row), identityKey = service.identityFor(track).key;
           const previous = records.get(cell);
-          if (previous && valid(previous) && previous.identityKey === identityKey && previous.cell.firstChild) {
-            if (isExpired(previous)) expire(previous);
-            continue;
+          if (previous && !closed && previous.revision === rev && previous.row === row && previous.context === context && previous.uri === uri && previous.cell.firstChild && options.isEnabled(cell, row)) {
+            const currentTrack = options.getTrack(row);
+            if (currentTrack === previous.track || service.identityFor(currentTrack).key === previous.identityKey) {
+              if (isExpired(previous)) expire(previous);
+              continue;
+            }
           }
+          const track = options.getTrack(row), identityKey = service.identityFor(track).key;
           pendingMounts.push({ cell, row, track, identityKey, uri, context });
         }
       }
@@ -1613,7 +1666,13 @@ const Genre4allColumn = (() => {
         }
       }
       for (const r of records.values()) if (container.contains(r.cell) && !desired.has(r.cell)) release(r.cell);
-      prune(); fallbackVisibility(); schedule();
+      fallbackVisibility();
+      if (pendingMounts.length) schedule();
+      else {
+        for (const r of records.values()) {
+          if ((r.visible && r.state === 'queued' && !r.task) || isExpired(r)) { schedule(); break; }
+        }
+      }
     }
     const unsubscribe = service.onChange(() => {
       for (const r of [...records.values()]) {
@@ -3149,17 +3208,24 @@ const Genre4allPlayerWaveform = (() => {
   const PITCH_NAMES = ['C', 'C♯', 'D', 'D♯', 'E', 'F', 'F♯', 'G', 'G♯', 'A', 'A♯', 'B'];
   const CAMELOT_MAJOR = ['8B', '3B', '10B', '5B', '12B', '7B', '2B', '9B', '4B', '11B', '6B', '1B'];
   const CAMELOT_MINOR = ['5A', '12A', '7A', '2A', '9A', '4A', '11A', '6A', '1A', '8A', '3A', '10A'];
+  const MAX_CACHE_ENTRIES = 64;
 
   const analysisCache = new Map();
   let enabled = false;
   let active = false;
   let mountedElement = null;
+  let mountedRefs = null;
+  let resizeObs = null;
   let animFrame = null;
+  let pollTimer = null;
   let currentTrackUri = null;
   let currentAnalysis = null;
+  let fallbackBars = null;
+  let fallbackBarsUri = '';
   let isDragging = false;
   let dragRatio = 0;
   let hoverRatio = null;
+  let lastSeekAt = 0;
 
   try {
     enabled = localStorage.getItem(STORAGE_KEY) === 'true';
@@ -3342,8 +3408,22 @@ const Genre4allPlayerWaveform = (() => {
 
     if (raw && raw.track) {
       const parsed = parseAudioAnalysis(raw, trackUri);
-      analysisCache.set(trackUri, parsed);
-      return parsed;
+      // Drop heavy raw segment/beat arrays from long-lived cache to save memory
+      const compactParsed = {
+        trackUri: parsed.trackUri,
+        duration: parsed.duration,
+        tempo: parsed.tempo,
+        key: parsed.key,
+        mode: parsed.mode,
+        keyLabel: parsed.keyLabel,
+        bars: parsed.bars
+      };
+      while (analysisCache.size >= MAX_CACHE_ENTRIES) {
+        const oldestKey = analysisCache.keys().next().value;
+        analysisCache.delete(oldestKey);
+      }
+      analysisCache.set(trackUri, compactParsed);
+      return compactParsed;
     }
 
     return null;
@@ -3359,25 +3439,28 @@ const Genre4allPlayerWaveform = (() => {
     const count = Math.max(40, Math.floor(width / step));
     const centerY = height / 2;
     const maxAmp = (height / 2) - 3;
+    const radius = barWidth / 2;
+    const hasRoundRect = typeof ctx.roundRect === 'function';
 
-    for (let i = 0; i < count; i++) {
-      const x = i * step + (step - barWidth) / 2;
-      const sampleIdx = Math.floor((i / count) * bars.length);
-      const amp = bars[sampleIdx] || 0.1;
-      const barH = Math.max(2.5, amp * maxAmp);
-
-      const isPlayed = (x / width) <= progressRatio;
-      ctx.fillStyle = isPlayed ? 'rgba(255, 255, 255, 0.96)' : 'rgba(255, 255, 255, 0.26)';
-
-      const top = centerY - barH;
-      const totalH = barH * 1.85;
-      const radius = barWidth / 2;
-
+    // Batch played and unplayed bars into 2 paths instead of 180 separate fill() calls
+    for (let pass = 0; pass < 2; pass++) {
+      const targetPlayed = pass === 0;
+      ctx.fillStyle = targetPlayed ? 'rgba(255, 255, 255, 0.96)' : 'rgba(255, 255, 255, 0.26)';
       ctx.beginPath();
-      if (typeof ctx.roundRect === 'function') {
-        ctx.roundRect(x, top, barWidth, totalH, radius);
-      } else {
-        ctx.rect(x, top, barWidth, totalH);
+      for (let i = 0; i < count; i++) {
+        const x = i * step + (step - barWidth) / 2;
+        const isPlayed = (x / width) <= progressRatio;
+        if (isPlayed !== targetPlayed) continue;
+        const sampleIdx = Math.floor((i / count) * bars.length);
+        const amp = bars[sampleIdx] || 0.1;
+        const barH = Math.max(2.5, amp * maxAmp);
+        const top = centerY - barH;
+        const totalH = barH * 1.85;
+        if (hasRoundRect) {
+          ctx.roundRect(x, top, barWidth, totalH, radius);
+        } else {
+          ctx.rect(x, top, barWidth, totalH);
+        }
       }
       ctx.fill();
     }
@@ -3394,8 +3477,6 @@ const Genre4allPlayerWaveform = (() => {
     ctx.fillStyle = '#ffffff';
     ctx.beginPath();
     ctx.arc(playheadX, 3, 2.5, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.beginPath();
     ctx.arc(playheadX, height - 3, 2.5, 0, Math.PI * 2);
     ctx.fill();
 
@@ -3413,8 +3494,28 @@ const Genre4allPlayerWaveform = (() => {
     }
   }
 
-  function injectWaveformUI(playbackBar) {
-    if (!playbackBar || playbackBar.querySelector('.g4a-waveform-player')) return;
+  function scheduleSync(immediate = false) {
+    if (!active || typeof window === 'undefined') return;
+    if (pollTimer !== null) {
+      clearTimeout(pollTimer);
+      pollTimer = null;
+    }
+    if (animFrame !== null) return;
+    if (immediate && typeof requestAnimationFrame === 'function') {
+      animFrame = requestAnimationFrame(syncPlayer);
+    } else if (typeof requestAnimationFrame === 'function') {
+      animFrame = requestAnimationFrame(syncPlayer);
+    }
+  }
+
+  function injectWaveformUI(playbackBar, centerContainer) {
+    if (!playbackBar) return;
+    if (mountedElement && mountedElement.parentElement === playbackBar && mountedRefs) {
+      mountedRefs.centerContainer = centerContainer;
+      return;
+    }
+    const existing = playbackBar.querySelector('.g4a-waveform-player');
+    if (existing && existing !== mountedElement) existing.remove();
 
     const root = document.createElement('div');
     root.className = 'g4a-waveform-player';
@@ -3451,46 +3552,73 @@ const Genre4allPlayerWaveform = (() => {
     track.append(canvas, tooltip);
     root.append(meta, track);
 
-    // Event listeners for seek & scrub interaction
-    const updateScrub = e => {
-      const rect = track.getBoundingClientRect();
-      if (rect.width <= 0) return 0;
-      const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-      return ratio;
+    let cachedRect = null;
+    const getTrackRect = (force = false) => {
+      if (force || !cachedRect || cachedRect.width <= 0) {
+        cachedRect = track.getBoundingClientRect();
+      }
+      return cachedRect;
     };
+
+    const updateScrub = (e, forceRect = false) => {
+      const rect = getTrackRect(forceRect);
+      if (!rect || rect.width <= 0) return 0;
+      return Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    };
+
+    track.addEventListener('pointerenter', () => {
+      getTrackRect(true);
+    }, { passive: true });
 
     track.addEventListener('pointerdown', e => {
       if (e.button !== 0) return;
       isDragging = true;
       track.setPointerCapture?.(e.pointerId);
-      dragRatio = updateScrub(e);
+      dragRatio = updateScrub(e, true);
+      lastSeekAt = Date.now();
       if (typeof Spicetify !== 'undefined' && Spicetify.Player?.seek) {
         Spicetify.Player.seek(dragRatio);
       }
+      scheduleSync(true);
     });
 
     track.addEventListener('pointermove', e => {
-      const ratio = updateScrub(e);
+      const ratio = updateScrub(e, false);
       hoverRatio = ratio;
 
       const dur = currentAnalysis?.duration || (typeof Spicetify !== 'undefined' ? Spicetify.Player?.getDuration() : 0) || 180000;
       const hoverMs = Math.round(ratio * dur);
-      tooltip.textContent = formatTime(hoverMs);
-      tooltip.style.left = `${Math.round(ratio * 100)}%`;
-      tooltip.classList.add('visible');
+      const nextTooltip = formatTime(hoverMs);
+      if (mountedRefs && mountedRefs.lastTooltipText !== nextTooltip) {
+        mountedRefs.lastTooltipText = nextTooltip;
+        tooltip.textContent = nextTooltip;
+      }
+      const nextLeft = `${Math.round(ratio * 100)}%`;
+      if (mountedRefs && mountedRefs.lastTooltipLeft !== nextLeft) {
+        mountedRefs.lastTooltipLeft = nextLeft;
+        tooltip.style.left = nextLeft;
+      }
+      if (!tooltip.classList.contains('visible')) tooltip.classList.add('visible');
 
       if (isDragging) {
         dragRatio = ratio;
-        if (typeof Spicetify !== 'undefined' && Spicetify.Player?.seek) {
+        const now = Date.now();
+        if (now - lastSeekAt >= 140 && typeof Spicetify !== 'undefined' && Spicetify.Player?.seek) {
+          lastSeekAt = now;
           Spicetify.Player.seek(ratio);
         }
       }
-    });
+      scheduleSync(true);
+    }, { passive: true });
 
     const stopScrub = () => {
+      if (isDragging && typeof Spicetify !== 'undefined' && Spicetify.Player?.seek) {
+        Spicetify.Player.seek(dragRatio);
+      }
       isDragging = false;
       hoverRatio = null;
       tooltip.classList.remove('visible');
+      scheduleSync(true);
     };
 
     track.addEventListener('pointerup', stopScrub);
@@ -3499,33 +3627,88 @@ const Genre4allPlayerWaveform = (() => {
       if (!isDragging) {
         hoverRatio = null;
         tooltip.classList.remove('visible');
+        scheduleSync(true);
       }
-    });
+    }, { passive: true });
 
     playbackBar.append(root);
     mountedElement = root;
+    const initRect = track.getBoundingClientRect();
+    mountedRefs = {
+      playbackBar,
+      centerContainer,
+      timeEl,
+      bpmEl,
+      keyEl,
+      track,
+      canvas,
+      ctx: canvas.getContext('2d'),
+      tooltip,
+      width: Math.floor(initRect.width) || 360,
+      height: Math.floor(initRect.height) || 42,
+      lastTimeText: '0:00 / 0:00',
+      lastBpmText: '-- BPM',
+      lastKeyText: '--',
+      lastTooltipText: '',
+      lastTooltipLeft: '',
+      lastPinned: null,
+      lastRenderKey: '',
+      lastBarsRef: null
+    };
+
+    resizeObs?.disconnect();
+    if (typeof ResizeObserver === 'function') {
+      resizeObs = new ResizeObserver(entries => {
+        for (const entry of entries) {
+          const cr = entry.contentRect;
+          const w = Math.floor(cr.width);
+          const h = Math.floor(cr.height);
+          if (w > 0 && h > 0 && mountedRefs) {
+            mountedRefs.width = w;
+            mountedRefs.height = h;
+            cachedRect = null;
+            scheduleSync(true);
+          }
+        }
+      });
+      resizeObs.observe(track);
+    }
   }
 
   function syncPlayer() {
-    if (!enabled) {
+    animFrame = null;
+    if (pollTimer !== null) {
+      clearTimeout(pollTimer);
+      pollTimer = null;
+    }
+    if (!enabled || !active) {
       teardown();
       return;
     }
 
-    const playbackBar = document.querySelector('.main-nowPlayingBar-center .playback-bar, .playback-bar');
-    const centerContainer = document.querySelector('.main-nowPlayingBar-center');
+    let playbackBar = mountedRefs?.playbackBar?.isConnected ? mountedRefs.playbackBar : null;
+    let centerContainer = mountedRefs?.centerContainer?.isConnected ? mountedRefs.centerContainer : null;
+    if (!playbackBar || !centerContainer) {
+      playbackBar = document.querySelector('.main-nowPlayingBar-center .playback-bar, .playback-bar');
+      centerContainer = document.querySelector('.main-nowPlayingBar-center');
+    }
 
     if (!playbackBar || !centerContainer) {
-      if (active) animFrame = requestAnimationFrame(syncPlayer);
+      if (active) pollTimer = setTimeout(() => scheduleSync(true), 500);
       return;
     }
 
-    document.documentElement.setAttribute('data-g4a-player-waveform', 'true');
-    injectWaveformUI(playbackBar);
+    if (document.documentElement.getAttribute('data-g4a-player-waveform') !== 'true') {
+      document.documentElement.setAttribute('data-g4a-player-waveform', 'true');
+    }
+    injectWaveformUI(playbackBar, centerContainer);
 
-    // Keep dynamic island pinned if music is paused
-    const isPlaying = typeof Spicetify !== 'undefined' ? Spicetify.Player?.isPlaying?.() : false;
-    centerContainer.classList.toggle('g4a-island-pinned', !isPlaying || isDragging);
+    const isPlaying = typeof Spicetify !== 'undefined' ? Boolean(Spicetify.Player?.isPlaying?.()) : false;
+    const shouldPin = !isPlaying || isDragging;
+    if (mountedRefs && mountedRefs.lastPinned !== shouldPin) {
+      mountedRefs.lastPinned = shouldPin;
+      centerContainer.classList.toggle('g4a-island-pinned', shouldPin);
+    }
 
     const trackUri = typeof Spicetify !== 'undefined' ? (Spicetify.Player?.data?.item?.uri || '') : '';
     const durMs = typeof Spicetify !== 'undefined' ? (Spicetify.Player?.getDuration?.() || 0) : 0;
@@ -3546,76 +3729,111 @@ const Genre4allPlayerWaveform = (() => {
       fetchAudioAnalysis(trackUri).then(res => {
         if (res && res.trackUri === currentTrackUri) {
           currentAnalysis = res;
+          scheduleSync(true);
         }
       });
     }
 
-    // Update metadata DOM labels
-    if (mountedElement) {
-      const timeEl = mountedElement.querySelector('.g4a-meta-time');
-      const bpmEl = mountedElement.querySelector('.g4a-meta-bpm');
-      const keyEl = mountedElement.querySelector('.g4a-meta-key');
+    if (mountedRefs) {
+      const nextTimeText = `${formatTime(progressMs)} / ${formatTime(durMs)}`;
+      if (mountedRefs.lastTimeText !== nextTimeText) {
+        mountedRefs.lastTimeText = nextTimeText;
+        mountedRefs.timeEl.textContent = nextTimeText;
+      }
 
-      if (timeEl) timeEl.textContent = `${formatTime(progressMs)} / ${formatTime(durMs)}`;
-      if (bpmEl) bpmEl.textContent = currentAnalysis?.tempo ? formatBpm(currentAnalysis.tempo) : '-- BPM';
-      if (keyEl) keyEl.textContent = currentAnalysis?.keyLabel || '--';
+      const nextBpmText = currentAnalysis?.tempo ? formatBpm(currentAnalysis.tempo) : '-- BPM';
+      if (mountedRefs.lastBpmText !== nextBpmText) {
+        mountedRefs.lastBpmText = nextBpmText;
+        mountedRefs.bpmEl.textContent = nextBpmText;
+      }
 
-      // Canvas render
-      const canvas = mountedElement.querySelector('.g4a-waveform-canvas');
-      if (canvas) {
+      const nextKeyText = currentAnalysis?.keyLabel || '--';
+      if (mountedRefs.lastKeyText !== nextKeyText) {
+        mountedRefs.lastKeyText = nextKeyText;
+        mountedRefs.keyEl.textContent = nextKeyText;
+      }
+
+      const w = mountedRefs.width || mountedRefs.track.clientWidth || 360;
+      const h = mountedRefs.height || mountedRefs.track.clientHeight || 42;
+      if (w > 0 && h > 0 && mountedRefs.ctx) {
         const dpr = window.devicePixelRatio || 1;
-        const rect = canvas.getBoundingClientRect();
-        const w = Math.floor(rect.width);
-        const h = Math.floor(rect.height);
-
-        if (w > 0 && h > 0) {
-          if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
-            canvas.width = w * dpr;
-            canvas.height = h * dpr;
+        let bars = currentAnalysis?.bars;
+        if (!bars) {
+          const seedKey = `${trackUri || 'default'}:${Math.round(durMs / 1000)}`;
+          if (fallbackBarsUri !== seedKey || !fallbackBars) {
+            fallbackBarsUri = seedKey;
+            fallbackBars = generateProceduralBars(durMs / 1000, 180, trackUri || 'default');
           }
-          const ctx = canvas.getContext('2d');
+          bars = fallbackBars;
+        }
+        const playheadPx = Math.round(progressRatio * w * 2);
+        const hoverPx = hoverRatio != null ? Math.round(hoverRatio * w * 2) : -1;
+        const renderKey = `${w}|${h}|${dpr}|${playheadPx}|${hoverPx}`;
+        if (mountedRefs.lastRenderKey !== renderKey || mountedRefs.lastBarsRef !== bars) {
+          mountedRefs.lastRenderKey = renderKey;
+          mountedRefs.lastBarsRef = bars;
+          const canvas = mountedRefs.canvas;
+          if (canvas.width !== Math.floor(w * dpr) || canvas.height !== Math.floor(h * dpr)) {
+            canvas.width = Math.floor(w * dpr);
+            canvas.height = Math.floor(h * dpr);
+          }
+          const ctx = mountedRefs.ctx;
           ctx.save();
           ctx.scale(dpr, dpr);
-          const bars = currentAnalysis?.bars || generateProceduralBars(durMs / 1000, 180, trackUri || 'default');
           renderWaveform(ctx, w, h, bars, progressRatio, hoverRatio);
           ctx.restore();
         }
       }
     }
 
-    if (active) animFrame = requestAnimationFrame(syncPlayer);
+    if (active && !document.hidden) {
+      if (isDragging || hoverRatio !== null) {
+        animFrame = requestAnimationFrame(syncPlayer);
+      } else if (isPlaying) {
+        pollTimer = setTimeout(() => scheduleSync(true), 120);
+      }
+    }
   }
+
+  const onPlayerEvent = () => scheduleSync(true);
 
   function start() {
     if (active || typeof window === 'undefined' || typeof document === 'undefined') return;
     active = true;
-    animFrame = requestAnimationFrame(syncPlayer);
+    scheduleSync(true);
 
     if (typeof Spicetify !== 'undefined' && Spicetify.Player?.addEventListener) {
-      Spicetify.Player.addEventListener('songchange', syncPlayer);
-      Spicetify.Player.addEventListener('onplaypause', syncPlayer);
+      Spicetify.Player.addEventListener('songchange', onPlayerEvent);
+      Spicetify.Player.addEventListener('onplaypause', onPlayerEvent);
     }
   }
 
   function teardown() {
     active = false;
-    if (animFrame && typeof cancelAnimationFrame !== 'undefined') {
+    if (animFrame !== null && typeof cancelAnimationFrame !== 'undefined') {
       cancelAnimationFrame(animFrame);
       animFrame = null;
     }
+    if (pollTimer !== null) {
+      clearTimeout(pollTimer);
+      pollTimer = null;
+    }
+    resizeObs?.disconnect();
+    resizeObs = null;
     if (typeof document !== 'undefined') {
       document.documentElement.removeAttribute('data-g4a-player-waveform');
       if (mountedElement) {
         mountedElement.remove();
         mountedElement = null;
       }
+      mountedRefs = null;
       const center = document.querySelector('.main-nowPlayingBar-center');
       if (center) center.classList.remove('g4a-island-pinned');
     }
 
     if (typeof Spicetify !== 'undefined' && Spicetify.Player?.removeEventListener) {
-      Spicetify.Player.removeEventListener('songchange', syncPlayer);
-      Spicetify.Player.removeEventListener('onplaypause', syncPlayer);
+      Spicetify.Player.removeEventListener('songchange', onPlayerEvent);
+      Spicetify.Player.removeEventListener('onplaypause', onPlayerEvent);
     }
   }
 
@@ -3850,7 +4068,7 @@ async function startGenre4all() {
       metadataClient = new MetadataServiceClass(currentTransport);
       return metadataClient;
     }
-    if (Date.now() - lastDiscovery < 3000) return null;
+    if (Date.now() - lastDiscovery < 5000) return null;
     lastDiscovery = Date.now();
     const chunk = window.rspackChunk ?? window.webpackChunkclient_web ?? window.rspackChunkclient_web;
     if (!chunk) return null;
@@ -3859,7 +4077,15 @@ async function startGenre4all() {
       const ret = chunk.push([[Symbol('genre4all')], {}, r => { req = r; return r; }]);
       if (!req && typeof ret === 'function') req = ret;
       if (!req?.m) return null;
-      for (const id of Object.keys(req.m)) {
+      const allIds = Object.keys(req.m);
+      const matchedIds = allIds.filter(id => {
+        try {
+          const src = String(req.m[id] || '');
+          return src.includes('MetadataService') || src.includes('mdata_esperanto');
+        } catch { return false; }
+      });
+      const scanIds = matchedIds.length ? matchedIds : (allIds.length <= 200 ? allIds : []);
+      for (const id of scanIds) {
         let exports; try { exports = req(id); } catch { continue; }
         const candidates = [exports];
         if (exports && (typeof exports === 'object' || typeof exports === 'function')) {
@@ -3879,12 +4105,31 @@ async function startGenre4all() {
 
   const validUri = uri => typeof uri === 'string' && /^spotify:(track|local):/.test(uri);
   const URI_SEARCH_KEYS = ['item', 'track', 'data', 'value', 'content', 'node', 'spec', '_path', 'props', 'children'];
+  const SKIP_HOST_TAGS = new Set(['svg', 'path', 'img', 'button', 'input']);
+  function directUriFromProps(p) {
+    if (!p || typeof p !== 'object') return null;
+    const c = p.uri || p.item?.uri || p.track?.uri || p.data?.uri || p.value?.uri || p.children?.props?.item?.uri || p.children?.props?.track?.uri || p.children?.props?.uri;
+    return validUri(c) ? c : null;
+  }
   function computeUri(row, rowProps, firstProps, fiber, dataUri, fallbackHref) {
-    function find(rootVal, maxDepth = 10) {
+    for (const props of [rowProps, firstProps]) {
+      const fast = directUriFromProps(props); if (fast) return fast;
+    }
+    const first = row.firstElementChild;
+    const firstFiberKey = first ? (first.__g4aFiberKey ?? (first.__g4aFiberKey = Object.keys(first).find(k => k.startsWith('__reactFiber$')) || '')) : '';
+    const fibers = [fiber, firstFiberKey ? first[firstFiberKey] : null].filter(Boolean);
+    for (const startFiber of fibers) {
+      for (let f = startFiber, i = 0; f && i < 8; f = f.return, i++) {
+        const fast = directUriFromProps(f.memoizedProps) || directUriFromProps(f.pendingProps);
+        if (fast) return fast;
+      }
+    }
+    function find(rootVal, maxDepth = 8) {
       if (!rootVal || typeof rootVal !== 'object') return null;
       const seen = new Set();
       function walk(value, depth) {
-        if (!value || typeof value !== 'object' || depth <= 0 || seen.has(value) || seen.size > 300) return null;
+        if (!value || typeof value !== 'object' || depth <= 0 || seen.has(value) || seen.size > 140) return null;
+        if (typeof value.type === 'string' && SKIP_HOST_TAGS.has(value.type)) return null;
         seen.add(value);
         if (validUri(value.uri)) return value.uri;
         if (Array.isArray(value)) {
@@ -3904,9 +4149,7 @@ async function startGenre4all() {
     for (const props of [rowProps, firstProps]) {
       const uri = find(props); if (uri) return uri;
     }
-    const first = row.firstElementChild;
-    const firstFiberKey = first ? (first.__g4aFiberKey ?? (first.__g4aFiberKey = Object.keys(first).find(k => k.startsWith('__reactFiber$')) || '')) : '';
-    for (const startFiber of [fiber, firstFiberKey ? first[firstFiberKey] : null].filter(Boolean)) {
+    for (const startFiber of fibers) {
       for (let f = startFiber, i = 0; f && i < 8; f = f.return, i++) {
         const uri = find(f.pendingProps) || find(f.memoizedProps); if (uri) return uri;
       }
@@ -4454,14 +4697,20 @@ async function startGenre4all() {
       }
     }
 
-    let measured = rootState.measured?.key === measureKey ? rootState.measured : null;
+    if (!rootState.measured) rootState.measuredMap?.clear();
+    let measured = rootState.measured?.key === measureKey
+      ? rootState.measured
+      : (rootState.measuredMap?.get(measureKey) || null);
     if (!measured) {
       const m = measureGrid(container, foreign, endIndex, minInsert, midOrder, isNativeLayout, rootState);
       measured = { key: measureKey, total: m.total, template: m.template };
-      if (!inlineGrid) rootState.measured = measured;
+      rootState.measured = measured;
+      if (!rootState.measuredMap) rootState.measuredMap = new Map();
+      if (rootState.measuredMap.size >= 12) rootState.measuredMap.delete(rootState.measuredMap.keys().next().value);
+      rootState.measuredMap.set(measureKey, measured);
     }
 
-    if (!inlineGrid) {
+    if (!inlineGrid || !root.style.getPropertyValue('--g4a-tracks')) {
       ownProperty(root, '--g4a-tracks', measured.template);
       ownProperty(root, '--g4a-total', `${measured.total}px`);
     }
@@ -4559,23 +4808,29 @@ async function startGenre4all() {
   }
 
   // Observe native changes and virtualization; ignore our rendering, menu writes and unrelated player animations.
+  const IGNORE_MUTATION_SELECTOR = 'genre4all-column,[data-g4a-menu-item],[data-g4a-profile-item],[data-g4a-sep],.g4a-genre-fan,.g4a-preferences,.g4a-waveform-player';
+  const RELEVANT_ATTR_SELECTOR = `${ROOT},${ROW},${CELL},[role="menu"],.main-contextMenu-menu`;
   const observer = new MutationObserver(records => {
     if (document.documentElement.classList.contains('g4a-reordering')) return;
     if (records.some(m => {
       const target = m.target.nodeType === 1 ? m.target : m.target.parentElement;
-      if (!target || target.closest?.('genre4all-column,[data-g4a-menu-item],[data-g4a-profile-item],[data-g4a-sep],.g4a-genre-fan,.g4a-preferences')) return false;
+      if (!target || target.closest?.(IGNORE_MUTATION_SELECTOR)) return false;
       const inRelevant = !!target.closest?.(`${ROOT},[role="menu"],.main-contextMenu-menu`);
       if (m.type === 'childList') {
         return [...m.addedNodes, ...m.removedNodes].some(n => {
-          if (n.nodeType !== 1 || n.matches('genre4all-column,[data-g4a-menu-item],[data-g4a-profile-item],[data-g4a-sep],.g4a-genre-fan,.g4a-preferences')) return false;
+          if (n.nodeType !== 1 || n.matches(IGNORE_MUTATION_SELECTOR)) return false;
           if (inRelevant) return true;
           return n.matches?.(`${ROOT},${ROW},[role="menu"],.main-contextMenu-menu`) || !!n.querySelector?.(`${ROOT},${ROW},[role="menu"],.main-contextMenu-menu`);
         });
       }
-      return inRelevant;
+      if (!inRelevant) return false;
+      if (m.type === 'attributes' && (m.attributeName === 'style' || m.attributeName === 'class')) {
+        return !!target.matches?.(RELEVANT_ATTR_SELECTOR) || !!target.parentElement?.matches?.(ROW);
+      }
+      return true;
     })) schedule();
   });
-  observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['aria-rowindex','data-uri','href','style','class'], characterData: true });
+  observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['aria-rowindex','data-uri','href','style','class'] });
   const resize = typeof ResizeObserver === 'function' ? new ResizeObserver(() => { invalidateLayouts(false, false); schedule(); }) : null;
 
   function sync() {

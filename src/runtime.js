@@ -194,7 +194,7 @@ async function startGenre4all() {
       metadataClient = new MetadataServiceClass(currentTransport);
       return metadataClient;
     }
-    if (Date.now() - lastDiscovery < 3000) return null;
+    if (Date.now() - lastDiscovery < 5000) return null;
     lastDiscovery = Date.now();
     const chunk = window.rspackChunk ?? window.webpackChunkclient_web ?? window.rspackChunkclient_web;
     if (!chunk) return null;
@@ -203,7 +203,15 @@ async function startGenre4all() {
       const ret = chunk.push([[Symbol('genre4all')], {}, r => { req = r; return r; }]);
       if (!req && typeof ret === 'function') req = ret;
       if (!req?.m) return null;
-      for (const id of Object.keys(req.m)) {
+      const allIds = Object.keys(req.m);
+      const matchedIds = allIds.filter(id => {
+        try {
+          const src = String(req.m[id] || '');
+          return src.includes('MetadataService') || src.includes('mdata_esperanto');
+        } catch { return false; }
+      });
+      const scanIds = matchedIds.length ? matchedIds : (allIds.length <= 200 ? allIds : []);
+      for (const id of scanIds) {
         let exports; try { exports = req(id); } catch { continue; }
         const candidates = [exports];
         if (exports && (typeof exports === 'object' || typeof exports === 'function')) {
@@ -223,12 +231,31 @@ async function startGenre4all() {
 
   const validUri = uri => typeof uri === 'string' && /^spotify:(track|local):/.test(uri);
   const URI_SEARCH_KEYS = ['item', 'track', 'data', 'value', 'content', 'node', 'spec', '_path', 'props', 'children'];
+  const SKIP_HOST_TAGS = new Set(['svg', 'path', 'img', 'button', 'input']);
+  function directUriFromProps(p) {
+    if (!p || typeof p !== 'object') return null;
+    const c = p.uri || p.item?.uri || p.track?.uri || p.data?.uri || p.value?.uri || p.children?.props?.item?.uri || p.children?.props?.track?.uri || p.children?.props?.uri;
+    return validUri(c) ? c : null;
+  }
   function computeUri(row, rowProps, firstProps, fiber, dataUri, fallbackHref) {
-    function find(rootVal, maxDepth = 10) {
+    for (const props of [rowProps, firstProps]) {
+      const fast = directUriFromProps(props); if (fast) return fast;
+    }
+    const first = row.firstElementChild;
+    const firstFiberKey = first ? (first.__g4aFiberKey ?? (first.__g4aFiberKey = Object.keys(first).find(k => k.startsWith('__reactFiber$')) || '')) : '';
+    const fibers = [fiber, firstFiberKey ? first[firstFiberKey] : null].filter(Boolean);
+    for (const startFiber of fibers) {
+      for (let f = startFiber, i = 0; f && i < 8; f = f.return, i++) {
+        const fast = directUriFromProps(f.memoizedProps) || directUriFromProps(f.pendingProps);
+        if (fast) return fast;
+      }
+    }
+    function find(rootVal, maxDepth = 8) {
       if (!rootVal || typeof rootVal !== 'object') return null;
       const seen = new Set();
       function walk(value, depth) {
-        if (!value || typeof value !== 'object' || depth <= 0 || seen.has(value) || seen.size > 300) return null;
+        if (!value || typeof value !== 'object' || depth <= 0 || seen.has(value) || seen.size > 140) return null;
+        if (typeof value.type === 'string' && SKIP_HOST_TAGS.has(value.type)) return null;
         seen.add(value);
         if (validUri(value.uri)) return value.uri;
         if (Array.isArray(value)) {
@@ -248,9 +275,7 @@ async function startGenre4all() {
     for (const props of [rowProps, firstProps]) {
       const uri = find(props); if (uri) return uri;
     }
-    const first = row.firstElementChild;
-    const firstFiberKey = first ? (first.__g4aFiberKey ?? (first.__g4aFiberKey = Object.keys(first).find(k => k.startsWith('__reactFiber$')) || '')) : '';
-    for (const startFiber of [fiber, firstFiberKey ? first[firstFiberKey] : null].filter(Boolean)) {
+    for (const startFiber of fibers) {
       for (let f = startFiber, i = 0; f && i < 8; f = f.return, i++) {
         const uri = find(f.pendingProps) || find(f.memoizedProps); if (uri) return uri;
       }
@@ -798,14 +823,20 @@ async function startGenre4all() {
       }
     }
 
-    let measured = rootState.measured?.key === measureKey ? rootState.measured : null;
+    if (!rootState.measured) rootState.measuredMap?.clear();
+    let measured = rootState.measured?.key === measureKey
+      ? rootState.measured
+      : (rootState.measuredMap?.get(measureKey) || null);
     if (!measured) {
       const m = measureGrid(container, foreign, endIndex, minInsert, midOrder, isNativeLayout, rootState);
       measured = { key: measureKey, total: m.total, template: m.template };
-      if (!inlineGrid) rootState.measured = measured;
+      rootState.measured = measured;
+      if (!rootState.measuredMap) rootState.measuredMap = new Map();
+      if (rootState.measuredMap.size >= 12) rootState.measuredMap.delete(rootState.measuredMap.keys().next().value);
+      rootState.measuredMap.set(measureKey, measured);
     }
 
-    if (!inlineGrid) {
+    if (!inlineGrid || !root.style.getPropertyValue('--g4a-tracks')) {
       ownProperty(root, '--g4a-tracks', measured.template);
       ownProperty(root, '--g4a-total', `${measured.total}px`);
     }
@@ -903,23 +934,29 @@ async function startGenre4all() {
   }
 
   // Observe native changes and virtualization; ignore our rendering, menu writes and unrelated player animations.
+  const IGNORE_MUTATION_SELECTOR = 'genre4all-column,[data-g4a-menu-item],[data-g4a-profile-item],[data-g4a-sep],.g4a-genre-fan,.g4a-preferences,.g4a-waveform-player';
+  const RELEVANT_ATTR_SELECTOR = `${ROOT},${ROW},${CELL},[role="menu"],.main-contextMenu-menu`;
   const observer = new MutationObserver(records => {
     if (document.documentElement.classList.contains('g4a-reordering')) return;
     if (records.some(m => {
       const target = m.target.nodeType === 1 ? m.target : m.target.parentElement;
-      if (!target || target.closest?.('genre4all-column,[data-g4a-menu-item],[data-g4a-profile-item],[data-g4a-sep],.g4a-genre-fan,.g4a-preferences')) return false;
+      if (!target || target.closest?.(IGNORE_MUTATION_SELECTOR)) return false;
       const inRelevant = !!target.closest?.(`${ROOT},[role="menu"],.main-contextMenu-menu`);
       if (m.type === 'childList') {
         return [...m.addedNodes, ...m.removedNodes].some(n => {
-          if (n.nodeType !== 1 || n.matches('genre4all-column,[data-g4a-menu-item],[data-g4a-profile-item],[data-g4a-sep],.g4a-genre-fan,.g4a-preferences')) return false;
+          if (n.nodeType !== 1 || n.matches(IGNORE_MUTATION_SELECTOR)) return false;
           if (inRelevant) return true;
           return n.matches?.(`${ROOT},${ROW},[role="menu"],.main-contextMenu-menu`) || !!n.querySelector?.(`${ROOT},${ROW},[role="menu"],.main-contextMenu-menu`);
         });
       }
-      return inRelevant;
+      if (!inRelevant) return false;
+      if (m.type === 'attributes' && (m.attributeName === 'style' || m.attributeName === 'class')) {
+        return !!target.matches?.(RELEVANT_ATTR_SELECTOR) || !!target.parentElement?.matches?.(ROW);
+      }
+      return true;
     })) schedule();
   });
-  observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['aria-rowindex','data-uri','href','style','class'], characterData: true });
+  observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['aria-rowindex','data-uri','href','style','class'] });
   const resize = typeof ResizeObserver === 'function' ? new ResizeObserver(() => { invalidateLayouts(false, false); schedule(); }) : null;
 
   function sync() {

@@ -4,21 +4,35 @@ const Genre4allTransport = (() => {
   const COMPACT_CACHE_KEY = 'genre4all-cache-txt-v11';
   const COMPACT_MAX_LINES = 2000;
 
+  function encodeCompactEntry(id, entry) {
+    if (!entry || !entry.value || !Number.isFinite(entry.expiresAt)) return '';
+    const v = entry.value;
+    if (!['success', 'empty', 'no_match'].includes(v.status)) return '';
+    if (entry.__compactLine && entry.__compactId === id && entry.__compactExp === entry.expiresAt) return entry.__compactLine;
+    const labelsPart = (v.labels || [])
+      .map(l => `${String(l.label || '').replace(/[\t\n\r;~]/gu, ' ')}~${l.kind || 'genre'}~${l.provider || v.provider || ''}`)
+      .join(';');
+    const safeId = String(id).replace(/[\t\n\r]/gu, ' ');
+    const provider = String(v.provider || '').replace(/[\t\n\r]/gu, '');
+    const status = String(v.status || 'empty');
+    const exp = Math.floor(entry.expiresAt).toString(36);
+    const ver = Number(entry.version || 2).toString(36);
+    const line = `${safeId}\t${provider}\t${status}\t${exp}\t${ver}\t${labelsPart}`;
+    try {
+      Object.defineProperties(entry, {
+        __compactLine: { value: line, configurable: true },
+        __compactId: { value: id, configurable: true },
+        __compactExp: { value: entry.expiresAt, configurable: true }
+      });
+    } catch { /* Frozen entry fallback. */ }
+    return line;
+  }
+
   function encodeCompactCache(map) {
     const lines = [];
     for (const [id, entry] of map) {
-      if (!entry || !entry.value || !Number.isFinite(entry.expiresAt)) continue;
-      const v = entry.value;
-      if (!['success', 'empty', 'no_match'].includes(v.status)) continue;
-      const labelsPart = (v.labels || [])
-        .map(l => `${String(l.label || '').replace(/[\t\n\r;~]/gu, ' ')}~${l.kind || 'genre'}~${l.provider || v.provider || ''}`)
-        .join(';');
-      const safeId = String(id).replace(/[\t\n\r]/gu, ' ');
-      const provider = String(v.provider || '').replace(/[\t\n\r]/gu, '');
-      const status = String(v.status || 'empty');
-      const exp = Math.floor(entry.expiresAt).toString(36);
-      const ver = Number(entry.version || 2).toString(36);
-      lines.push(`${safeId}\t${provider}\t${status}\t${exp}\t${ver}\t${labelsPart}`);
+      const line = encodeCompactEntry(id, entry);
+      if (line) lines.push(line);
     }
     return lines.slice(-COMPACT_MAX_LINES).join('\n');
   }

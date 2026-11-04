@@ -6,17 +6,24 @@ const Genre4allPlayerWaveform = (() => {
   const PITCH_NAMES = ['C', 'C♯', 'D', 'D♯', 'E', 'F', 'F♯', 'G', 'G♯', 'A', 'A♯', 'B'];
   const CAMELOT_MAJOR = ['8B', '3B', '10B', '5B', '12B', '7B', '2B', '9B', '4B', '11B', '6B', '1B'];
   const CAMELOT_MINOR = ['5A', '12A', '7A', '2A', '9A', '4A', '11A', '6A', '1A', '8A', '3A', '10A'];
+  const MAX_CACHE_ENTRIES = 64;
 
   const analysisCache = new Map();
   let enabled = false;
   let active = false;
   let mountedElement = null;
+  let mountedRefs = null;
+  let resizeObs = null;
   let animFrame = null;
+  let pollTimer = null;
   let currentTrackUri = null;
   let currentAnalysis = null;
+  let fallbackBars = null;
+  let fallbackBarsUri = '';
   let isDragging = false;
   let dragRatio = 0;
   let hoverRatio = null;
+  let lastSeekAt = 0;
 
   try {
     enabled = localStorage.getItem(STORAGE_KEY) === 'true';
@@ -199,8 +206,22 @@ const Genre4allPlayerWaveform = (() => {
 
     if (raw && raw.track) {
       const parsed = parseAudioAnalysis(raw, trackUri);
-      analysisCache.set(trackUri, parsed);
-      return parsed;
+      // Drop heavy raw segment/beat arrays from long-lived cache to save memory
+      const compactParsed = {
+        trackUri: parsed.trackUri,
+        duration: parsed.duration,
+        tempo: parsed.tempo,
+        key: parsed.key,
+        mode: parsed.mode,
+        keyLabel: parsed.keyLabel,
+        bars: parsed.bars
+      };
+      while (analysisCache.size >= MAX_CACHE_ENTRIES) {
+        const oldestKey = analysisCache.keys().next().value;
+        analysisCache.delete(oldestKey);
+      }
+      analysisCache.set(trackUri, compactParsed);
+      return compactParsed;
     }
 
     return null;
@@ -216,25 +237,28 @@ const Genre4allPlayerWaveform = (() => {
     const count = Math.max(40, Math.floor(width / step));
     const centerY = height / 2;
     const maxAmp = (height / 2) - 3;
+    const radius = barWidth / 2;
+    const hasRoundRect = typeof ctx.roundRect === 'function';
 
-    for (let i = 0; i < count; i++) {
-      const x = i * step + (step - barWidth) / 2;
-      const sampleIdx = Math.floor((i / count) * bars.length);
-      const amp = bars[sampleIdx] || 0.1;
-      const barH = Math.max(2.5, amp * maxAmp);
-
-      const isPlayed = (x / width) <= progressRatio;
-      ctx.fillStyle = isPlayed ? 'rgba(255, 255, 255, 0.96)' : 'rgba(255, 255, 255, 0.26)';
-
-      const top = centerY - barH;
-      const totalH = barH * 1.85;
-      const radius = barWidth / 2;
-
+    // Batch played and unplayed bars into 2 paths instead of 180 separate fill() calls
+    for (let pass = 0; pass < 2; pass++) {
+      const targetPlayed = pass === 0;
+      ctx.fillStyle = targetPlayed ? 'rgba(255, 255, 255, 0.96)' : 'rgba(255, 255, 255, 0.26)';
       ctx.beginPath();
-      if (typeof ctx.roundRect === 'function') {
-        ctx.roundRect(x, top, barWidth, totalH, radius);
-      } else {
-        ctx.rect(x, top, barWidth, totalH);
+      for (let i = 0; i < count; i++) {
+        const x = i * step + (step - barWidth) / 2;
+        const isPlayed = (x / width) <= progressRatio;
+        if (isPlayed !== targetPlayed) continue;
+        const sampleIdx = Math.floor((i / count) * bars.length);
+        const amp = bars[sampleIdx] || 0.1;
+        const barH = Math.max(2.5, amp * maxAmp);
+        const top = centerY - barH;
+        const totalH = barH * 1.85;
+        if (hasRoundRect) {
+          ctx.roundRect(x, top, barWidth, totalH, radius);
+        } else {
+          ctx.rect(x, top, barWidth, totalH);
+        }
       }
       ctx.fill();
     }
@@ -251,8 +275,6 @@ const Genre4allPlayerWaveform = (() => {
     ctx.fillStyle = '#ffffff';
     ctx.beginPath();
     ctx.arc(playheadX, 3, 2.5, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.beginPath();
     ctx.arc(playheadX, height - 3, 2.5, 0, Math.PI * 2);
     ctx.fill();
 
@@ -270,8 +292,28 @@ const Genre4allPlayerWaveform = (() => {
     }
   }
 
-  function injectWaveformUI(playbackBar) {
-    if (!playbackBar || playbackBar.querySelector('.g4a-waveform-player')) return;
+  function scheduleSync(immediate = false) {
+    if (!active || typeof window === 'undefined') return;
+    if (pollTimer !== null) {
+      clearTimeout(pollTimer);
+      pollTimer = null;
+    }
+    if (animFrame !== null) return;
+    if (immediate && typeof requestAnimationFrame === 'function') {
+      animFrame = requestAnimationFrame(syncPlayer);
+    } else if (typeof requestAnimationFrame === 'function') {
+      animFrame = requestAnimationFrame(syncPlayer);
+    }
+  }
+
+  function injectWaveformUI(playbackBar, centerContainer) {
+    if (!playbackBar) return;
+    if (mountedElement && mountedElement.parentElement === playbackBar && mountedRefs) {
+      mountedRefs.centerContainer = centerContainer;
+      return;
+    }
+    const existing = playbackBar.querySelector('.g4a-waveform-player');
+    if (existing && existing !== mountedElement) existing.remove();
 
     const root = document.createElement('div');
     root.className = 'g4a-waveform-player';
@@ -308,46 +350,73 @@ const Genre4allPlayerWaveform = (() => {
     track.append(canvas, tooltip);
     root.append(meta, track);
 
-    // Event listeners for seek & scrub interaction
-    const updateScrub = e => {
-      const rect = track.getBoundingClientRect();
-      if (rect.width <= 0) return 0;
-      const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-      return ratio;
+    let cachedRect = null;
+    const getTrackRect = (force = false) => {
+      if (force || !cachedRect || cachedRect.width <= 0) {
+        cachedRect = track.getBoundingClientRect();
+      }
+      return cachedRect;
     };
+
+    const updateScrub = (e, forceRect = false) => {
+      const rect = getTrackRect(forceRect);
+      if (!rect || rect.width <= 0) return 0;
+      return Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    };
+
+    track.addEventListener('pointerenter', () => {
+      getTrackRect(true);
+    }, { passive: true });
 
     track.addEventListener('pointerdown', e => {
       if (e.button !== 0) return;
       isDragging = true;
       track.setPointerCapture?.(e.pointerId);
-      dragRatio = updateScrub(e);
+      dragRatio = updateScrub(e, true);
+      lastSeekAt = Date.now();
       if (typeof Spicetify !== 'undefined' && Spicetify.Player?.seek) {
         Spicetify.Player.seek(dragRatio);
       }
+      scheduleSync(true);
     });
 
     track.addEventListener('pointermove', e => {
-      const ratio = updateScrub(e);
+      const ratio = updateScrub(e, false);
       hoverRatio = ratio;
 
       const dur = currentAnalysis?.duration || (typeof Spicetify !== 'undefined' ? Spicetify.Player?.getDuration() : 0) || 180000;
       const hoverMs = Math.round(ratio * dur);
-      tooltip.textContent = formatTime(hoverMs);
-      tooltip.style.left = `${Math.round(ratio * 100)}%`;
-      tooltip.classList.add('visible');
+      const nextTooltip = formatTime(hoverMs);
+      if (mountedRefs && mountedRefs.lastTooltipText !== nextTooltip) {
+        mountedRefs.lastTooltipText = nextTooltip;
+        tooltip.textContent = nextTooltip;
+      }
+      const nextLeft = `${Math.round(ratio * 100)}%`;
+      if (mountedRefs && mountedRefs.lastTooltipLeft !== nextLeft) {
+        mountedRefs.lastTooltipLeft = nextLeft;
+        tooltip.style.left = nextLeft;
+      }
+      if (!tooltip.classList.contains('visible')) tooltip.classList.add('visible');
 
       if (isDragging) {
         dragRatio = ratio;
-        if (typeof Spicetify !== 'undefined' && Spicetify.Player?.seek) {
+        const now = Date.now();
+        if (now - lastSeekAt >= 140 && typeof Spicetify !== 'undefined' && Spicetify.Player?.seek) {
+          lastSeekAt = now;
           Spicetify.Player.seek(ratio);
         }
       }
-    });
+      scheduleSync(true);
+    }, { passive: true });
 
     const stopScrub = () => {
+      if (isDragging && typeof Spicetify !== 'undefined' && Spicetify.Player?.seek) {
+        Spicetify.Player.seek(dragRatio);
+      }
       isDragging = false;
       hoverRatio = null;
       tooltip.classList.remove('visible');
+      scheduleSync(true);
     };
 
     track.addEventListener('pointerup', stopScrub);
@@ -356,33 +425,88 @@ const Genre4allPlayerWaveform = (() => {
       if (!isDragging) {
         hoverRatio = null;
         tooltip.classList.remove('visible');
+        scheduleSync(true);
       }
-    });
+    }, { passive: true });
 
     playbackBar.append(root);
     mountedElement = root;
+    const initRect = track.getBoundingClientRect();
+    mountedRefs = {
+      playbackBar,
+      centerContainer,
+      timeEl,
+      bpmEl,
+      keyEl,
+      track,
+      canvas,
+      ctx: canvas.getContext('2d'),
+      tooltip,
+      width: Math.floor(initRect.width) || 360,
+      height: Math.floor(initRect.height) || 42,
+      lastTimeText: '0:00 / 0:00',
+      lastBpmText: '-- BPM',
+      lastKeyText: '--',
+      lastTooltipText: '',
+      lastTooltipLeft: '',
+      lastPinned: null,
+      lastRenderKey: '',
+      lastBarsRef: null
+    };
+
+    resizeObs?.disconnect();
+    if (typeof ResizeObserver === 'function') {
+      resizeObs = new ResizeObserver(entries => {
+        for (const entry of entries) {
+          const cr = entry.contentRect;
+          const w = Math.floor(cr.width);
+          const h = Math.floor(cr.height);
+          if (w > 0 && h > 0 && mountedRefs) {
+            mountedRefs.width = w;
+            mountedRefs.height = h;
+            cachedRect = null;
+            scheduleSync(true);
+          }
+        }
+      });
+      resizeObs.observe(track);
+    }
   }
 
   function syncPlayer() {
-    if (!enabled) {
+    animFrame = null;
+    if (pollTimer !== null) {
+      clearTimeout(pollTimer);
+      pollTimer = null;
+    }
+    if (!enabled || !active) {
       teardown();
       return;
     }
 
-    const playbackBar = document.querySelector('.main-nowPlayingBar-center .playback-bar, .playback-bar');
-    const centerContainer = document.querySelector('.main-nowPlayingBar-center');
+    let playbackBar = mountedRefs?.playbackBar?.isConnected ? mountedRefs.playbackBar : null;
+    let centerContainer = mountedRefs?.centerContainer?.isConnected ? mountedRefs.centerContainer : null;
+    if (!playbackBar || !centerContainer) {
+      playbackBar = document.querySelector('.main-nowPlayingBar-center .playback-bar, .playback-bar');
+      centerContainer = document.querySelector('.main-nowPlayingBar-center');
+    }
 
     if (!playbackBar || !centerContainer) {
-      if (active) animFrame = requestAnimationFrame(syncPlayer);
+      if (active) pollTimer = setTimeout(() => scheduleSync(true), 500);
       return;
     }
 
-    document.documentElement.setAttribute('data-g4a-player-waveform', 'true');
-    injectWaveformUI(playbackBar);
+    if (document.documentElement.getAttribute('data-g4a-player-waveform') !== 'true') {
+      document.documentElement.setAttribute('data-g4a-player-waveform', 'true');
+    }
+    injectWaveformUI(playbackBar, centerContainer);
 
-    // Keep dynamic island pinned if music is paused
-    const isPlaying = typeof Spicetify !== 'undefined' ? Spicetify.Player?.isPlaying?.() : false;
-    centerContainer.classList.toggle('g4a-island-pinned', !isPlaying || isDragging);
+    const isPlaying = typeof Spicetify !== 'undefined' ? Boolean(Spicetify.Player?.isPlaying?.()) : false;
+    const shouldPin = !isPlaying || isDragging;
+    if (mountedRefs && mountedRefs.lastPinned !== shouldPin) {
+      mountedRefs.lastPinned = shouldPin;
+      centerContainer.classList.toggle('g4a-island-pinned', shouldPin);
+    }
 
     const trackUri = typeof Spicetify !== 'undefined' ? (Spicetify.Player?.data?.item?.uri || '') : '';
     const durMs = typeof Spicetify !== 'undefined' ? (Spicetify.Player?.getDuration?.() || 0) : 0;
@@ -403,76 +527,111 @@ const Genre4allPlayerWaveform = (() => {
       fetchAudioAnalysis(trackUri).then(res => {
         if (res && res.trackUri === currentTrackUri) {
           currentAnalysis = res;
+          scheduleSync(true);
         }
       });
     }
 
-    // Update metadata DOM labels
-    if (mountedElement) {
-      const timeEl = mountedElement.querySelector('.g4a-meta-time');
-      const bpmEl = mountedElement.querySelector('.g4a-meta-bpm');
-      const keyEl = mountedElement.querySelector('.g4a-meta-key');
+    if (mountedRefs) {
+      const nextTimeText = `${formatTime(progressMs)} / ${formatTime(durMs)}`;
+      if (mountedRefs.lastTimeText !== nextTimeText) {
+        mountedRefs.lastTimeText = nextTimeText;
+        mountedRefs.timeEl.textContent = nextTimeText;
+      }
 
-      if (timeEl) timeEl.textContent = `${formatTime(progressMs)} / ${formatTime(durMs)}`;
-      if (bpmEl) bpmEl.textContent = currentAnalysis?.tempo ? formatBpm(currentAnalysis.tempo) : '-- BPM';
-      if (keyEl) keyEl.textContent = currentAnalysis?.keyLabel || '--';
+      const nextBpmText = currentAnalysis?.tempo ? formatBpm(currentAnalysis.tempo) : '-- BPM';
+      if (mountedRefs.lastBpmText !== nextBpmText) {
+        mountedRefs.lastBpmText = nextBpmText;
+        mountedRefs.bpmEl.textContent = nextBpmText;
+      }
 
-      // Canvas render
-      const canvas = mountedElement.querySelector('.g4a-waveform-canvas');
-      if (canvas) {
+      const nextKeyText = currentAnalysis?.keyLabel || '--';
+      if (mountedRefs.lastKeyText !== nextKeyText) {
+        mountedRefs.lastKeyText = nextKeyText;
+        mountedRefs.keyEl.textContent = nextKeyText;
+      }
+
+      const w = mountedRefs.width || mountedRefs.track.clientWidth || 360;
+      const h = mountedRefs.height || mountedRefs.track.clientHeight || 42;
+      if (w > 0 && h > 0 && mountedRefs.ctx) {
         const dpr = window.devicePixelRatio || 1;
-        const rect = canvas.getBoundingClientRect();
-        const w = Math.floor(rect.width);
-        const h = Math.floor(rect.height);
-
-        if (w > 0 && h > 0) {
-          if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
-            canvas.width = w * dpr;
-            canvas.height = h * dpr;
+        let bars = currentAnalysis?.bars;
+        if (!bars) {
+          const seedKey = `${trackUri || 'default'}:${Math.round(durMs / 1000)}`;
+          if (fallbackBarsUri !== seedKey || !fallbackBars) {
+            fallbackBarsUri = seedKey;
+            fallbackBars = generateProceduralBars(durMs / 1000, 180, trackUri || 'default');
           }
-          const ctx = canvas.getContext('2d');
+          bars = fallbackBars;
+        }
+        const playheadPx = Math.round(progressRatio * w * 2);
+        const hoverPx = hoverRatio != null ? Math.round(hoverRatio * w * 2) : -1;
+        const renderKey = `${w}|${h}|${dpr}|${playheadPx}|${hoverPx}`;
+        if (mountedRefs.lastRenderKey !== renderKey || mountedRefs.lastBarsRef !== bars) {
+          mountedRefs.lastRenderKey = renderKey;
+          mountedRefs.lastBarsRef = bars;
+          const canvas = mountedRefs.canvas;
+          if (canvas.width !== Math.floor(w * dpr) || canvas.height !== Math.floor(h * dpr)) {
+            canvas.width = Math.floor(w * dpr);
+            canvas.height = Math.floor(h * dpr);
+          }
+          const ctx = mountedRefs.ctx;
           ctx.save();
           ctx.scale(dpr, dpr);
-          const bars = currentAnalysis?.bars || generateProceduralBars(durMs / 1000, 180, trackUri || 'default');
           renderWaveform(ctx, w, h, bars, progressRatio, hoverRatio);
           ctx.restore();
         }
       }
     }
 
-    if (active) animFrame = requestAnimationFrame(syncPlayer);
+    if (active && !document.hidden) {
+      if (isDragging || hoverRatio !== null) {
+        animFrame = requestAnimationFrame(syncPlayer);
+      } else if (isPlaying) {
+        pollTimer = setTimeout(() => scheduleSync(true), 120);
+      }
+    }
   }
+
+  const onPlayerEvent = () => scheduleSync(true);
 
   function start() {
     if (active || typeof window === 'undefined' || typeof document === 'undefined') return;
     active = true;
-    animFrame = requestAnimationFrame(syncPlayer);
+    scheduleSync(true);
 
     if (typeof Spicetify !== 'undefined' && Spicetify.Player?.addEventListener) {
-      Spicetify.Player.addEventListener('songchange', syncPlayer);
-      Spicetify.Player.addEventListener('onplaypause', syncPlayer);
+      Spicetify.Player.addEventListener('songchange', onPlayerEvent);
+      Spicetify.Player.addEventListener('onplaypause', onPlayerEvent);
     }
   }
 
   function teardown() {
     active = false;
-    if (animFrame && typeof cancelAnimationFrame !== 'undefined') {
+    if (animFrame !== null && typeof cancelAnimationFrame !== 'undefined') {
       cancelAnimationFrame(animFrame);
       animFrame = null;
     }
+    if (pollTimer !== null) {
+      clearTimeout(pollTimer);
+      pollTimer = null;
+    }
+    resizeObs?.disconnect();
+    resizeObs = null;
     if (typeof document !== 'undefined') {
       document.documentElement.removeAttribute('data-g4a-player-waveform');
       if (mountedElement) {
         mountedElement.remove();
         mountedElement = null;
       }
+      mountedRefs = null;
       const center = document.querySelector('.main-nowPlayingBar-center');
       if (center) center.classList.remove('g4a-island-pinned');
     }
 
     if (typeof Spicetify !== 'undefined' && Spicetify.Player?.removeEventListener) {
-      Spicetify.Player.removeEventListener('songchange', syncPlayer);
-      Spicetify.Player.removeEventListener('onplaypause', syncPlayer);
+      Spicetify.Player.removeEventListener('songchange', onPlayerEvent);
+      Spicetify.Player.removeEventListener('onplaypause', onPlayerEvent);
     }
   }
 
