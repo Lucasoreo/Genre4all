@@ -6,7 +6,7 @@ const path = require('node:path');
 test('v1.12 & v1.13: cells(), Mix Mode full-width protection, CSS/layout self-heal, and player waveform integration', () => {
   const runtimeSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'runtime.js'), 'utf8');
   assert.ok(runtimeSource.includes("if (c.tagName === 'GENRE4ALL-COLUMN' || isFullWidthCell(c) || !c.matches(CELL)"));
-  assert.ok(runtimeSource.includes("version: '1.13.0'"));
+  assert.ok(runtimeSource.includes(`version: '${require('../package.json').version}'`));
   assert.ok(runtimeSource.includes("function isFullWidthCell(c)"));
   assert.ok(runtimeSource.includes("PoSfoROJK6lwVe6ZtR0U"));
   assert.ok(runtimeSource.includes("trackListRowFullWidthCell"));

@@ -105,7 +105,9 @@ test('Genre4allPlayerWaveform: parseAudioAnalysis builds clean metadata model', 
   assert.equal(parsed.duration, 386400);
   assert.equal(parsed.tempo, 129);
   assert.equal(parsed.keyLabel, 'F minor');
-  assert.equal(parsed.bars.length, 180);
+  assert.equal(parsed.bars.length, 1024);
+  assert.equal(parsed.body.length, parsed.bars.length);
+  assert.equal(parsed.available, true);
 });
 
 test('Genre4allPlayerWaveform: toggles enabled state and persists in storage', () => {
@@ -119,5 +121,59 @@ test('Genre4allPlayerWaveform: toggles enabled state and persists in storage', (
   } finally {
     Genre4allPlayerWaveform.setEnabled(original);
   }
+});
+
+test('wave envelope preserves real attacks, quiet sections, silence, and bounded memory', () => {
+  const waveform = Genre4allPlayerWaveform.buildWaveformEnvelope(10000, [
+    { start: 0, duration: 2, loudness_start: -45, loudness_max: -30, loudness_max_time: .2, loudness_end: -42 },
+    { start: 2, duration: 2, loudness_start: -30, loudness_max: -3, loudness_max_time: .05, loudness_end: -24 },
+    { start: 4, duration: 2, loudness_start: -65, loudness_max: -62, loudness_max_time: .1, loudness_end: -70 },
+    { start: 8, duration: 2, loudness_start: -40, loudness_max: -32, loudness_max_time: .3, loudness_end: -45 }
+  ], 1000);
+  assert.equal(waveform.available, true);
+  assert.ok(Math.max(...waveform.peaks.slice(200, 400)) > Math.max(...waveform.peaks.slice(0, 200)) * 3);
+  assert.equal(Math.max(...waveform.peaks.slice(400, 800)), 0, 'silence and missing segments stay silent');
+  assert.ok(waveform.peaks[205] > waveform.body[205], 'short attack remains distinct from integrated body');
+  assert.ok([...waveform.peaks].every((p, i) => Number.isFinite(p) && p >= 0 && p <= 1 && waveform.body[i] <= p));
+  assert.equal(Genre4allPlayerWaveform.buildWaveformEnvelope(10000, [], Infinity).peaks.length, 180);
+  assert.equal(Genre4allPlayerWaveform.buildWaveformEnvelope(10000, [], 999999).peaks.length, 4096);
+});
+
+test('missing or malformed audio never invents a musical arrangement', () => {
+  for (const raw of [null, {}, { track: { duration: -1 }, segments: [{ start: NaN }] }, { track: { duration: 10 } }]) {
+    const parsed = Genre4allPlayerWaveform.parseAudioAnalysis(raw, 'spotify:track:test');
+    assert.equal(parsed.available, false);
+    assert.equal(Math.max(...parsed.bars), 0);
+    assert.deepEqual(parsed.regions, []);
+  }
+});
+
+test('section summaries use supplied boundaries and describe energy without claiming instrument detection', () => {
+  const body = Float32Array.from({ length: 100 }, (_, i) => i < 50 ? .2 : .8);
+  const result = Genre4allPlayerWaveform.summarizeSections([
+    { start: 5, duration: 5, confidence: .9 }, { start: 0, duration: 5, confidence: .9 },
+    { start: 4, duration: 1, confidence: .1 }, { start: 11, duration: 2 }
+  ], 10000, body);
+  assert.deepEqual(result.map(r => [r.start, r.duration, r.description]), [[0, 5, 'Energia baixa'], [5, 5, 'Energia alta']]);
+  const rise = Genre4allPlayerWaveform.summarizeSections([{ start: 0, duration: 10 }], 10000, Float32Array.from({ length: 100 }, (_, i) => i / 100));
+  assert.equal(rise[0].description, 'Energia crescente');
+});
+
+test('audio analysis requests are deduplicated and cache only compact waveform data', async () => {
+  const original = global.Spicetify;
+  let requests = 0, finish;
+  global.Spicetify = { getAudioData: async () => { requests++; return new Promise(resolve => { finish = resolve; }); } };
+  try {
+    const first = Genre4allPlayerWaveform.fetchAudioAnalysis('spotify:track:dedup');
+    const second = Genre4allPlayerWaveform.fetchAudioAnalysis('spotify:track:dedup');
+    assert.equal(requests, 1);
+    finish({ track: { duration: 10 }, segments: [{ start: 0, duration: 10, loudness_max: -10 }] });
+    const [a, b] = await Promise.all([first, second]);
+    assert.equal(a, b);
+    assert.equal(a.segments, undefined);
+    assert.equal((await Genre4allPlayerWaveform.fetchAudioAnalysis('spotify:track:dedup')), a);
+    assert.equal(requests, 1);
+    assert.equal(await Genre4allPlayerWaveform.fetchAudioAnalysis('spotify:local:artist:song'), null);
+  } finally { global.Spicetify = original; }
 });
 

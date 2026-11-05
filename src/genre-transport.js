@@ -251,13 +251,13 @@ const Genre4allTransport = (() => {
         params.set('token', token);
       }
     }
-    function pickBest(identity, results) {
-      if (!Array.isArray(results) || !results.length) return null;
+    function scoreCandidates(identity, results) {
+      if (!Array.isArray(results) || !results.length) return [];
       const targetTitle = normText(identity.title);
       const targetClean = normText(cleanSearchTitle(identity.title));
       const targetAlbum = normText(cleanSearchTitle(identity.album));
       const targetArtists = (identity.artists || []).map(a => normText(String(a).replace(/\s*\(\d+\)$/u, ''))).filter(Boolean);
-      let best = null, bestScore = -1;
+      const scored = [];
       for (const item of results) {
         const genres = Array.isArray(item?.genre) ? item.genre.filter(Boolean) : [];
         const styles = Array.isArray(item?.style) ? item.style.filter(Boolean) : [];
@@ -277,9 +277,38 @@ const Genre4allTransport = (() => {
         if (item.type === 'master') score += 15;
         if (genres.length) score += 10;
         if (styles.length) score += 5;
-        if (score > bestScore) { bestScore = score; best = item; }
+        scored.push({ item, score, genres, styles });
       }
-      return best;
+      return scored.map((c, i) => ({ ...c, i })).sort((a, b) => (b.score - a.score) || (a.i - b.i));
+    }
+    function rankByVotes(candidates, field, bestList) {
+      const votes = new Map();
+      for (const c of candidates) {
+        c[field].forEach((name, idx) => {
+          const k = normText(name);
+          if (!k) return;
+          const weight = c.score / (1 + idx * 0.35);
+          const prev = votes.get(k);
+          if (prev) prev.votes += weight;
+          else votes.set(k, { name, votes: weight });
+        });
+      }
+      const bestOrder = new Map(bestList.map((n, i) => [normText(n), i]));
+      return [...votes.entries()]
+        .sort((a, b) => (b[1].votes - a[1].votes) || ((bestOrder.get(a[0]) ?? 99) - (bestOrder.get(b[0]) ?? 99)))
+        .slice(0, 8)
+        .map(([, v]) => v.name);
+    }
+    function pickBest(identity, results) {
+      const ranked = scoreCandidates(identity, results);
+      if (!ranked.length) return null;
+      const top = ranked[0];
+      const strong = ranked.filter(c => c.score >= top.score - 15).slice(0, 6);
+      return {
+        item: top.item,
+        genres: rankByVotes(strong, 'genres', top.genres),
+        styles: rankByVotes(strong, 'styles', top.styles)
+      };
     }
     const adapter = async (identity, signal, runStep) => {
       if (signal?.aborted) throw new api.GenreError('cancelled', 'CANCELLED');
@@ -306,11 +335,11 @@ const Genre4allTransport = (() => {
       }
       if (!best) return null;
       return {
-        genres: Array.isArray(best.genre) ? best.genre : [],
-        styles: Array.isArray(best.style) ? best.style : [],
-        entityType: best.type || 'release',
-        entityId: String(best.id || ''),
-        sourceUrl: best.uri ? new URL(best.uri, 'https://www.discogs.com').href : 'https://www.discogs.com'
+        genres: best.genres,
+        styles: best.styles,
+        entityType: best.item.type || 'release',
+        entityId: String(best.item.id || ''),
+        sourceUrl: best.item.uri ? new URL(best.item.uri, 'https://www.discogs.com').href : 'https://www.discogs.com'
       };
     };
     adapter.isConfigured = () => {

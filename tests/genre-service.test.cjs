@@ -52,8 +52,8 @@ test('Discogs priority short-circuits MusicBrainz and Spotify, placing main genr
   assert.equal(result.selectedProvider, 'discogs');
   assert.equal(mbCalls, 0, 'MusicBrainz must not be called when Discogs succeeds');
   assert.equal(spCalls, 0, 'Spotify must not be called when Discogs succeeds');
-  assert.deepEqual(result.labels.map(l => l.label), ['Electronic', 'Rock', 'Synth-pop', 'Indie Rock']);
-  assert.deepEqual(result.labels.map(l => l.kind), ['genre', 'genre', 'style', 'style']);
+  assert.deepEqual(result.labels.map(l => l.label), ['Synth-pop', 'Electronic', 'Rock', 'Indie Rock'], 'Specific Discogs style is promoted as primary over generic Electronic');
+  assert.deepEqual(result.labels.map(l => l.kind), ['style', 'genre', 'genre', 'style']);
   assert.ok(result.labels.every(l => l.provider === 'discogs'));
   service.close();
 });
@@ -491,4 +491,63 @@ test('v1.11: Discogs missing CORS rate-limit header does not block subsequent tr
   const decoded = decodeCompactCache(txt, time);
   assert.equal(decoded.size, entriesMap.size);
   service.close();
+});
+
+test('pinGenre moves clicked secondary genre or style to primary position and persists in storage across reloads', async () => {
+  const store = storage();
+  const service1 = api.createService({
+    storage: store,
+    discogs: Object.assign(
+      async () => ({ genres: ['Electronic'], styles: ['Tech House', 'Minimal'] }),
+      { isConfigured: () => true }
+    )
+  });
+  const initial = await service1.resolve(TRACK);
+  assert.equal(initial.status, 'success');
+  assert.deepEqual(initial.labels.map(l => l.label), ['Tech House', 'Electronic', 'Minimal']);
+
+  const pinnedResult = await service1.pinGenre(TRACK, 'Minimal');
+  assert.equal(pinnedResult.labels[0].label, 'Minimal');
+  assert.equal(pinnedResult.labels[0].pinned, true);
+  assert.deepEqual(pinnedResult.labels.map(l => l.label), ['Minimal', 'Tech House', 'Electronic']);
+  service1.close();
+
+  // Reload a new service instance backed by the same persistent storage
+  const service2 = api.createService({
+    storage: store,
+    discogs: Object.assign(
+      async () => ({ genres: ['Electronic'], styles: ['Tech House', 'Minimal'] }),
+      { isConfigured: () => true }
+    )
+  });
+  const reloaded = await service2.resolve(TRACK);
+  assert.equal(reloaded.labels[0].label, 'Minimal');
+  assert.equal(reloaded.labels[0].pinned, true);
+  assert.deepEqual(reloaded.labels.map(l => l.label), ['Minimal', 'Tech House', 'Electronic']);
+  service2.close();
+});
+
+test('Discogs: specific subgenres (Electro, Techno) are promoted over generic Electronic while skipping vague descriptors', async () => {
+  const service = api.createService({
+    storage: storage(),
+    discogsInterval: 1,
+    discogs: async () => ({ genres: ['Electronic', 'Pop'], styles: ['Vocal', 'Electro', 'Techno'] })
+  });
+  const r = await service.resolve(TRACK);
+  assert.deepEqual(r.labels.map(l => l.label), ['Electro', 'Electronic', 'Pop', 'Vocal', 'Techno']);
+  service.close();
+
+  const adapter = createDiscogsAdapter(api, () => ({ discogsToken: 't' }), async () => ({
+    ok: true, status: 200, headers: { get: () => null },
+    async json() {
+      return { results: [
+        { id: 1, type: 'release', title: 'Artist A - Real Thing', genre: ['Electronic'], style: ['House', 'Techno'] },
+        { id: 2, type: 'master', title: 'Artist A - Real Thing', genre: ['Electronic'], style: ['Techno', 'Electro'] },
+        { id: 3, type: 'release', title: 'Artist A - Real Thing', genre: ['Electronic'], style: ['Techno'] }
+      ] };
+    }
+  }));
+  const d = await adapter(api.identityFor(TRACK));
+  assert.equal(d.styles[0], 'Techno', 'Consensus specific style across matching releases is ranked first');
+  assert.equal(d.entityId, '2');
 });

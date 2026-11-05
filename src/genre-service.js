@@ -78,6 +78,33 @@ const Genre4allGenres = (() => {
     }
     return [...genres, ...styles];
   }
+  // Discogs top-level genres are broad umbrella categories (Electronic, Pop, Rock...).
+  // Promote the most specific style/subgenre (Electro, Techno, Deep House...) to primary
+  // while keeping the umbrella genre in the expandable list.
+  const VAGUE_STYLES = new Set(['vocal', 'instrumental', 'ballad', 'novelty', 'soundtrack', 'score', 'theme', 'spoken word', 'interview', 'comedy', 'dialogue', 'medley', 'education', 'field recording', 'promotional', 'non-music']);
+  const UMBRELLA_GENRES = new Set(['electronic', 'eletronica', 'eletrônica', 'electronica', 'pop', 'rock', 'hip hop', 'hip-hop', 'funk / soul', 'latin', 'jazz', 'reggae', 'classical', 'blues', 'folk, world, & country', 'stage & screen', 'non-music']);
+  function promoteSpecificPrimary(values) {
+    if (!Array.isArray(values) || values.length < 2) return values;
+    const genres = [], styles = [];
+    for (const label of values) {
+      if (label.kind === 'genre') genres.push(label);
+      else styles.push(label);
+    }
+    if (styles.length) {
+      const bestStyle = styles.find(s => !VAGUE_STYLES.has(s.key) && !UMBRELLA_GENRES.has(s.key));
+      if (bestStyle) return [bestStyle, ...genres, ...styles.filter(s => s !== bestStyle)];
+    }
+    if (genres.length > 1 && UMBRELLA_GENRES.has(genres[0].key)) {
+      const specificGenre = genres.find(g => !UMBRELLA_GENRES.has(g.key) && !VAGUE_STYLES.has(g.key));
+      if (specificGenre) return [specificGenre, ...genres.filter(g => g !== specificGenre), ...styles];
+    }
+    return [...genres, ...styles];
+  }
+  function orderProviderLabels(provider, values) {
+    if (provider === 'spotify') return values;
+    const sorted = sortLabelsByKind(values);
+    return provider === 'discogs' ? promoteSpecificPrimary(sorted) : sorted;
+  }
   function identityFor(track) {
     const t = track && typeof track === 'object' ? track : {};
     const metadata = t.metadata || {};
@@ -284,7 +311,47 @@ const Genre4allGenres = (() => {
   function createService(options = {}) {
     const now = options.now || (() => Date.now());
     const storage = options.storage || { async get() {}, async set() {}, async remove() {}, async clear() {}, async entries() { return []; } };
-    const providerCache = new Map(), resolved = new Map(), inflight = new Map();
+    const providerCache = new Map(), resolved = new Map(), inflight = new Map(), pinnedGenres = new Map();
+    const PINNED_STORAGE_KEY = 'genre4all-pinned-genres-v1';
+    try {
+      const rawPinned = globalThis.localStorage?.getItem?.(PINNED_STORAGE_KEY);
+      if (rawPinned) {
+        for (const line of rawPinned.split('\n')) {
+          const tab = line.indexOf('\t');
+          if (tab > 0) pinnedGenres.set(line.slice(0, tab), line.slice(tab + 1));
+        }
+      }
+    } catch { /* Ignore localStorage read errors. */ }
+    function persistPinnedGenres() {
+      while (pinnedGenres.size > CACHE_LIMIT) pinnedGenres.delete(pinnedGenres.keys().next().value);
+      const obj = Object.fromEntries(pinnedGenres);
+      write('settings', 'genre-pinned-v1', obj);
+      try {
+        const txt = [...pinnedGenres.entries()].map(([k, v]) => `${String(k).replace(/[\t\n\r]/gu, ' ')}\t${String(v).replace(/[\t\n\r]/gu, ' ')}`).join('\n');
+        globalThis.localStorage?.setItem?.(PINNED_STORAGE_KEY, txt);
+      } catch { /* Ignore quota errors. */ }
+    }
+    function getPinnedKey(identity) {
+      if (!identity) return null;
+      return (identity.uri && pinnedGenres.get(identity.uri)) || (identity.key && pinnedGenres.get(identity.key)) || null;
+    }
+    function applyPinnedOrder(labels, identity) {
+      if (!Array.isArray(labels) || !labels.length) return labels;
+      const pKey = getPinnedKey(identity);
+      if (!pKey) return labels;
+      const idx = labels.findIndex(l => l.key === pKey);
+      if (idx < 0) return labels;
+      const next = labels.map((l, i) => {
+        if (i === idx) return { ...l, pinned: true };
+        if (l.pinned) { const copy = { ...l }; delete copy.pinned; return copy; }
+        return l;
+      });
+      if (idx > 0) {
+        const [picked] = next.splice(idx, 1);
+        next.unshift(picked);
+      }
+      return next;
+    }
     const intervals = { discogs: options.discogsInterval ?? 1100, musicbrainz: options.musicbrainzInterval ?? 1150, spotify: options.spotifyInterval ?? 25 };
     const limiters = Object.fromEntries(PROVIDERS.map(p => [p, createLimiter(intervals[p] ?? 25, { now, wait: options.wait, maxQueue: 256 })]));
     let config = defaultConfig(), revision = 1, closed = false;
@@ -296,6 +363,12 @@ const Genre4allGenres = (() => {
       const savedConfig = await storage.get('settings', 'genre-selector-v1');
       config = configFrom(savedConfig);
       if (savedConfig && savedConfig.version !== config.version) write('settings', 'genre-selector-v1', config);
+      const savedPinned = await storage.get('settings', 'genre-pinned-v1');
+      if (savedPinned && typeof savedPinned === 'object') {
+        for (const [k, v] of Object.entries(savedPinned)) {
+          if (typeof k === 'string' && typeof v === 'string' && v && !pinnedGenres.has(k)) pinnedGenres.set(k, v);
+        }
+      }
       for (const [id, entry] of await storage.entries('cache')) {
         if (entry?.version === CACHE_VERSION && entry.value && typeof entry.value === 'object' && Number.isFinite(entry.expiresAt) && entry.expiresAt > now() && PROVIDERS.some(p => id.startsWith(`provider:${p}:`))) {
           providerCache.set(id, entry);
@@ -422,7 +495,7 @@ const Genre4allGenres = (() => {
           styleLabels[0].kind = 'genre';
         }
       }
-      const labels = sortLabelsByKind(dedupeLabels([...genreLabels, ...styleLabels]));
+      const labels = orderProviderLabels('discogs', dedupeLabels([...genreLabels, ...styleLabels]));
       return response('discogs', labels.length ? 'success' : 'empty', labels, {
         entityType: data.entityType || 'release',
         entityId: data.entityId || identity.key,
@@ -534,7 +607,7 @@ const Genre4allGenres = (() => {
         if (!r || r.provider !== provider || !STATUSES.includes(r.status) || !Array.isArray(r.labels)) throw new GenreError('error', 'PROVIDER_CONTRACT_INVALID');
         if (r.status === 'success' && !r.labels.length) throw new GenreError('error', 'PROVIDER_EMPTY_SUCCESS');
         const labels = r.labels.map(l => ({ ...l, provider: l.provider || provider }));
-        const orderedLabels = provider === 'spotify' ? labels : sortLabelsByKind(labels);
+        const orderedLabels = orderProviderLabels(provider, labels);
         const result = { ...r, labels: orderedLabels, dependencies: [] };
         if (['success', 'empty', 'no_match'].includes(r.status)) await cachePut(providerCache, id, result, r.expiresAt || now() + (TTL[provider] || HOUR));
         return result;
@@ -544,7 +617,7 @@ const Genre4allGenres = (() => {
       const filtered = rawLabels
         .map(l => ({ ...l, provider: l.provider || provider }))
         .filter(l => (l.kinds || [l.kind]).some(kind => kind === 'style' ? policy.showStyles : policy.showGenres));
-      return provider === 'spotify' ? filtered : sortLabelsByKind(filtered);
+      return orderProviderLabels(provider, filtered);
     }
     async function resolve(track, { signal, onPreview } = {}) {
       try { await ready; await cacheMutation; } catch { return { ...failure(null, new GenreError('error', 'STORAGE_UNAVAILABLE')), configVersion: revision, attempts: [] }; }
@@ -581,7 +654,7 @@ const Genre4allGenres = (() => {
               if (spRaw.status === 'success' && spLabels.length) {
                 onPreview({
                   ...spRaw,
-                  labels: dedupeLabels(spLabels),
+                  labels: applyPinnedOrder(dedupeLabels(spLabels), identity),
                   selectedProvider: 'spotify',
                   isPreview: true,
                   configVersion: currentRevision
@@ -668,6 +741,9 @@ const Genre4allGenres = (() => {
                 : { status: 'empty', reason: 'ALL_SOURCES_EMPTY', labels: [], selectedProvider: null };
             }
           }
+          if (Array.isArray(final.labels) && final.labels.length) {
+            final = { ...final, labels: applyPinnedOrder(final.labels, identity) };
+          }
           const retryTimes = attempts.filter(r => ['rate_limited', 'error'].includes(r.status) && Number.isFinite(r.retryAt) && r.retryAt > now()).map(r => r.retryAt);
           const validExpiries = [...attempts.map(r => r.expiresAt).filter(Number.isFinite), ...retryTimes];
           const baseExpiry = Number.isFinite(final.expiresAt) ? final.expiresAt : (validExpiries.length ? Math.min(...validExpiries) : now() + HOUR);
@@ -689,6 +765,39 @@ const Genre4allGenres = (() => {
       getConfig: () => clone(config),
       get revision() { return revision; },
       onChange(fn) { changes.add(fn); return () => changes.delete(fn); },
+      getPinnedGenre(track) {
+        return getPinnedKey(identityFor(track));
+      },
+      async pinGenre(track, labelOrKey) {
+        await ready;
+        const targetKey = key(typeof labelOrKey === 'string' ? labelOrKey : (labelOrKey?.key || labelOrKey?.label || ''));
+        if (!targetKey) return null;
+        const identity = identityFor(track);
+        if (identity.key) pinnedGenres.set(identity.key, targetKey);
+        if (identity.uri && identity.uri.startsWith('spotify:track:')) pinnedGenres.set(identity.uri, targetKey);
+        persistPinnedGenres();
+
+        for (const p of PROVIDERS) {
+          const cacheKey = p === 'spotify' && identity.uri.startsWith('spotify:track:') ? identity.uri : identity.key;
+          const cacheId = `provider:${p}:${cacheKey}`;
+          const entry = providerCache.get(cacheId);
+          if (entry?.value?.labels?.some(l => l.key === targetKey)) {
+            const updatedValue = { ...entry.value, labels: applyPinnedOrder(entry.value.labels, identity) };
+            await cachePut(providerCache, cacheId, updatedValue, entry.expiresAt);
+          }
+        }
+
+        const resId = `${identity.key}:${revision}`;
+        const cachedRes = resolved.get(resId);
+        if (cachedRes?.labels?.length) {
+          const updatedRes = { ...cachedRes, labels: applyPinnedOrder(cachedRes.labels, identity) };
+          resolved.set(resId, updatedRes);
+          notify();
+          return clone(updatedRes);
+        }
+        notify();
+        return null;
+      },
       async configure(patch) {
         await ready;
         const next = configFrom({ ...config, ...patch, enabled: { ...config.enabled, ...patch.enabled } });

@@ -1,5 +1,5 @@
 /*
-Genre4all 1.0.0 — standalone Spicetify genre column.
+Genre4all 1.14.0 — standalone Spicetify genre column.
 Adapted from Lucasoreo/Sort-Play-2 @ c1fc205bccfd4200ad0660c75e55e8d138155936.
 
 MIT License
@@ -106,6 +106,33 @@ const Genre4allGenres = (() => {
       else styles.push(label);
     }
     return [...genres, ...styles];
+  }
+  // Discogs top-level genres are broad umbrella categories (Electronic, Pop, Rock...).
+  // Promote the most specific style/subgenre (Electro, Techno, Deep House...) to primary
+  // while keeping the umbrella genre in the expandable list.
+  const VAGUE_STYLES = new Set(['vocal', 'instrumental', 'ballad', 'novelty', 'soundtrack', 'score', 'theme', 'spoken word', 'interview', 'comedy', 'dialogue', 'medley', 'education', 'field recording', 'promotional', 'non-music']);
+  const UMBRELLA_GENRES = new Set(['electronic', 'eletronica', 'eletrônica', 'electronica', 'pop', 'rock', 'hip hop', 'hip-hop', 'funk / soul', 'latin', 'jazz', 'reggae', 'classical', 'blues', 'folk, world, & country', 'stage & screen', 'non-music']);
+  function promoteSpecificPrimary(values) {
+    if (!Array.isArray(values) || values.length < 2) return values;
+    const genres = [], styles = [];
+    for (const label of values) {
+      if (label.kind === 'genre') genres.push(label);
+      else styles.push(label);
+    }
+    if (styles.length) {
+      const bestStyle = styles.find(s => !VAGUE_STYLES.has(s.key) && !UMBRELLA_GENRES.has(s.key));
+      if (bestStyle) return [bestStyle, ...genres, ...styles.filter(s => s !== bestStyle)];
+    }
+    if (genres.length > 1 && UMBRELLA_GENRES.has(genres[0].key)) {
+      const specificGenre = genres.find(g => !UMBRELLA_GENRES.has(g.key) && !VAGUE_STYLES.has(g.key));
+      if (specificGenre) return [specificGenre, ...genres.filter(g => g !== specificGenre), ...styles];
+    }
+    return [...genres, ...styles];
+  }
+  function orderProviderLabels(provider, values) {
+    if (provider === 'spotify') return values;
+    const sorted = sortLabelsByKind(values);
+    return provider === 'discogs' ? promoteSpecificPrimary(sorted) : sorted;
   }
   function identityFor(track) {
     const t = track && typeof track === 'object' ? track : {};
@@ -313,7 +340,47 @@ const Genre4allGenres = (() => {
   function createService(options = {}) {
     const now = options.now || (() => Date.now());
     const storage = options.storage || { async get() {}, async set() {}, async remove() {}, async clear() {}, async entries() { return []; } };
-    const providerCache = new Map(), resolved = new Map(), inflight = new Map();
+    const providerCache = new Map(), resolved = new Map(), inflight = new Map(), pinnedGenres = new Map();
+    const PINNED_STORAGE_KEY = 'genre4all-pinned-genres-v1';
+    try {
+      const rawPinned = globalThis.localStorage?.getItem?.(PINNED_STORAGE_KEY);
+      if (rawPinned) {
+        for (const line of rawPinned.split('\n')) {
+          const tab = line.indexOf('\t');
+          if (tab > 0) pinnedGenres.set(line.slice(0, tab), line.slice(tab + 1));
+        }
+      }
+    } catch { /* Ignore localStorage read errors. */ }
+    function persistPinnedGenres() {
+      while (pinnedGenres.size > CACHE_LIMIT) pinnedGenres.delete(pinnedGenres.keys().next().value);
+      const obj = Object.fromEntries(pinnedGenres);
+      write('settings', 'genre-pinned-v1', obj);
+      try {
+        const txt = [...pinnedGenres.entries()].map(([k, v]) => `${String(k).replace(/[\t\n\r]/gu, ' ')}\t${String(v).replace(/[\t\n\r]/gu, ' ')}`).join('\n');
+        globalThis.localStorage?.setItem?.(PINNED_STORAGE_KEY, txt);
+      } catch { /* Ignore quota errors. */ }
+    }
+    function getPinnedKey(identity) {
+      if (!identity) return null;
+      return (identity.uri && pinnedGenres.get(identity.uri)) || (identity.key && pinnedGenres.get(identity.key)) || null;
+    }
+    function applyPinnedOrder(labels, identity) {
+      if (!Array.isArray(labels) || !labels.length) return labels;
+      const pKey = getPinnedKey(identity);
+      if (!pKey) return labels;
+      const idx = labels.findIndex(l => l.key === pKey);
+      if (idx < 0) return labels;
+      const next = labels.map((l, i) => {
+        if (i === idx) return { ...l, pinned: true };
+        if (l.pinned) { const copy = { ...l }; delete copy.pinned; return copy; }
+        return l;
+      });
+      if (idx > 0) {
+        const [picked] = next.splice(idx, 1);
+        next.unshift(picked);
+      }
+      return next;
+    }
     const intervals = { discogs: options.discogsInterval ?? 1100, musicbrainz: options.musicbrainzInterval ?? 1150, spotify: options.spotifyInterval ?? 25 };
     const limiters = Object.fromEntries(PROVIDERS.map(p => [p, createLimiter(intervals[p] ?? 25, { now, wait: options.wait, maxQueue: 256 })]));
     let config = defaultConfig(), revision = 1, closed = false;
@@ -325,6 +392,12 @@ const Genre4allGenres = (() => {
       const savedConfig = await storage.get('settings', 'genre-selector-v1');
       config = configFrom(savedConfig);
       if (savedConfig && savedConfig.version !== config.version) write('settings', 'genre-selector-v1', config);
+      const savedPinned = await storage.get('settings', 'genre-pinned-v1');
+      if (savedPinned && typeof savedPinned === 'object') {
+        for (const [k, v] of Object.entries(savedPinned)) {
+          if (typeof k === 'string' && typeof v === 'string' && v && !pinnedGenres.has(k)) pinnedGenres.set(k, v);
+        }
+      }
       for (const [id, entry] of await storage.entries('cache')) {
         if (entry?.version === CACHE_VERSION && entry.value && typeof entry.value === 'object' && Number.isFinite(entry.expiresAt) && entry.expiresAt > now() && PROVIDERS.some(p => id.startsWith(`provider:${p}:`))) {
           providerCache.set(id, entry);
@@ -451,7 +524,7 @@ const Genre4allGenres = (() => {
           styleLabels[0].kind = 'genre';
         }
       }
-      const labels = sortLabelsByKind(dedupeLabels([...genreLabels, ...styleLabels]));
+      const labels = orderProviderLabels('discogs', dedupeLabels([...genreLabels, ...styleLabels]));
       return response('discogs', labels.length ? 'success' : 'empty', labels, {
         entityType: data.entityType || 'release',
         entityId: data.entityId || identity.key,
@@ -563,7 +636,7 @@ const Genre4allGenres = (() => {
         if (!r || r.provider !== provider || !STATUSES.includes(r.status) || !Array.isArray(r.labels)) throw new GenreError('error', 'PROVIDER_CONTRACT_INVALID');
         if (r.status === 'success' && !r.labels.length) throw new GenreError('error', 'PROVIDER_EMPTY_SUCCESS');
         const labels = r.labels.map(l => ({ ...l, provider: l.provider || provider }));
-        const orderedLabels = provider === 'spotify' ? labels : sortLabelsByKind(labels);
+        const orderedLabels = orderProviderLabels(provider, labels);
         const result = { ...r, labels: orderedLabels, dependencies: [] };
         if (['success', 'empty', 'no_match'].includes(r.status)) await cachePut(providerCache, id, result, r.expiresAt || now() + (TTL[provider] || HOUR));
         return result;
@@ -573,7 +646,7 @@ const Genre4allGenres = (() => {
       const filtered = rawLabels
         .map(l => ({ ...l, provider: l.provider || provider }))
         .filter(l => (l.kinds || [l.kind]).some(kind => kind === 'style' ? policy.showStyles : policy.showGenres));
-      return provider === 'spotify' ? filtered : sortLabelsByKind(filtered);
+      return orderProviderLabels(provider, filtered);
     }
     async function resolve(track, { signal, onPreview } = {}) {
       try { await ready; await cacheMutation; } catch { return { ...failure(null, new GenreError('error', 'STORAGE_UNAVAILABLE')), configVersion: revision, attempts: [] }; }
@@ -610,7 +683,7 @@ const Genre4allGenres = (() => {
               if (spRaw.status === 'success' && spLabels.length) {
                 onPreview({
                   ...spRaw,
-                  labels: dedupeLabels(spLabels),
+                  labels: applyPinnedOrder(dedupeLabels(spLabels), identity),
                   selectedProvider: 'spotify',
                   isPreview: true,
                   configVersion: currentRevision
@@ -697,6 +770,9 @@ const Genre4allGenres = (() => {
                 : { status: 'empty', reason: 'ALL_SOURCES_EMPTY', labels: [], selectedProvider: null };
             }
           }
+          if (Array.isArray(final.labels) && final.labels.length) {
+            final = { ...final, labels: applyPinnedOrder(final.labels, identity) };
+          }
           const retryTimes = attempts.filter(r => ['rate_limited', 'error'].includes(r.status) && Number.isFinite(r.retryAt) && r.retryAt > now()).map(r => r.retryAt);
           const validExpiries = [...attempts.map(r => r.expiresAt).filter(Number.isFinite), ...retryTimes];
           const baseExpiry = Number.isFinite(final.expiresAt) ? final.expiresAt : (validExpiries.length ? Math.min(...validExpiries) : now() + HOUR);
@@ -718,6 +794,39 @@ const Genre4allGenres = (() => {
       getConfig: () => clone(config),
       get revision() { return revision; },
       onChange(fn) { changes.add(fn); return () => changes.delete(fn); },
+      getPinnedGenre(track) {
+        return getPinnedKey(identityFor(track));
+      },
+      async pinGenre(track, labelOrKey) {
+        await ready;
+        const targetKey = key(typeof labelOrKey === 'string' ? labelOrKey : (labelOrKey?.key || labelOrKey?.label || ''));
+        if (!targetKey) return null;
+        const identity = identityFor(track);
+        if (identity.key) pinnedGenres.set(identity.key, targetKey);
+        if (identity.uri && identity.uri.startsWith('spotify:track:')) pinnedGenres.set(identity.uri, targetKey);
+        persistPinnedGenres();
+
+        for (const p of PROVIDERS) {
+          const cacheKey = p === 'spotify' && identity.uri.startsWith('spotify:track:') ? identity.uri : identity.key;
+          const cacheId = `provider:${p}:${cacheKey}`;
+          const entry = providerCache.get(cacheId);
+          if (entry?.value?.labels?.some(l => l.key === targetKey)) {
+            const updatedValue = { ...entry.value, labels: applyPinnedOrder(entry.value.labels, identity) };
+            await cachePut(providerCache, cacheId, updatedValue, entry.expiresAt);
+          }
+        }
+
+        const resId = `${identity.key}:${revision}`;
+        const cachedRes = resolved.get(resId);
+        if (cachedRes?.labels?.length) {
+          const updatedRes = { ...cachedRes, labels: applyPinnedOrder(cachedRes.labels, identity) };
+          resolved.set(resId, updatedRes);
+          notify();
+          return clone(updatedRes);
+        }
+        notify();
+        return null;
+      },
       async configure(patch) {
         await ready;
         const next = configFrom({ ...config, ...patch, enabled: { ...config.enabled, ...patch.enabled } });
@@ -1047,13 +1156,13 @@ const Genre4allTransport = (() => {
         params.set('token', token);
       }
     }
-    function pickBest(identity, results) {
-      if (!Array.isArray(results) || !results.length) return null;
+    function scoreCandidates(identity, results) {
+      if (!Array.isArray(results) || !results.length) return [];
       const targetTitle = normText(identity.title);
       const targetClean = normText(cleanSearchTitle(identity.title));
       const targetAlbum = normText(cleanSearchTitle(identity.album));
       const targetArtists = (identity.artists || []).map(a => normText(String(a).replace(/\s*\(\d+\)$/u, ''))).filter(Boolean);
-      let best = null, bestScore = -1;
+      const scored = [];
       for (const item of results) {
         const genres = Array.isArray(item?.genre) ? item.genre.filter(Boolean) : [];
         const styles = Array.isArray(item?.style) ? item.style.filter(Boolean) : [];
@@ -1073,9 +1182,38 @@ const Genre4allTransport = (() => {
         if (item.type === 'master') score += 15;
         if (genres.length) score += 10;
         if (styles.length) score += 5;
-        if (score > bestScore) { bestScore = score; best = item; }
+        scored.push({ item, score, genres, styles });
       }
-      return best;
+      return scored.map((c, i) => ({ ...c, i })).sort((a, b) => (b.score - a.score) || (a.i - b.i));
+    }
+    function rankByVotes(candidates, field, bestList) {
+      const votes = new Map();
+      for (const c of candidates) {
+        c[field].forEach((name, idx) => {
+          const k = normText(name);
+          if (!k) return;
+          const weight = c.score / (1 + idx * 0.35);
+          const prev = votes.get(k);
+          if (prev) prev.votes += weight;
+          else votes.set(k, { name, votes: weight });
+        });
+      }
+      const bestOrder = new Map(bestList.map((n, i) => [normText(n), i]));
+      return [...votes.entries()]
+        .sort((a, b) => (b[1].votes - a[1].votes) || ((bestOrder.get(a[0]) ?? 99) - (bestOrder.get(b[0]) ?? 99)))
+        .slice(0, 8)
+        .map(([, v]) => v.name);
+    }
+    function pickBest(identity, results) {
+      const ranked = scoreCandidates(identity, results);
+      if (!ranked.length) return null;
+      const top = ranked[0];
+      const strong = ranked.filter(c => c.score >= top.score - 15).slice(0, 6);
+      return {
+        item: top.item,
+        genres: rankByVotes(strong, 'genres', top.genres),
+        styles: rankByVotes(strong, 'styles', top.styles)
+      };
     }
     const adapter = async (identity, signal, runStep) => {
       if (signal?.aborted) throw new api.GenreError('cancelled', 'CANCELLED');
@@ -1102,11 +1240,11 @@ const Genre4allTransport = (() => {
       }
       if (!best) return null;
       return {
-        genres: Array.isArray(best.genre) ? best.genre : [],
-        styles: Array.isArray(best.style) ? best.style : [],
-        entityType: best.type || 'release',
-        entityId: String(best.id || ''),
-        sourceUrl: best.uri ? new URL(best.uri, 'https://www.discogs.com').href : 'https://www.discogs.com'
+        genres: best.genres,
+        styles: best.styles,
+        entityType: best.item.type || 'release',
+        entityId: String(best.item.id || ''),
+        sourceUrl: best.item.uri ? new URL(best.item.uri, 'https://www.discogs.com').href : 'https://www.discogs.com'
       };
     };
     adapter.isConfigured = () => {
@@ -1373,12 +1511,12 @@ const Genre4allColumn = (() => {
   const CSS = `
     .g4a-genre-gridcell { min-width:0 !important; overflow:visible !important; }
     .g4a-genre-host { display:flex !important; align-items:center; justify-content:flex-start; width:100%; min-width:0; max-width:100%; height:100%; padding:0 3px; box-sizing:border-box; overflow:visible; font:12px/1.2 var(--font-family,CircularSp,sans-serif); }
-    .g4a-genre-chip { display:inline-block; flex:0 1 auto; min-width:0; max-width:100%; height:22px; box-sizing:border-box; border:none; border-radius:5px; padding:0 8px; font:700 12px/22px var(--font-family,CircularSp,sans-serif); letter-spacing:0.01em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; vertical-align:middle; color:var(--g4a-genre-ink,${INK}) !important; background:var(--g4a-genre-color,#ddd5e5); text-shadow:none; user-select:none; transition:box-shadow .5s ease,transform .18s cubic-bezier(.22,1,.36,1),filter .18s ease; }
+    .g4a-genre-chip { display:inline-block; flex:0 1 auto; min-width:0; max-width:100%; height:22px; box-sizing:border-box; border:none; border-radius:5px; padding:0 8px; font:700 12px/22px var(--font-family,CircularSp,sans-serif); letter-spacing:0.01em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; vertical-align:middle; color:var(--g4a-genre-ink,${INK}) !important; background:var(--g4a-genre-color,#ddd5e5); text-shadow:none; user-select:none; transition:transform .18s cubic-bezier(.22,1,.36,1),filter .18s ease; }
     .g4a-genre-chip[data-contrast="light"] { text-shadow:0 1px 1px rgba(0,0,0,.25); }
-    .g4a-genre-chip[data-provider="discogs"],.g4a-genre-fan .g4a-genre-chip[data-provider="discogs"] { border:1.5px solid rgb(255,255,255); line-height:19px; box-shadow:0 0 10px rgba(255,255,255,.78),0 0 3px rgba(255,255,255,.95); }
-    .g4a-genre-chip[data-provider="discogs"]:hover,.g4a-genre-chip[data-provider="discogs"]:focus-visible,.g4a-genre-fan .g4a-genre-chip[data-provider="discogs"]:hover { box-shadow:0 0 4px rgb(255,255,255),0 0 12px rgb(255,255,255),0 0 24px rgba(255,255,255,.92),0 0 44px rgba(255,255,255,.75); }
-    .g4a-genre-chip[data-provider="musicbrainz"],.g4a-genre-fan .g4a-genre-chip[data-provider="musicbrainz"] { border:1.5px solid transparent; line-height:19px; background:linear-gradient(var(--g4a-genre-color,#ddd5e5),var(--g4a-genre-color,#ddd5e5)) padding-box,linear-gradient(135deg,rgb(168,85,247) 0%,rgb(168,85,247) 48%,rgb(255,122,0) 52%,rgb(255,122,0) 100%) border-box; box-shadow:-2px -2px 9px rgba(168,85,247,.85),2px 2px 9px rgba(255,122,0,.85); }
-    .g4a-genre-chip[data-provider="musicbrainz"]:hover,.g4a-genre-chip[data-provider="musicbrainz"]:focus-visible,.g4a-genre-fan .g4a-genre-chip[data-provider="musicbrainz"]:hover { box-shadow:-1px -1px 4px rgb(168,85,247),-3px -3px 12px rgb(168,85,247),-5px -5px 24px rgba(168,85,247,.92),-8px -8px 42px rgba(168,85,247,.72),1px 1px 4px rgb(255,122,0),3px 3px 12px rgb(255,122,0),5px 5px 24px rgba(255,122,0,.92),8px 8px 42px rgba(255,122,0,.72); }
+    .g4a-genre-chip[data-provider="discogs"],.g4a-genre-fan .g4a-genre-chip[data-provider="discogs"] { border:1.5px solid rgb(255,255,255); line-height:19px; box-shadow:0 1px 4px rgba(0,0,0,.24); }
+    .g4a-genre-chip[data-provider="discogs"]:hover,.g4a-genre-chip[data-provider="discogs"]:focus-visible,.g4a-genre-fan .g4a-genre-chip[data-provider="discogs"]:hover { box-shadow:0 0 0 1px #ffffff50,0 2px 8px #0005; }
+    .g4a-genre-chip[data-provider="musicbrainz"],.g4a-genre-fan .g4a-genre-chip[data-provider="musicbrainz"] { border:1.5px solid transparent; line-height:19px; background:linear-gradient(var(--g4a-genre-color,#ddd5e5),var(--g4a-genre-color,#ddd5e5)) padding-box,linear-gradient(135deg,rgb(168,85,247) 0%,rgb(168,85,247) 48%,rgb(255,122,0) 52%,rgb(255,122,0) 100%) border-box; box-shadow:0 1px 4px rgba(0,0,0,.24); }
+    .g4a-genre-chip[data-provider="musicbrainz"]:hover,.g4a-genre-chip[data-provider="musicbrainz"]:focus-visible,.g4a-genre-fan .g4a-genre-chip[data-provider="musicbrainz"]:hover { box-shadow:-1px -1px 5px #a855f740,1px 1px 5px #ff7a0040; }
     .g4a-genre-primary[data-has-more="true"] { cursor:pointer; }
     .g4a-genre-primary:hover { filter:brightness(1.06); }
     .g4a-genre-state { color:var(--spice-subtext,#ddd); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:12px; }
@@ -1386,7 +1524,8 @@ const Genre4allColumn = (() => {
     .g4a-genre-host :focus-visible { outline:2px solid #7850a0; outline-offset:-2px; }
     .g4a-genre-fan { position:fixed; z-index:9999; display:flex; flex-direction:column; align-items:flex-start; gap:6px; margin:0; padding:4px 6px; list-style:none; pointer-events:auto; }
     .g4a-genre-fan[data-direction="up"] { flex-direction:column-reverse; }
-    .g4a-genre-fan .g4a-genre-chip { flex:none; width:max-content; max-width:min(320px,calc(100vw - 24px)); transform-origin:top left; will-change:transform,opacity; animation:g4a-domino-down var(--g4a-dur,320ms) cubic-bezier(.42,0,.2,1) both; animation-delay:var(--g4a-delay,0ms); }
+    .g4a-genre-fan .g4a-genre-chip { flex:none; width:max-content; max-width:min(320px,calc(100vw - 24px)); cursor:pointer; transform-origin:top left; animation:g4a-domino-down var(--g4a-dur,320ms) cubic-bezier(.42,0,.2,1) both; animation-delay:var(--g4a-delay,0ms); }
+    .g4a-genre-fan .g4a-genre-chip:hover,.g4a-genre-fan .g4a-genre-chip:focus-visible { filter:brightness(1.1); transform:translate3d(2px,0,0) scale(1.03); }
     .g4a-genre-fan .g4a-genre-chip[data-provider="spotify"] { box-shadow:0 8px 20px rgba(0,0,0,.48),0 2px 6px rgba(0,0,0,.32),inset 0 0 0 1px rgba(255,255,255,.14); }
     .g4a-genre-fan[data-direction="up"] .g4a-genre-chip { transform-origin:bottom left; animation-name:g4a-domino-up; }
     .g4a-genre-fan.g4a-genre-fan-closing .g4a-genre-chip { animation:g4a-domino-out 130ms cubic-bezier(.4,0,1,1) both; }
@@ -1406,6 +1545,7 @@ const Genre4allColumn = (() => {
       0% { opacity:1; transform:translate3d(0,0,0) scale(1); }
       100% { opacity:0; transform:translate3d(-2px,-8px,0) scale(.94); }
     }
+    @media (prefers-reduced-motion:reduce) { .g4a-genre-chip,.g4a-genre-fan .g4a-genre-chip { animation-duration:.01ms !important; animation-delay:0ms !important; transition-duration:.01ms !important; } }
     @media (forced-colors:active) { .g4a-genre-chip { forced-color-adjust:none; background:Canvas; color:CanvasText !important; border:1px solid CanvasText; } .g4a-genre-host :focus-visible { outline:2px solid Highlight; box-shadow:none; } }
   `;
   function createController(service, options) {
@@ -1487,11 +1627,43 @@ const Genre4allColumn = (() => {
       extra.forEach((label, i) => {
         const item = chip(label, 'li', defaultProvider, useColors);
         item.classList.add('g4a-genre-fan-chip');
+        item.tabIndex = 0;
+        item.title = 'Clique para fixar este gênero como principal';
+        item.setAttribute('aria-label', `Fixar ${label.label} como gênero principal`);
         const dur = Math.max(190, Math.round(320 * Math.pow(0.88, i)));
         item.style.setProperty('--g4a-i', String(i));
         item.style.setProperty('--g4a-delay', `${delay}ms`);
         item.style.setProperty('--g4a-dur', `${dur}ms`);
         delay += Math.max(24, Math.round(68 * Math.pow(0.78, i)));
+        const selectGenre = e => {
+          e.preventDefault();
+          e.stopPropagation();
+          for (const rec of records.values()) {
+            if ((rec.identityKey === r.identityKey || (r.uri && rec.uri === r.uri)) && Array.isArray(rec.result?.labels)) {
+              const idx = rec.result.labels.findIndex(l => l.key === label.key);
+              if (idx >= 0) {
+                const nextLabels = rec.result.labels.map((l, k) => {
+                  if (k === idx) return { ...l, pinned: true };
+                  if (l.pinned) { const copy = { ...l }; delete copy.pinned; return copy; }
+                  return l;
+                });
+                if (idx > 0) {
+                  const [picked] = nextLabels.splice(idx, 1);
+                  nextLabels.unshift(picked);
+                }
+                rec.result = { ...rec.result, labels: nextLabels };
+                render(rec);
+              }
+            }
+          }
+          closeFan(false);
+          service.pinGenre?.(r.track, label)?.catch?.(() => {});
+        };
+        item.addEventListener('click', selectGenre);
+        item.addEventListener('keydown', e => {
+          if (e.key === 'Enter' || e.key === ' ') selectGenre(e);
+          else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeFan(true); }
+        });
         fan.append(item);
       });
       const rect = anchor.getBoundingClientRect();
@@ -1631,6 +1803,10 @@ const Genre4allColumn = (() => {
           desired.add(cell);
           const previous = records.get(cell);
           if (previous && !closed && previous.revision === rev && previous.row === row && previous.context === context && previous.uri === uri && previous.cell.firstChild && options.isEnabled(cell, row)) {
+            if (uri.startsWith('spotify:track:') && (previous.track?.name || previous.track?.title || previous.state === 'success')) {
+              if (isExpired(previous)) expire(previous);
+              continue;
+            }
             const currentTrack = options.getTrack(row);
             if (currentTrack === previous.track || service.identityFor(currentTrack).key === previous.identityKey) {
               if (isExpired(previous)) expire(previous);
@@ -3209,6 +3385,9 @@ const Genre4allPlayerWaveform = (() => {
   const CAMELOT_MAJOR = ['8B', '3B', '10B', '5B', '12B', '7B', '2B', '9B', '4B', '11B', '6B', '1B'];
   const CAMELOT_MINOR = ['5A', '12A', '7A', '2A', '9A', '4A', '11A', '6A', '1A', '8A', '3A', '10A'];
   const MAX_CACHE_ENTRIES = 64;
+  const ANALYSIS_BARS = 1024;
+  const EMPTY_BARS = new Float32Array(180).fill(0.035);
+  const pendingAnalysis = new Map();
 
   const analysisCache = new Map();
   let enabled = false;
@@ -3218,14 +3397,15 @@ const Genre4allPlayerWaveform = (() => {
   let resizeObs = null;
   let animFrame = null;
   let pollTimer = null;
+  let islandHideTimer = null;
   let currentTrackUri = null;
   let currentAnalysis = null;
-  let fallbackBars = null;
-  let fallbackBarsUri = '';
   let isDragging = false;
   let dragRatio = 0;
   let hoverRatio = null;
   let lastSeekAt = 0;
+  let mountCleanup = null;
+  let analysisRevision = 0;
 
   try {
     enabled = localStorage.getItem(STORAGE_KEY) === 'true';
@@ -3265,7 +3445,7 @@ const Genre4allPlayerWaveform = (() => {
     }
     const seed = (hash >>> 0) / 4294967296;
 
-    const bpm = 126;
+    const bpm = 124 + Math.round(seed * 8);
     const beatIntervalSec = 60 / bpm;
     const dt = (durSec || 180) / barCount;
 
@@ -3273,402 +3453,434 @@ const Genre4allPlayerWaveform = (() => {
       const progress = i / barCount;
       const t = i * dt;
 
-      let energy = 0.3;
-      if (progress < 0.15) {
-        energy = 0.25 + progress * 1.6;
-      } else if (progress < 0.30) {
-        energy = 0.45 + (progress - 0.15) * 2.3;
-      } else if (progress < 0.55) {
-        energy = 0.85 + Math.sin((progress - 0.30) * 12) * 0.08;
-      } else if (progress < 0.70) {
-        energy = 0.22 + Math.sin((progress - 0.55) * 8) * 0.08;
-      } else if (progress < 0.82) {
-        energy = 0.45 + (progress - 0.70) * 3.8;
+      // Realistic DJ/Beatport track arrangement: intro -> build -> drop 1 -> breakdown -> drop 2 -> outro
+      let env = 0.28;
+      if (progress < 0.08) {
+        env = 0.16 + (progress / 0.08) * 0.24;
+      } else if (progress < 0.16) {
+        env = 0.40 + ((progress - 0.08) / 0.08) * 0.28;
+      } else if (progress < 0.54) {
+        env = 0.84 + Math.sin((progress - 0.16) * 28) * 0.07;
+      } else if (progress < 0.71) {
+        env = 0.22 + Math.sin((progress - 0.54) * 18) * 0.09;
+      } else if (progress < 0.91) {
+        env = 0.88 + Math.cos((progress - 0.71) * 24) * 0.06;
       } else {
-        energy = 0.88 - (progress - 0.82) * 2.4;
+        env = 0.45 * (1 - (progress - 0.91) / 0.09) + 0.10;
       }
 
       const beatPhase = (t % beatIntervalSec) / beatIntervalSec;
-      const isKick = beatPhase < 0.22;
-      const kickBoost = isKick ? 0.32 : -0.06;
+      const isKickSlot = (i % 2 === 0) || beatPhase < 0.26;
+      const n1 = Math.abs((Math.sin(i * 12.9898 + seed * 78.233) * 43758.5453) % 1);
+      const n2 = Math.abs((Math.cos(i * 39.3467 + seed * 19.173) * 27183.1923) % 1);
 
-      const noise = (Math.sin(i * 12.9898 + seed * 78.233) * 43758.5453) % 1;
-      const amp = energy * (0.75 + Math.abs(noise) * 0.25) + (energy > 0.4 ? kickBoost : 0);
-      bars[i] = Math.max(0.08, Math.min(1.0, amp));
-    }
-
-    return bars;
-  }
-
-  function generateWaveformBars(durationMs, segments, beats, sections, barCount = 180) {
-    if (barCount <= 0) barCount = 180;
-    const bars = new Float32Array(barCount);
-    const durSec = (durationMs || 180000) / 1000;
-    if (durSec <= 0) return bars;
-
-    const dt = durSec / barCount;
-    if (!segments || segments.length === 0) {
-      return generateProceduralBars(durSec, barCount);
-    }
-
-    let segIdx = 0;
-    let beatIdx = 0;
-
-    for (let i = 0; i < barCount; i++) {
-      const t0 = i * dt;
-      const t1 = (i + 1) * dt;
-      const tMid = (t0 + t1) / 2;
-
-      let maxLoudness = -60;
-      while (segIdx < segments.length && segments[segIdx].start + segments[segIdx].duration < t0) {
-        segIdx++;
-      }
-      let s = segIdx;
-      while (s < segments.length && segments[s].start <= t1) {
-        const seg = segments[s];
-        if (seg.loudness_max > maxLoudness) maxLoudness = seg.loudness_max;
-        s++;
-      }
-
-      if (maxLoudness === -60 && s > 0 && s < segments.length) {
-        maxLoudness = segments[s - 1].loudness_max;
-      }
-
-      const norm = Math.max(0, Math.min(1, (maxLoudness + 45) / 45));
-      let amp = 0.08 + Math.pow(norm, 1.3) * 0.72;
-
-      while (beatIdx < beats.length && beats[beatIdx].start < t0 - 0.05) {
-        beatIdx++;
-      }
-      let hasBeat = false;
-      let b = beatIdx;
-      while (b < beats.length && beats[b].start <= t1 + 0.05) {
-        const dist = Math.abs(beats[b].start - tMid);
-        if (dist <= dt * 0.65) {
-          hasBeat = true;
-          break;
+      let amp;
+      if (env > 0.62) {
+        // High-energy drop section: sharp separation between kick spikes and off-beat bass body
+        if (isKickSlot && n1 > 0.18) {
+          amp = env * (0.86 + n2 * 0.14);
+        } else {
+          amp = env * (0.42 + n1 * 0.24);
         }
-        b++;
+      } else {
+        // Intro / breakdown / outro: lower threshold with subtle percussive peaks
+        amp = env * (0.55 + n1 * 0.45);
       }
-
-      if (hasBeat) {
-        amp = Math.min(1.0, amp * 1.28 + 0.08);
-      }
-
       bars[i] = Math.max(0.06, Math.min(1.0, amp));
     }
 
     return bars;
   }
 
+  const clamp = (value, min = 0, max = 1) => Math.max(min, Math.min(max, value));
+  const barLength = count => Number.isFinite(count) && count > 0 ? clamp(Math.floor(count), 1, 4096) : 180;
+
+  // Integrate the real segment attack/decay envelope. No fabricated beats or pixel noise.
+  // Peaks preserve attacks; the energy-weighted body shows sustained vs. sparse passages.
+  function buildWaveformEnvelope(durationMs, segments, barCount = 180) {
+    const count = barLength(barCount);
+    const peaks = new Float32Array(count), body = new Float32Array(count);
+    const duration = Number.isFinite(durationMs) && durationMs > 0 ? durationMs / 1000 : 0;
+    if (!duration || !Array.isArray(segments) || !segments.length) return { peaks, body, available: false };
+    const valid = segments.filter(s => Number.isFinite(s.start) && Number.isFinite(s.duration) && s.duration > 0
+      && s.start < duration && s.start + s.duration > 0 && Number.isFinite(s.loudness_max));
+    if (!valid.length) return { peaks, body, available: false };
+    if (valid.some((s, i) => i && s.start < valid[i - 1].start)) valid.sort((a, b) => a.start - b.start);
+    const sorted = valid.map(s => s.loudness_max).sort((a, b) => a - b);
+    // One gain for the entire song preserves quiet/loud section contrast.
+    const ceiling = Math.max(-20, sorted[Math.ceil((sorted.length - 1) * .98)] + 1);
+    const amplitude = db => db <= -60 ? 0 : clamp(Math.pow(10, (clamp(db, -80, 6) - ceiling) / 32));
+    const dt = duration / count;
+    function integrate(t0, t1, a0, a1) {
+      if (t1 <= t0) return;
+      const first = Math.max(0, Math.floor(t0 / dt)), last = Math.min(count - 1, Math.ceil(t1 / dt) - 1);
+      for (let i = first; i <= last; i++) {
+        const lo = Math.max(i * dt, t0, 0), hi = Math.min((i + 1) * dt, t1, duration);
+        if (hi <= lo) continue;
+        const v0 = a0 + (a1 - a0) * (lo - t0) / (t1 - t0);
+        const v1 = a0 + (a1 - a0) * (hi - t0) / (t1 - t0);
+        peaks[i] = Math.max(peaks[i], v0, v1);
+        body[i] += (hi - lo) * (v0 * v0 + v0 * v1 + v1 * v1) / (3 * dt);
+      }
+    }
+    for (let i = 0; i < valid.length; i++) {
+      const s = valid[i];
+      // Do not double-count overlapping segments.
+      const end = Math.min(s.start + s.duration, valid[i + 1]?.start ?? duration, duration);
+      if (end <= s.start) continue;
+      const peakTime = s.start + clamp(Number.isFinite(s.loudness_max_time) ? s.loudness_max_time : s.duration * .2, 0, end - s.start);
+      const start = amplitude(Number.isFinite(s.loudness_start) ? s.loudness_start : s.loudness_max - 6);
+      const peak = amplitude(s.loudness_max);
+      const finish = amplitude(Number.isFinite(s.loudness_end) ? s.loudness_end
+        : Number.isFinite(valid[i + 1]?.loudness_start) ? valid[i + 1].loudness_start : s.loudness_max - 8);
+      integrate(s.start, peakTime, start, peak);
+      integrate(peakTime, end, peak, finish);
+    }
+    for (let i = 0; i < count; i++) body[i] = Math.min(peaks[i], Math.sqrt(body[i]));
+    return { peaks, body, available: true };
+  }
+
+  function generateWaveformBars(durationMs, segments, beats, sections, barCount = 180) {
+    return buildWaveformEnvelope(durationMs, segments, barCount).peaks;
+  }
+
+  function summarizeSections(sections, durationMs, body) {
+    const duration = durationMs / 1000;
+    if (!duration || !body?.length || !Array.isArray(sections)) return [];
+    const valid = sections.filter(s => Number.isFinite(s.start) && s.start >= 0 && s.start < duration
+      && Number.isFinite(s.duration) && s.duration > 0 && (!Number.isFinite(s.confidence) || s.confidence >= .3))
+      .sort((a, b) => a.start - b.start).slice(0, 128);
+    return valid.map((s, index) => {
+      const end = Math.min(duration, s.start + s.duration, valid[index + 1]?.start ?? duration);
+      const first = Math.floor(s.start / duration * body.length), last = Math.min(body.length, Math.ceil(end / duration * body.length));
+      let sum = 0, early = 0, late = 0, earlyCount = 0, lateCount = 0;
+      for (let i = first; i < last; i++) {
+        sum += body[i];
+        if (i < first + (last - first) / 3) { early += body[i]; earlyCount++; }
+        if (i >= last - (last - first) / 3) { late += body[i]; lateCount++; }
+      }
+      const energy = sum / Math.max(1, last - first);
+      const delta = late / Math.max(1, lateCount) - early / Math.max(1, earlyCount);
+      const description = delta > .12 ? 'Energia crescente' : delta < -.12 ? 'Energia decrescente'
+        : energy >= .6 ? 'Energia alta' : energy <= .28 ? 'Energia baixa' : 'Energia moderada';
+      return { start: s.start, duration: end - s.start, energy, description, index: index + 1 };
+    }).filter(s => s.duration > 0);
+  }
+
   function parseAudioAnalysis(raw, trackUri) {
-    const duration = (raw.track?.duration || 0) * 1000;
-    const tempo = raw.track?.tempo ? Math.round(raw.track.tempo) : null;
-    const key = raw.track?.key ?? null;
-    const mode = raw.track?.mode ?? null;
-    const keyLabel = formatMusicalKey(key, mode);
-
-    const segments = Array.isArray(raw.segments) ? raw.segments : [];
-    const beats = Array.isArray(raw.beats) ? raw.beats : [];
-    const sections = Array.isArray(raw.sections) ? raw.sections : [];
-
-    return {
-      trackUri,
-      duration,
-      tempo,
-      key,
-      mode,
-      keyLabel,
-      segments,
-      beats,
-      sections,
-      bars: generateWaveformBars(duration, segments, beats, sections, 180)
-    };
+    const duration = Number.isFinite(raw?.track?.duration) && raw.track.duration > 0 ? raw.track.duration * 1000 : 0;
+    const tempo = Number.isFinite(raw?.track?.tempo) && raw.track.tempo > 0 ? Math.round(raw.track.tempo) : null;
+    const key = raw?.track?.key ?? null, mode = raw?.track?.mode ?? null;
+    const segments = Array.isArray(raw?.segments) ? raw.segments : [];
+    const beats = Array.isArray(raw?.beats) ? raw.beats : [];
+    const sections = Array.isArray(raw?.sections) ? raw.sections : [];
+    const envelope = buildWaveformEnvelope(duration, segments, ANALYSIS_BARS);
+    return { trackUri, duration, tempo, key, mode, keyLabel: formatMusicalKey(key, mode),
+      segments, beats, sections, bars: envelope.peaks, body: envelope.body, available: envelope.available,
+      regions: envelope.available ? summarizeSections(sections, duration, envelope.body) : [] };
   }
 
   async function fetchAudioAnalysis(trackUri) {
-    if (!trackUri) return null;
-    const cached = analysisCache.get(trackUri);
-    if (cached) return cached;
-
-    const id = trackUri.replace(/^spotify:track:/, '');
-    let raw = null;
-
-    if (typeof Spicetify !== 'undefined' && typeof Spicetify.getAudioData === 'function') {
-      try {
-        raw = await Spicetify.getAudioData(trackUri);
-      } catch { /* Fallback to CosmosAsync */ }
+    if (!/^spotify:track:[a-zA-Z0-9]+$/.test(trackUri || '')) return null;
+    if (analysisCache.has(trackUri)) {
+      const cached = analysisCache.get(trackUri);
+      analysisCache.delete(trackUri); analysisCache.set(trackUri, cached);
+      return cached;
     }
-
-    if (!raw && typeof Spicetify !== 'undefined' && Spicetify.CosmosAsync?.get) {
-      try {
-        raw = await Spicetify.CosmosAsync.get(`https://spclient.wg.spotify.com/audio-attributes/v1/audio-analysis/${id}?format=json`);
-      } catch { /* Offline / unavailable */ }
-    }
-
-    if (raw && raw.track) {
+    if (pendingAnalysis.has(trackUri)) return pendingAnalysis.get(trackUri);
+    const revision = analysisRevision;
+    const request = (async () => {
+      let raw = null;
+      if (typeof Spicetify !== 'undefined' && typeof Spicetify.getAudioData === 'function') {
+        try { raw = await Spicetify.getAudioData(trackUri); } catch { /* Try the existing alternate transport. */ }
+      }
+      if (!raw?.track && typeof Spicetify !== 'undefined' && Spicetify.CosmosAsync?.get) {
+        try { raw = await Spicetify.CosmosAsync.get('https://spclient.wg.spotify.com/audio-attributes/v1/audio-analysis/' + trackUri.slice(14) + '?format=json'); }
+        catch { /* Keep seek available even without analysis. */ }
+      }
+      if (!raw?.track || revision !== analysisRevision) return null;
       const parsed = parseAudioAnalysis(raw, trackUri);
-      // Drop heavy raw segment/beat arrays from long-lived cache to save memory
-      const compactParsed = {
-        trackUri: parsed.trackUri,
-        duration: parsed.duration,
-        tempo: parsed.tempo,
-        key: parsed.key,
-        mode: parsed.mode,
-        keyLabel: parsed.keyLabel,
-        bars: parsed.bars
-      };
-      while (analysisCache.size >= MAX_CACHE_ENTRIES) {
-        const oldestKey = analysisCache.keys().next().value;
-        analysisCache.delete(oldestKey);
-      }
-      analysisCache.set(trackUri, compactParsed);
-      return compactParsed;
-    }
-
-    return null;
+      const { segments, beats, sections, ...compact } = parsed;
+      while (analysisCache.size >= MAX_CACHE_ENTRIES) analysisCache.delete(analysisCache.keys().next().value);
+      analysisCache.set(trackUri, compact);
+      return compact;
+    })();
+    pendingAnalysis.set(trackUri, request);
+    try { return await request; }
+    finally { if (pendingAnalysis.get(trackUri) === request) pendingAnalysis.delete(trackUri); }
   }
 
-  function renderWaveform(ctx, width, height, bars, progressRatio, hoverRatioVal) {
+  // Static geometry is rasterized once per track/size, then progress only composites bitmaps.
+  function drawBeatportWaveLayer(ctx, width, height, bars, isPlayed, model = {}) {
     ctx.clearRect(0, 0, width, height);
-    if (!bars || bars.length === 0) return;
-
-    const barWidth = 2.4;
-    const barGap = 1.6;
-    const step = barWidth + barGap;
-    const count = Math.max(40, Math.floor(width / step));
-    const centerY = height / 2;
-    const maxAmp = (height / 2) - 3;
-    const radius = barWidth / 2;
-    const hasRoundRect = typeof ctx.roundRect === 'function';
-
-    // Batch played and unplayed bars into 2 paths instead of 180 separate fill() calls
-    for (let pass = 0; pass < 2; pass++) {
-      const targetPlayed = pass === 0;
-      ctx.fillStyle = targetPlayed ? 'rgba(255, 255, 255, 0.96)' : 'rgba(255, 255, 255, 0.26)';
-      ctx.beginPath();
-      for (let i = 0; i < count; i++) {
-        const x = i * step + (step - barWidth) / 2;
-        const isPlayed = (x / width) <= progressRatio;
-        if (isPlayed !== targetPlayed) continue;
-        const sampleIdx = Math.floor((i / count) * bars.length);
-        const amp = bars[sampleIdx] || 0.1;
-        const barH = Math.max(2.5, amp * maxAmp);
-        const top = centerY - barH;
-        const totalH = barH * 1.85;
-        if (hasRoundRect) {
-          ctx.roundRect(x, top, barWidth, totalH, radius);
-        } else {
-          ctx.rect(x, top, barWidth, totalH);
-        }
-      }
-      ctx.fill();
+    const mid = height / 2, amplitude = Math.max(1, mid - 6);
+    const duration = (model.duration || 0) / 1000;
+    for (const section of model.regions || []) {
+      const x = section.start / duration * width, end = (section.start + section.duration) / duration * width;
+      ctx.fillStyle = 'rgba(255,255,255,' + (.025 + section.energy * .035) + ')';
+      ctx.fillRect(x, 5, end - x, height - 10);
+      ctx.fillStyle = isPlayed ? 'rgba(255,255,255,.44)' : 'rgba(255,255,255,.24)';
+      ctx.fillRect(x + 1, 1, Math.max(0, end - x - 2), 2);
+      if (x > 0) { ctx.fillStyle = 'rgba(255,255,255,.16)'; ctx.fillRect(Math.round(x), 5, 1, height - 10); }
     }
-
-    // Playhead line and glowing caps
-    const playheadX = Math.round(progressRatio * width);
-    ctx.strokeStyle = '#ffffff';
-    ctx.lineWidth = 1.5;
+    if (!bars?.length || model.available === false) {
+      ctx.fillStyle = isPlayed ? '#ffffff' : '#656565';
+      ctx.fillRect(0, mid, width, 1);
+      return;
+    }
+    const cols = Math.max(1, Math.floor(width));
+    const bodyHeights = new Float32Array(cols);
+    ctx.fillStyle = isPlayed ? 'rgba(255,255,255,.78)' : 'rgba(255,255,255,.31)';
     ctx.beginPath();
-    ctx.moveTo(playheadX, 2);
-    ctx.lineTo(playheadX, height - 2);
-    ctx.stroke();
-
-    ctx.fillStyle = '#ffffff';
-    ctx.beginPath();
-    ctx.arc(playheadX, 3, 2.5, 0, Math.PI * 2);
-    ctx.arc(playheadX, height - 3, 2.5, 0, Math.PI * 2);
+    for (let x = 0; x < cols; x++) {
+      const lo = Math.floor(x * bars.length / cols), hi = Math.max(lo + 1, Math.ceil((x + 1) * bars.length / cols));
+      let peak = 0, sum = 0;
+      for (let i = lo; i < hi && i < bars.length; i++) {
+        peak = Math.max(peak, bars[i]);
+        sum += model.body?.[i] ?? bars[i] * .65;
+      }
+      const peakHeight = Math.max(.5, peak * amplitude);
+      bodyHeights[x] = Math.max(.5, Math.min(peak, sum / (hi - lo)) * amplitude);
+      ctx.rect(x, mid - peakHeight, 1, peakHeight * 2);
+    }
     ctx.fill();
+    ctx.fillStyle = isPlayed ? '#ffffff' : '#999999';
+    ctx.beginPath();
+    for (let x = 0; x < cols; x++) ctx.rect(x, mid - bodyHeights[x], 1, bodyHeights[x] * 2);
+    ctx.fill();
+  }
 
-    // Hover scrubber indicator
-    if (hoverRatioVal != null && hoverRatioVal >= 0 && hoverRatioVal <= 1) {
-      const hoverX = Math.round(hoverRatioVal * width);
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.45)';
-      ctx.lineWidth = 1;
-      ctx.setLineDash([2, 2]);
-      ctx.beginPath();
-      ctx.moveTo(hoverX, 0);
-      ctx.lineTo(hoverX, height);
-      ctx.stroke();
-      ctx.setLineDash([]);
+  function renderWaveform(ctx, width, height, bars, progressRatio, hoverRatioVal, model = {}) {
+    if (width <= 0 || height <= 0) return;
+    ctx.clearRect(0, 0, width, height);
+    const playheadX = clamp(Number(progressRatio) || 0) * width;
+    const canvas = ctx.canvas;
+    const dpr = canvas?.width && width ? canvas.width / width : 1;
+    let cache = canvas?.__g4aWaveCache;
+    if (canvas?.ownerDocument && (!cache || cache.bars !== bars || cache.body !== model.body || cache.regions !== model.regions
+      || cache.available !== model.available || cache.w !== width || cache.h !== height || cache.dpr !== dpr)) {
+      const playedCanvas = canvas.ownerDocument.createElement('canvas'), unplayedCanvas = canvas.ownerDocument.createElement('canvas');
+      for (const [layer, played] of [[playedCanvas, true], [unplayedCanvas, false]]) {
+        layer.width = Math.round(width * dpr); layer.height = Math.round(height * dpr);
+        const layerCtx = layer.getContext('2d');
+        layerCtx.scale(dpr, dpr);
+        drawBeatportWaveLayer(layerCtx, width, height, bars, played, model);
+      }
+      cache = { bars, body: model.body, regions: model.regions, available: model.available, w: width, h: height, dpr, playedCanvas, unplayedCanvas };
+      canvas.__g4aWaveCache = cache;
+    }
+    if (cache) {
+      ctx.drawImage(cache.unplayedCanvas, 0, 0, width, height);
+      if (playheadX > 0) ctx.drawImage(cache.playedCanvas, 0, 0, playheadX * dpr, height * dpr, 0, 0, playheadX, height);
+    } else {
+      drawBeatportWaveLayer(ctx, width, height, bars, false, model);
+      ctx.save(); ctx.beginPath(); ctx.rect(0, 0, playheadX, height); ctx.clip();
+      drawBeatportWaveLayer(ctx, width, height, bars, true, model); ctx.restore();
+    }
+    const x = clamp(Math.round(playheadX), .5, width - .5);
+    ctx.fillStyle = '#ffffff'; ctx.fillRect(x, 4, 1, height - 8);
+    if (hoverRatioVal != null) {
+      ctx.fillStyle = 'rgba(255,255,255,.55)';
+      ctx.fillRect(clamp(Math.round(hoverRatioVal * width), 0, width - 1), 0, 1, height);
     }
   }
 
-  function scheduleSync(immediate = false) {
-    if (!active || typeof window === 'undefined') return;
+  function scheduleSync() {
+    if (!active || typeof window === 'undefined' || document.hidden) return;
     if (pollTimer !== null) {
       clearTimeout(pollTimer);
       pollTimer = null;
     }
     if (animFrame !== null) return;
-    if (immediate && typeof requestAnimationFrame === 'function') {
-      animFrame = requestAnimationFrame(syncPlayer);
-    } else if (typeof requestAnimationFrame === 'function') {
+    if (typeof requestAnimationFrame === 'function') {
       animFrame = requestAnimationFrame(syncPlayer);
     }
   }
 
-  function injectWaveformUI(playbackBar, centerContainer) {
-    if (!playbackBar) return;
-    if (mountedElement && mountedElement.parentElement === playbackBar && mountedRefs) {
-      mountedRefs.centerContainer = centerContainer;
-      return;
-    }
-    const existing = playbackBar.querySelector('.g4a-waveform-player');
-    if (existing && existing !== mountedElement) existing.remove();
-
-    const root = document.createElement('div');
-    root.className = 'g4a-waveform-player';
-
-    const meta = document.createElement('div');
-    meta.className = 'g4a-waveform-meta';
-
-    const timeEl = document.createElement('div');
-    timeEl.className = 'g4a-meta-time';
-    timeEl.title = 'Tempo decorrido / Duração total';
-    timeEl.textContent = '0:00 / 0:00';
-
-    const bpmEl = document.createElement('div');
-    bpmEl.className = 'g4a-meta-bpm';
-    bpmEl.title = 'Batidas por minuto (Tempo)';
-    bpmEl.textContent = '-- BPM';
-
-    const keyEl = document.createElement('div');
-    keyEl.className = 'g4a-meta-key';
-    keyEl.title = 'Tom musical';
-    keyEl.textContent = '--';
-
-    meta.append(timeEl, bpmEl, keyEl);
-
-    const track = document.createElement('div');
-    track.className = 'g4a-waveform-track';
-
-    const canvas = document.createElement('canvas');
-    canvas.className = 'g4a-waveform-canvas';
-
-    const tooltip = document.createElement('div');
-    tooltip.className = 'g4a-waveform-tooltip';
-
-    track.append(canvas, tooltip);
-    root.append(meta, track);
-
-    let cachedRect = null;
-    const getTrackRect = (force = false) => {
-      if (force || !cachedRect || cachedRect.width <= 0) {
-        cachedRect = track.getBoundingClientRect();
+  function resolveControlsElement(playbackBar, centerContainer) {
+    const parent = playbackBar?.parentElement || centerContainer;
+    if (!parent) return null;
+    // Direct selector for Spotify's transport buttons row
+    const direct = parent.querySelector('.player-controls__buttons, [data-testid="player-controls"] > .player-controls__buttons');
+    if (direct && !direct.contains(playbackBar)) return direct;
+    // Fallback: find the sibling of playbackBar that contains the play/pause button
+    const searchRoot = centerContainer || parent;
+    const playBtn = searchRoot.querySelector('[data-testid="control-button-playpause"], .main-playPauseButton-button');
+    if (playBtn) {
+      let node = playBtn;
+      while (node && node.parentElement && node.parentElement !== parent && node.parentElement !== centerContainer) {
+        if (node.parentElement.contains(playbackBar)) break;
+        node = node.parentElement;
       }
+      if (node && !node.contains(playbackBar)) return node;
+    }
+    for (const child of parent.children) {
+      if (child !== playbackBar && !child.classList.contains('g4a-waveform-player') && !child.classList.contains('g4a-island-sensor') && child.querySelector?.('button')) {
+        return child;
+      }
+    }
+    return null;
+  }
+
+  function releaseMount() {
+    mountCleanup?.();
+    mountCleanup = null;
+    resizeObs?.disconnect(); resizeObs = null;
+    if (islandHideTimer !== null) { clearTimeout(islandHideTimer); islandHideTimer = null; }
+    if (mountedRefs) {
+      for (const [el, attr] of [[mountedRefs.islandHost, 'data-g4a-island-host'], [mountedRefs.centerContainer, 'data-g4a-island-center'], [mountedRefs.controlsEl, 'data-g4a-island-controls']]) {
+        el?.removeAttribute(attr); el?.classList.remove('g4a-island-open');
+      }
+      mountedRefs.controlsEl?.querySelectorAll('button').forEach(button => button.style.removeProperty('--g4a-enter-delay'));
+      mountedRefs.sensor?.remove();
+    }
+    mountedElement?.remove(); mountedElement = null; mountedRefs = null;
+    isDragging = false; hoverRatio = null;
+  }
+
+  function injectWaveformUI(playbackBar, centerContainer) {
+    const islandHost = playbackBar?.parentElement || centerContainer;
+    if (!playbackBar || !islandHost) return;
+    if (mountedElement?.isConnected && mountedElement.parentElement === playbackBar
+      && mountedRefs?.controlsEl?.isConnected && mountedRefs.controlsEl.parentElement === islandHost
+      && mountedRefs.centerContainer === centerContainer) return;
+    const controlsEl = resolveControlsElement(playbackBar, centerContainer);
+    if (mountedElement?.isConnected && mountedElement.parentElement === playbackBar && mountedRefs?.controlsEl === controlsEl
+      && mountedRefs.centerContainer === centerContainer) return;
+    releaseMount();
+    islandHost.setAttribute('data-g4a-island-host', 'true');
+    centerContainer?.setAttribute('data-g4a-island-center', 'true');
+    controlsEl?.setAttribute('data-g4a-island-controls', 'true');
+
+    const root = document.createElement('div'); root.className = 'g4a-waveform-player';
+    const meta = document.createElement('div'); meta.className = 'g4a-waveform-meta';
+    const timeEl = document.createElement('div'); timeEl.className = 'g4a-meta-time'; timeEl.title = 'Tempo decorrido / Duração total';
+    const timeCurrentSpan = document.createElement('span'); timeCurrentSpan.className = 'g4a-meta-time-current'; timeCurrentSpan.textContent = '0:00';
+    const timeTotalSpan = document.createElement('span'); timeTotalSpan.className = 'g4a-meta-time-total'; timeTotalSpan.textContent = ' / 0:00';
+    timeEl.append(timeCurrentSpan, timeTotalSpan);
+    const bpmEl = document.createElement('div'); bpmEl.className = 'g4a-meta-bpm'; bpmEl.title = 'Batidas por minuto'; bpmEl.textContent = '-- bpm';
+    const keyEl = document.createElement('div'); keyEl.className = 'g4a-meta-key'; keyEl.title = 'Tom musical'; keyEl.textContent = '--';
+    meta.append(timeEl, bpmEl, keyEl);
+    const track = document.createElement('div'); track.className = 'g4a-waveform-track';
+    track.tabIndex = 0; track.setAttribute('role', 'slider'); track.setAttribute('aria-label', 'Posição na música');
+    track.setAttribute('aria-valuemin', '0'); track.setAttribute('aria-valuemax', '100'); track.setAttribute('aria-valuenow', '0');
+    const canvas = document.createElement('canvas'); canvas.className = 'g4a-waveform-canvas'; canvas.setAttribute('aria-hidden', 'true');
+    const tooltip = document.createElement('div'); tooltip.className = 'g4a-waveform-tooltip'; tooltip.setAttribute('aria-hidden', 'true');
+    const status = document.createElement('span'); status.className = 'g4a-waveform-status';
+    track.append(canvas, tooltip, status); root.append(meta, track);
+    const sensor = document.createElement('div'); sensor.className = 'g4a-island-sensor'; sensor.setAttribute('aria-hidden', 'true');
+    islandHost.append(sensor); playbackBar.append(root);
+    mountedElement = root;
+    const events = new AbortController();
+    const listen = (el, type, fn, options = {}) => el?.addEventListener(type, fn, { ...options, signal: events.signal });
+    let pointerInside = false, keyboardFocus = false, cachedRect = null;
+    const closeIsland = (force = false) => {
+      if (!force && (pointerInside || keyboardFocus)) return;
+      clearTimeout(islandHideTimer); islandHideTimer = null;
+      islandHost.classList.remove('g4a-island-open');
+      centerContainer?.classList.remove('g4a-island-open');
+    };
+    const openIsland = () => {
+      clearTimeout(islandHideTimer); islandHideTimer = null;
+      if (isDragging) return;
+      islandHost.classList.add('g4a-island-open');
+      centerContainer?.classList.add('g4a-island-open');
+    };
+    const scheduleClose = () => {
+      if (islandHideTimer !== null) return;
+      islandHideTimer = setTimeout(() => { islandHideTimer = null; closeIsland(); }, 180);
+    };
+    for (const el of [sensor, controlsEl]) {
+      listen(el, 'pointerenter', () => { pointerInside = true; openIsland(); }, { passive: true });
+      listen(el, 'pointerleave', () => { pointerInside = false; scheduleClose(); }, { passive: true });
+    }
+    listen(controlsEl, 'focusin', e => { keyboardFocus = e.target.matches?.(':focus-visible') || false; openIsland(); });
+    listen(controlsEl, 'focusout', e => {
+      if (!controlsEl.contains(e.relatedTarget)) { keyboardFocus = false; scheduleClose(); }
+    });
+    listen(controlsEl, 'pointerdown', () => { keyboardFocus = false; }, { passive: true });
+    listen(controlsEl, 'click', e => {
+      if (e.detail > 0 && controlsEl.contains(document.activeElement)) document.activeElement.blur();
+    });
+    listen(controlsEl, 'keydown', e => {
+      if (e.key === 'Escape') { keyboardFocus = false; pointerInside = false; track.focus(); closeIsland(true); }
+    });
+    listen(window, 'blur', () => { pointerInside = false; keyboardFocus = false; closeIsland(true); });
+    const staggerButtons = () => {
+      const buttons = [...(controlsEl?.querySelectorAll('button') || [])], middle = (buttons.length - 1) / 2;
+      buttons.forEach((button, i) => {
+        const delay = Math.round(30 + Math.abs(i - middle) * 26 + (i > middle ? 12 : 0)) + 'ms';
+        if (button.style.getPropertyValue('--g4a-enter-delay') !== delay) button.style.setProperty('--g4a-enter-delay', delay);
+      });
+    };
+    staggerButtons();
+    const controlsObserver = typeof MutationObserver === 'function' ? new MutationObserver(staggerButtons) : null;
+    if (controlsEl) controlsObserver?.observe(controlsEl, { childList: true, subtree: true });
+    mountCleanup = () => { events.abort(); controlsObserver?.disconnect(); };
+
+    const getRect = force => {
+      if (force || !cachedRect) cachedRect = track.getBoundingClientRect();
       return cachedRect;
     };
-
-    const updateScrub = (e, forceRect = false) => {
-      const rect = getTrackRect(forceRect);
-      if (!rect || rect.width <= 0) return 0;
-      return Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    const ratioAt = (e, force = false) => {
+      const rect = getRect(force);
+      return rect.width > 0 ? clamp((e.clientX - rect.left) / rect.width) : 0;
     };
-
-    track.addEventListener('pointerenter', () => {
-      getTrackRect(true);
-    }, { passive: true });
-
-    track.addEventListener('pointerdown', e => {
-      if (e.button !== 0) return;
-      isDragging = true;
-      track.setPointerCapture?.(e.pointerId);
-      dragRatio = updateScrub(e, true);
-      lastSeekAt = Date.now();
-      if (typeof Spicetify !== 'undefined' && Spicetify.Player?.seek) {
-        Spicetify.Player.seek(dragRatio);
-      }
-      scheduleSync(true);
+    const durationMs = () => typeof Spicetify !== 'undefined' ? Spicetify.Player?.getDuration?.() || currentAnalysis?.duration || 0 : 0;
+    const seek = ratio => { if (typeof Spicetify !== 'undefined') Spicetify.Player?.seek?.(clamp(ratio)); };
+    listen(track, 'pointerenter', () => getRect(true), { passive: true });
+    listen(track, 'pointerdown', e => {
+      if (e.button !== 0 || !durationMs()) return;
+      e.preventDefault(); track.focus({ preventScroll: true });
+      isDragging = true; closeIsland(true); track.setPointerCapture?.(e.pointerId);
+      dragRatio = ratioAt(e, true); lastSeekAt = Date.now(); seek(dragRatio); scheduleSync();
     });
-
-    track.addEventListener('pointermove', e => {
-      const ratio = updateScrub(e, false);
-      hoverRatio = ratio;
-
-      const dur = currentAnalysis?.duration || (typeof Spicetify !== 'undefined' ? Spicetify.Player?.getDuration() : 0) || 180000;
-      const hoverMs = Math.round(ratio * dur);
-      const nextTooltip = formatTime(hoverMs);
-      if (mountedRefs && mountedRefs.lastTooltipText !== nextTooltip) {
-        mountedRefs.lastTooltipText = nextTooltip;
-        tooltip.textContent = nextTooltip;
-      }
-      const nextLeft = `${Math.round(ratio * 100)}%`;
-      if (mountedRefs && mountedRefs.lastTooltipLeft !== nextLeft) {
-        mountedRefs.lastTooltipLeft = nextLeft;
-        tooltip.style.left = nextLeft;
-      }
-      if (!tooltip.classList.contains('visible')) tooltip.classList.add('visible');
-
-      if (isDragging) {
-        dragRatio = ratio;
-        const now = Date.now();
-        if (now - lastSeekAt >= 140 && typeof Spicetify !== 'undefined' && Spicetify.Player?.seek) {
-          lastSeekAt = now;
-          Spicetify.Player.seek(ratio);
-        }
-      }
-      scheduleSync(true);
+    listen(track, 'pointermove', e => {
+      const ratio = ratioAt(e); hoverRatio = ratio;
+      const duration = durationMs(), seconds = ratio * duration / 1000;
+      const region = currentAnalysis?.regions?.find(s => seconds >= s.start && seconds < s.start + s.duration);
+      const text = formatTime(ratio * duration) + (region ? ' · Trecho ' + region.index + ' · ' + region.description : '');
+      if (tooltip.textContent !== text) tooltip.textContent = text;
+      const x = Math.round(ratio * (mountedRefs?.width || 1));
+      tooltip.style.left = x + 'px';
+      tooltip.style.setProperty('--g4a-tip-shift', ratio < .2 ? '0%' : ratio > .8 ? '-100%' : '-50%');
+      tooltip.classList.add('visible');
+      if (isDragging) { dragRatio = ratio; if (Date.now() - lastSeekAt >= 140) { lastSeekAt = Date.now(); seek(ratio); } }
+      scheduleSync();
     }, { passive: true });
-
-    const stopScrub = () => {
-      if (isDragging && typeof Spicetify !== 'undefined' && Spicetify.Player?.seek) {
-        Spicetify.Player.seek(dragRatio);
-      }
-      isDragging = false;
-      hoverRatio = null;
-      tooltip.classList.remove('visible');
-      scheduleSync(true);
+    const stopScrub = e => {
+      if (isDragging) seek(dragRatio);
+      isDragging = false; hoverRatio = null;
+      if (track.hasPointerCapture?.(e.pointerId)) track.releasePointerCapture(e.pointerId);
+      tooltip.classList.remove('visible'); scheduleSync();
     };
-
-    track.addEventListener('pointerup', stopScrub);
-    track.addEventListener('pointercancel', stopScrub);
-    track.addEventListener('pointerleave', () => {
-      if (!isDragging) {
-        hoverRatio = null;
-        tooltip.classList.remove('visible');
-        scheduleSync(true);
-      }
-    }, { passive: true });
-
-    playbackBar.append(root);
-    mountedElement = root;
-    const initRect = track.getBoundingClientRect();
-    mountedRefs = {
-      playbackBar,
-      centerContainer,
-      timeEl,
-      bpmEl,
-      keyEl,
-      track,
-      canvas,
-      ctx: canvas.getContext('2d'),
-      tooltip,
-      width: Math.floor(initRect.width) || 360,
-      height: Math.floor(initRect.height) || 42,
-      lastTimeText: '0:00 / 0:00',
-      lastBpmText: '-- BPM',
-      lastKeyText: '--',
-      lastTooltipText: '',
-      lastTooltipLeft: '',
-      lastPinned: null,
-      lastRenderKey: '',
-      lastBarsRef: null
-    };
-
-    resizeObs?.disconnect();
+    listen(track, 'pointerup', stopScrub);
+    listen(track, 'pointercancel', stopScrub);
+    listen(track, 'lostpointercapture', () => { isDragging = false; hoverRatio = null; tooltip.classList.remove('visible'); scheduleSync(); });
+    listen(track, 'pointerleave', () => { if (!isDragging) { hoverRatio = null; tooltip.classList.remove('visible'); scheduleSync(); } }, { passive: true });
+    listen(track, 'keydown', e => {
+      const duration = durationMs(); if (!duration) return;
+      let position = typeof Spicetify !== 'undefined' ? Spicetify.Player?.getProgress?.() || 0 : 0;
+      if (e.key === 'Home') position = 0;
+      else if (e.key === 'End') position = duration;
+      else if (['ArrowLeft', 'ArrowDown'].includes(e.key)) position -= e.shiftKey ? 10000 : 5000;
+      else if (['ArrowRight', 'ArrowUp'].includes(e.key)) position += e.shiftKey ? 10000 : 5000;
+      else return;
+      e.preventDefault(); e.stopPropagation(); seek(position / duration); scheduleSync();
+    });
+    listen(window, 'resize', () => { cachedRect = null; }, { passive: true });
+    const rect = track.getBoundingClientRect();
+    mountedRefs = { playbackBar, centerContainer, islandHost, controlsEl, sensor, timeEl, timeCurrentSpan, timeTotalSpan, bpmEl, keyEl,
+      track, canvas, ctx: canvas.getContext('2d'), tooltip, status, width: Math.floor(rect.width), height: Math.floor(rect.height),
+      lastCurrentTime: '0:00', lastTotalTime: ' / 0:00', lastBpmText: '-- bpm', lastKeyText: '--',
+      lastRenderKey: '', lastBarsRef: null, lastRegionsRef: null, closeIsland };
     if (typeof ResizeObserver === 'function') {
       resizeObs = new ResizeObserver(entries => {
-        for (const entry of entries) {
-          const cr = entry.contentRect;
-          const w = Math.floor(cr.width);
-          const h = Math.floor(cr.height);
-          if (w > 0 && h > 0 && mountedRefs) {
-            mountedRefs.width = w;
-            mountedRefs.height = h;
-            cachedRect = null;
-            scheduleSync(true);
-          }
+        const cr = entries[entries.length - 1]?.contentRect;
+        if (!mountedRefs || !cr) return;
+        const width = Math.floor(cr.width), height = Math.floor(cr.height);
+        if (width !== mountedRefs.width || height !== mountedRefs.height) {
+          mountedRefs.width = width; mountedRefs.height = height; cachedRect = null; scheduleSync();
         }
       });
       resizeObs.observe(track);
@@ -3677,160 +3889,111 @@ const Genre4allPlayerWaveform = (() => {
 
   function syncPlayer() {
     animFrame = null;
-    if (pollTimer !== null) {
-      clearTimeout(pollTimer);
-      pollTimer = null;
-    }
-    if (!enabled || !active) {
-      teardown();
-      return;
-    }
+    if (pollTimer !== null) { clearTimeout(pollTimer); pollTimer = null; }
+    if (!enabled || !active) return;
+    if (document.hidden) return;
 
     let playbackBar = mountedRefs?.playbackBar?.isConnected ? mountedRefs.playbackBar : null;
     let centerContainer = mountedRefs?.centerContainer?.isConnected ? mountedRefs.centerContainer : null;
     if (!playbackBar || !centerContainer) {
-      playbackBar = document.querySelector('.main-nowPlayingBar-center .playback-bar, .playback-bar');
-      centerContainer = document.querySelector('.main-nowPlayingBar-center');
+      playbackBar = document.querySelector('.main-nowPlayingBar-center .playback-bar, [data-testid="now-playing-bar"] .playback-bar, .playback-bar');
+      centerContainer = playbackBar?.closest('.main-nowPlayingBar-center') || playbackBar?.parentElement;
     }
-
     if (!playbackBar || !centerContainer) {
-      if (active) pollTimer = setTimeout(() => scheduleSync(true), 500);
+      releaseMount();
+      document.documentElement.removeAttribute('data-g4a-player-waveform');
+      pollTimer = setTimeout(scheduleSync, 1000);
       return;
     }
-
-    if (document.documentElement.getAttribute('data-g4a-player-waveform') !== 'true') {
-      document.documentElement.setAttribute('data-g4a-player-waveform', 'true');
-    }
+    if (document.documentElement.getAttribute('data-g4a-player-waveform') !== 'true') document.documentElement.setAttribute('data-g4a-player-waveform', 'true');
     injectWaveformUI(playbackBar, centerContainer);
-
-    const isPlaying = typeof Spicetify !== 'undefined' ? Boolean(Spicetify.Player?.isPlaying?.()) : false;
-    const shouldPin = !isPlaying || isDragging;
-    if (mountedRefs && mountedRefs.lastPinned !== shouldPin) {
-      mountedRefs.lastPinned = shouldPin;
-      centerContainer.classList.toggle('g4a-island-pinned', shouldPin);
-    }
-
-    const trackUri = typeof Spicetify !== 'undefined' ? (Spicetify.Player?.data?.item?.uri || '') : '';
-    const durMs = typeof Spicetify !== 'undefined' ? (Spicetify.Player?.getDuration?.() || 0) : 0;
-    const progressMs = typeof Spicetify !== 'undefined' ? (Spicetify.Player?.getProgress?.() || 0) : 0;
-    const progressRatio = isDragging ? dragRatio : (durMs > 0 ? Math.max(0, Math.min(1, progressMs / durMs)) : 0);
-
-    // Update track metadata on song change
-    if (trackUri && trackUri !== currentTrackUri) {
+    const player = typeof Spicetify !== 'undefined' ? Spicetify.Player : null;
+    const isPlaying = Boolean(player?.isPlaying?.());
+    const trackUri = player?.data?.item?.uri || '';
+    const durMs = player?.getDuration?.() || 0, progressMs = player?.getProgress?.() || 0;
+    if (trackUri !== currentTrackUri) {
       currentTrackUri = trackUri;
-      currentAnalysis = {
-        trackUri,
-        duration: durMs,
-        tempo: null,
-        keyLabel: '--',
-        bars: generateProceduralBars(durMs / 1000, 180, trackUri)
-      };
-
-      fetchAudioAnalysis(trackUri).then(res => {
-        if (res && res.trackUri === currentTrackUri) {
-          currentAnalysis = res;
-          scheduleSync(true);
-        }
+      isDragging = false; hoverRatio = null;
+      mountedRefs.tooltip.classList.remove('visible');
+      currentAnalysis = { trackUri, duration: durMs, tempo: null, keyLabel: '--', bars: EMPTY_BARS, available: false,
+        loading: /^spotify:track:[a-zA-Z0-9]+$/.test(trackUri) };
+      const revision = analysisRevision;
+      fetchAudioAnalysis(trackUri).then(result => {
+        if (!active || revision !== analysisRevision || trackUri !== currentTrackUri) return;
+        currentAnalysis = result || { ...currentAnalysis, loading: false };
+        scheduleSync();
       });
     }
-
-    if (mountedRefs) {
-      const nextTimeText = `${formatTime(progressMs)} / ${formatTime(durMs)}`;
-      if (mountedRefs.lastTimeText !== nextTimeText) {
-        mountedRefs.lastTimeText = nextTimeText;
-        mountedRefs.timeEl.textContent = nextTimeText;
+    const ratio = isDragging ? dragRatio : durMs > 0 ? clamp(progressMs / durMs) : 0;
+    const refs = mountedRefs;
+    if (refs) {
+      const currentTime = formatTime(isDragging ? dragRatio * durMs : progressMs), totalTime = ' / ' + formatTime(durMs);
+      if (refs.lastCurrentTime !== currentTime) { refs.lastCurrentTime = currentTime; refs.timeCurrentSpan.textContent = currentTime; }
+      if (refs.lastTotalTime !== totalTime) { refs.lastTotalTime = totalTime; refs.timeTotalSpan.textContent = totalTime; }
+      const bpm = currentAnalysis?.tempo ? Math.round(currentAnalysis.tempo) + ' bpm' : '-- bpm', key = currentAnalysis?.keyLabel || '--';
+      if (refs.lastBpmText !== bpm) { refs.lastBpmText = bpm; refs.bpmEl.textContent = bpm; }
+      if (refs.lastKeyText !== key) { refs.lastKeyText = key; refs.keyEl.textContent = key; }
+      const status = currentAnalysis?.available ? '' : currentAnalysis?.loading ? 'Carregando análise…' : 'Análise indisponível';
+      if (refs.status.textContent !== status) refs.status.textContent = status;
+      const aria = currentTime + ' de ' + formatTime(durMs);
+      if (refs.track.getAttribute('aria-valuetext') !== aria) {
+        refs.track.setAttribute('aria-valuetext', aria); refs.track.setAttribute('aria-valuenow', String(Math.round(ratio * 100)));
       }
-
-      const nextBpmText = currentAnalysis?.tempo ? formatBpm(currentAnalysis.tempo) : '-- BPM';
-      if (mountedRefs.lastBpmText !== nextBpmText) {
-        mountedRefs.lastBpmText = nextBpmText;
-        mountedRefs.bpmEl.textContent = nextBpmText;
-      }
-
-      const nextKeyText = currentAnalysis?.keyLabel || '--';
-      if (mountedRefs.lastKeyText !== nextKeyText) {
-        mountedRefs.lastKeyText = nextKeyText;
-        mountedRefs.keyEl.textContent = nextKeyText;
-      }
-
-      const w = mountedRefs.width || mountedRefs.track.clientWidth || 360;
-      const h = mountedRefs.height || mountedRefs.track.clientHeight || 42;
-      if (w > 0 && h > 0 && mountedRefs.ctx) {
-        const dpr = window.devicePixelRatio || 1;
-        let bars = currentAnalysis?.bars;
-        if (!bars) {
-          const seedKey = `${trackUri || 'default'}:${Math.round(durMs / 1000)}`;
-          if (fallbackBarsUri !== seedKey || !fallbackBars) {
-            fallbackBarsUri = seedKey;
-            fallbackBars = generateProceduralBars(durMs / 1000, 180, trackUri || 'default');
-          }
-          bars = fallbackBars;
+      const w = refs.width, h = refs.height, dpr = clamp(window.devicePixelRatio || 1, 1, 2);
+      const bars = currentAnalysis?.bars || EMPTY_BARS;
+      const renderKey = w + '|' + h + '|' + dpr + '|' + Math.round(ratio * w) + '|' + (hoverRatio == null ? -1 : Math.round(hoverRatio * w));
+      if (w > 0 && h > 0 && refs.ctx && (refs.lastRenderKey !== renderKey || refs.lastBarsRef !== bars || refs.lastRegionsRef !== currentAnalysis?.regions)) {
+        refs.lastRenderKey = renderKey; refs.lastBarsRef = bars; refs.lastRegionsRef = currentAnalysis?.regions;
+        if (refs.canvas.width !== Math.round(w * dpr) || refs.canvas.height !== Math.round(h * dpr)) {
+          refs.canvas.width = Math.round(w * dpr); refs.canvas.height = Math.round(h * dpr);
         }
-        const playheadPx = Math.round(progressRatio * w * 2);
-        const hoverPx = hoverRatio != null ? Math.round(hoverRatio * w * 2) : -1;
-        const renderKey = `${w}|${h}|${dpr}|${playheadPx}|${hoverPx}`;
-        if (mountedRefs.lastRenderKey !== renderKey || mountedRefs.lastBarsRef !== bars) {
-          mountedRefs.lastRenderKey = renderKey;
-          mountedRefs.lastBarsRef = bars;
-          const canvas = mountedRefs.canvas;
-          if (canvas.width !== Math.floor(w * dpr) || canvas.height !== Math.floor(h * dpr)) {
-            canvas.width = Math.floor(w * dpr);
-            canvas.height = Math.floor(h * dpr);
-          }
-          const ctx = mountedRefs.ctx;
-          ctx.save();
-          ctx.scale(dpr, dpr);
-          renderWaveform(ctx, w, h, bars, progressRatio, hoverRatio);
-          ctx.restore();
-        }
+        refs.ctx.save(); refs.ctx.scale(dpr, dpr);
+        renderWaveform(refs.ctx, w, h, bars, ratio, hoverRatio, currentAnalysis || { available: false });
+        refs.ctx.restore();
       }
     }
-
-    if (active && !document.hidden) {
-      if (isDragging || hoverRatio !== null) {
-        animFrame = requestAnimationFrame(syncPlayer);
-      } else if (isPlaying) {
-        pollTimer = setTimeout(() => scheduleSync(true), 120);
-      }
-    }
+    // Pixel-paced progress instead of an unconditional 60 FPS loop on hover.
+    // Paused watchdog also recovers a replaced Spotify player and external seeks.
+    const interval = isPlaying ? clamp(durMs / Math.max(1, refs?.width || 480) / 2, 120, 750) : 1000;
+    pollTimer = setTimeout(scheduleSync, interval);
   }
 
-  const onPlayerEvent = () => scheduleSync(true);
+  const onPlayerEvent = () => scheduleSync();
+  const onVisibility = () => {
+    if (document.hidden) {
+      if (animFrame !== null) cancelAnimationFrame(animFrame);
+      if (pollTimer !== null) clearTimeout(pollTimer);
+      animFrame = null; pollTimer = null;
+      isDragging = false; hoverRatio = null;
+      mountedRefs?.tooltip.classList.remove('visible');
+      mountedRefs?.closeIsland(true);
+    } else scheduleSync();
+  };
 
   function start() {
-    if (active || typeof window === 'undefined' || typeof document === 'undefined') return;
+    if (!enabled || active || typeof window === 'undefined' || typeof document === 'undefined') return;
     active = true;
-    scheduleSync(true);
-
+    document.addEventListener('visibilitychange', onVisibility);
     if (typeof Spicetify !== 'undefined' && Spicetify.Player?.addEventListener) {
       Spicetify.Player.addEventListener('songchange', onPlayerEvent);
       Spicetify.Player.addEventListener('onplaypause', onPlayerEvent);
     }
+    scheduleSync();
   }
 
   function teardown() {
     active = false;
-    if (animFrame !== null && typeof cancelAnimationFrame !== 'undefined') {
-      cancelAnimationFrame(animFrame);
-      animFrame = null;
-    }
-    if (pollTimer !== null) {
-      clearTimeout(pollTimer);
-      pollTimer = null;
-    }
-    resizeObs?.disconnect();
-    resizeObs = null;
+    analysisRevision++;
+    pendingAnalysis.clear();
+    currentTrackUri = null; currentAnalysis = null;
+    if (animFrame !== null && typeof cancelAnimationFrame !== 'undefined') cancelAnimationFrame(animFrame);
+    if (pollTimer !== null) clearTimeout(pollTimer);
+    animFrame = null; pollTimer = null;
+    releaseMount();
     if (typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', onVisibility);
       document.documentElement.removeAttribute('data-g4a-player-waveform');
-      if (mountedElement) {
-        mountedElement.remove();
-        mountedElement = null;
-      }
-      mountedRefs = null;
-      const center = document.querySelector('.main-nowPlayingBar-center');
-      if (center) center.classList.remove('g4a-island-pinned');
     }
-
     if (typeof Spicetify !== 'undefined' && Spicetify.Player?.removeEventListener) {
       Spicetify.Player.removeEventListener('songchange', onPlayerEvent);
       Spicetify.Player.removeEventListener('onplaypause', onPlayerEvent);
@@ -3863,6 +4026,8 @@ const Genre4allPlayerWaveform = (() => {
     formatCamelot,
     formatBpm,
     formatTime,
+    buildWaveformEnvelope,
+    summarizeSections,
     generateWaveformBars,
     generateProceduralBars,
     parseAudioAnalysis,
@@ -3893,7 +4058,7 @@ async function startGenre4all() {
   } catch { /* Session preference still works. */ }
   const context = () => globalThis.Spicetify?.Platform?.History?.location?.pathname || location.pathname;
   const api = {
-    version: '1.13.0',
+    version: '1.14.0',
     get visible() { return visible; },
     get orderOffset() { return orderOffset; },
     get columnOrder() { return [...columnOrder]; },
@@ -3927,7 +4092,7 @@ async function startGenre4all() {
   style.textContent = `
     /* Role lives in ElementInternals: other extensions' [role=gridcell] scans ignore our shell. */
     .g4a-root :is(.g4a-row,[data-g4a-row],:has(> genre4all-column)):not([data-g4a-measure]) { grid-template-columns:var(--g4a-tracks) !important; min-width:var(--g4a-total) !important; }
-    .g4a-root :is(.g4a-row,[data-g4a-row],:has(> genre4all-column)):not([data-g4a-measure]) > :not([aria-colspan]):not([class*="FullWidthCell"]):not([class*="trackListRowFullWidthCell"]):not(.PoSfoROJK6lwVe6ZtR0U) { grid-column:auto !important; grid-row:1 !important; min-width:0; }
+    .g4a-root :is(.g4a-row,[data-g4a-row],:has(> genre4all-column)):not([data-g4a-measure]) > :not([data-g4a-position]):not([aria-colspan]):not([class*="FullWidthCell"]):not([class*="trackListRowFullWidthCell"]):not(.PoSfoROJK6lwVe6ZtR0U) { grid-column:auto !important; grid-row:1 !important; min-width:0; }
     .g4a-root :is(.g4a-row,[data-g4a-row],:has(> genre4all-column)):not([data-g4a-measure]) > [data-g4a-position] { grid-column:var(--g4a-position,auto) !important; grid-row:1 !important; min-width:0; }
     .g4a-root :is(.g4a-row,[data-g4a-row],:has(> genre4all-column)):not([data-g4a-measure]) > :is([aria-colspan],[class*="FullWidthCell"],[class*="trackListRowFullWidthCell"],.PoSfoROJK6lwVe6ZtR0U) { grid-column:1 / -1 !important; grid-row:auto !important; width:100% !important; min-width:0 !important; }
     .g4a-root :is(.main-trackList-trackListHeader,.rrn0EjHTu7eCxn9G0Rrc,[class*="trackListHeader"]):is(.main-trackList-trackListHeaderStuck,.iPo4a2lbrsxW9Iedav3h,[class*="trackListHeaderStuck"]) { background-color:var(--spice-main,var(--background-base,#121212)) !important; }
@@ -3955,8 +4120,9 @@ async function startGenre4all() {
     .g4a-menu-button:hover,.g4a-menu-button:focus-visible,.g4a-profile-button:hover,.g4a-profile-button:focus-visible { background:#ffffff1a; outline-offset:-2px; }
     .g4a-menu-button[aria-checked=true] { color:var(--text-positive,#1ed760); }
     .g4a-menu-button svg,.g4a-profile-button svg { width:16px; height:16px; flex:none; fill:currentColor; }
-    .g4a-preferences { position:fixed; inset:0; margin:auto; padding:24px; max-width:460px; width:calc(100vw - 40px); max-height:calc(100vh - 40px); overflow-y:auto; box-sizing:border-box; border:1px solid #555; border-radius:10px; color:var(--spice-text,#fff); background:var(--spice-main,#181818); font:14px/1.45 sans-serif; box-shadow:0 20px 50px rgba(0,0,0,.65); }
+    .g4a-preferences { position:fixed; inset:0; margin:auto; padding:24px; max-width:460px; width:calc(100vw - 40px); max-height:calc(100vh - 40px); overflow-y:auto; box-sizing:border-box; border:1px solid #ffffff20; border-radius:16px; color:var(--spice-text,#fff); background:var(--spice-main,#181818); font:14px/1.45 sans-serif; box-shadow:0 20px 50px rgba(0,0,0,.65); }
     .g4a-preferences::backdrop { background:#000a; }
+    .g4a-preferences :focus-visible { outline:2px solid #fff; outline-offset:3px; }
     .g4a-preferences h2 { margin:0 0 14px; font:700 18px/1.3 sans-serif; display:flex; align-items:center; justify-content:space-between; }
     .g4a-preferences h3 { margin:16px 0 8px; font:600 12px/1.2 sans-serif; text-transform:uppercase; letter-spacing:.06em; color:var(--spice-subtext,#b3b3b3); }
     .g4a-preferences label { display:flex; gap:10px; margin:10px 0; align-items:center; cursor:pointer; }
@@ -3966,26 +4132,66 @@ async function startGenre4all() {
     .g4a-preferences-input { width:100%; box-sizing:border-box; padding:8px 10px; border:1px solid #555; border-radius:5px; background:#121212; color:var(--spice-text,#fff); font:13px/1.3 monospace,sans-serif; }
     .g4a-preferences-input:focus { border-color:#1ed760; outline:none; }
     .g4a-preferences-actions { display:flex; flex-wrap:wrap; gap:10px; margin-top:18px; justify-content:flex-end; }
-    .g4a-preferences button { padding:8px 14px; color:inherit; background:transparent; border:1px solid #aaa; border-radius:4px; cursor:pointer; font:inherit; }
+    .g4a-preferences button { padding:9px 15px; color:inherit; background:#ffffff08; border:1px solid #ffffff30; border-radius:8px; cursor:pointer; font:inherit; }
     .g4a-preferences button:hover { background:#ffffff14; }
 
-    /* Player Waveform & Apple-style Dynamic Island */
-    .g4a-waveform-player { display:flex; align-items:center; gap:12px; width:100%; height:46px; position:relative; user-select:none; box-sizing:border-box; }
-    .g4a-waveform-meta { display:flex; flex-direction:column; justify-content:center; width:86px; min-width:86px; flex-shrink:0; font-family:var(--font-family,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif); line-height:1.35; text-align:left; user-select:none; }
-    .g4a-meta-time { font-size:11px; font-weight:700; color:var(--spice-text,#ffffff); font-variant-numeric:tabular-nums; letter-spacing:-0.01em; }
-    .g4a-meta-bpm { font-size:11px; font-weight:500; color:var(--spice-subtext,rgba(255,255,255,0.72)); white-space:nowrap; }
-    .g4a-meta-key { font-size:11px; font-weight:500; color:var(--spice-subtext,rgba(255,255,255,0.72)); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-    .g4a-waveform-track { position:relative; flex:1; height:42px; min-width:120px; cursor:pointer; display:flex; align-items:center; }
-    .g4a-waveform-canvas { width:100%; height:100%; display:block; }
-    .g4a-waveform-tooltip { position:absolute; top:-26px; transform:translateX(-50%); background:rgba(18,18,18,0.92); color:#fff; padding:2px 7px; border-radius:4px; font-size:10.5px; font-weight:600; pointer-events:none; white-space:nowrap; box-shadow:0 4px 12px rgba(0,0,0,0.4); border:1px solid rgba(255,255,255,0.15); font-variant-numeric:tabular-nums; opacity:0; transition:opacity 0.15s ease; z-index:100; }
-    .g4a-waveform-tooltip.visible { opacity:1; }
-    .g4a-badge-experimental { font-size:10px; font-weight:700; padding:2px 6px; border-radius:10px; background:#e91429; color:#fff; letter-spacing:0.04em; }
-
+    /* Monochrome waveform and a raised, compositor-animated transport island. */
+    .g4a-waveform-player { display:flex; align-items:center; gap:14px; width:100%; height:62px; min-height:62px; min-width:0; position:relative; user-select:none; box-sizing:border-box; }
+    .g4a-waveform-meta { display:flex; flex-direction:column; justify-content:center; gap:2px; width:94px; min-width:94px; font-family:var(--font-family,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif); line-height:1.3; text-align:left; }
+    .g4a-meta-time { font-size:12px; font-variant-numeric:tabular-nums; letter-spacing:-.015em; white-space:nowrap; }
+    .g4a-meta-time-current { font-weight:650; color:#fff; }
+    .g4a-meta-time-total { font-weight:400; color:#a7a7a7; }
+    .g4a-meta-bpm,.g4a-meta-key { font-size:11px; font-weight:500; color:#b3b3b3; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .g4a-waveform-track { position:relative; flex:1; height:58px; min-height:58px; min-width:0; cursor:crosshair; touch-action:none; border-radius:4px; }
+    .g4a-waveform-track:focus-visible { outline:2px solid #fff; outline-offset:4px; }
+    .g4a-waveform-canvas { width:100%; height:100%; display:block; pointer-events:none; }
+    .g4a-waveform-status { position:absolute; top:3px; right:0; color:#a7a7a7; font-size:10px; line-height:16px; pointer-events:none; }
+    .g4a-waveform-status:empty { display:none; }
+    .g4a-waveform-tooltip { position:absolute; bottom:calc(100% + 8px); transform:translateX(var(--g4a-tip-shift,-50%)) translateY(3px); background:#242424; color:#fff; padding:6px 9px; border-radius:8px; font-size:11px; font-weight:500; line-height:1.3; pointer-events:none; white-space:nowrap; max-width:min(360px,80vw); box-shadow:0 6px 18px #0006; border:1px solid #ffffff1f; font-variant-numeric:tabular-nums; opacity:0; transition:opacity 120ms ease,transform 160ms ease; z-index:1002; }
+    .g4a-waveform-tooltip.visible { opacity:1; transform:translateX(var(--g4a-tip-shift,-50%)) translateY(0); }
+    .g4a-badge-experimental { font-size:10px; font-weight:600; padding:3px 7px; border-radius:6px; background:#ffffff14; color:#b3b3b3; letter-spacing:.03em; }
     [data-g4a-player-waveform="true"] .playback-bar > :is([data-testid="playback-position"],[data-testid="playback-duration"],.EwWvIxEwsX4OCTm8USco) { display:none !important; }
     [data-g4a-player-waveform="true"] .playback-bar :is([data-testid="progress-bar"],.progress-bar,.x-progressBar-progressBar) { display:none !important; }
-    [data-g4a-player-waveform="true"] .main-nowPlayingBar-center { position:relative !important; display:flex !important; flex-direction:column !important; justify-content:center !important; overflow:visible !important; }
-    [data-g4a-player-waveform="true"] .player-controls { position:absolute !important; left:50% !important; bottom:calc(100% + 8px) !important; transform:translateX(-50%) translateY(8px) scale(0.92) !important; opacity:0 !important; pointer-events:none !important; background:rgba(22,22,24,0.88) !important; backdrop-filter:blur(24px) saturate(190%) !important; -webkit-backdrop-filter:blur(24px) saturate(190%) !important; border:1px solid rgba(255,255,255,0.14) !important; border-radius:9999px !important; padding:4px 14px !important; margin-bottom:0 !important; box-shadow:0 16px 36px rgba(0,0,0,0.65), 0 2px 10px rgba(0,0,0,0.4) !important; z-index:1000 !important; transition:transform 0.42s cubic-bezier(0.16,1,0.3,1), opacity 0.32s cubic-bezier(0.16,1,0.3,1), box-shadow 0.42s ease !important; }
-    [data-g4a-player-waveform="true"] .main-nowPlayingBar-center:hover .player-controls, [data-g4a-player-waveform="true"] .main-nowPlayingBar-center:focus-within .player-controls, [data-g4a-player-waveform="true"] .main-nowPlayingBar-center.g4a-island-pinned .player-controls { opacity:1 !important; pointer-events:auto !important; transform:translateX(-50%) translateY(0) scale(1) !important; box-shadow:0 20px 45px rgba(0,0,0,0.75), 0 4px 14px rgba(0,0,0,0.5) !important; }
+    [data-g4a-player-waveform="true"] .playback-bar { width:100% !important; min-height:62px !important; height:62px !important; display:flex !important; align-items:center !important; overflow:visible !important; }
+    [data-g4a-player-waveform="true"] .main-nowPlayingBar-center,[data-g4a-player-waveform="true"] [data-g4a-island-center="true"] { position:relative !important; display:flex !important; flex-direction:column !important; justify-content:center !important; width:100% !important; min-width:0 !important; max-width:920px !important; flex:1 1 auto !important; overflow:visible !important; }
+    [data-g4a-player-waveform="true"] [data-g4a-island-host="true"] { position:relative !important; display:flex !important; flex-direction:column !important; justify-content:center !important; width:100% !important; overflow:visible !important; }
+    [data-g4a-player-waveform="true"] .g4a-island-sensor { position:absolute; left:50%; bottom:calc(100% - 7px); transform:translateX(-50%); width:min(280px,100%); height:34px; z-index:999; background:transparent; }
+    [data-g4a-player-waveform="true"] [data-g4a-island-controls="true"] {
+      position:absolute !important; left:50% !important; bottom:calc(100% + 14px) !important;
+      width:max-content !important; max-width:calc(100vw - 32px) !important; flex:0 0 auto !important;
+      display:inline-flex !important; align-items:center !important; justify-content:center !important;
+      gap:10px !important; margin:0 !important; padding:9px 18px !important;
+      background:linear-gradient(180deg,#252525,#161616) !important; border:1px solid #ffffff20 !important;
+      border-radius:999px !important; box-shadow:0 8px 26px #0008,inset 0 1px 0 #ffffff0d !important;
+      transform-origin:50% 100% !important; transform:translate(-50%,12px) scale(.94,.82) !important;
+      opacity:0 !important; pointer-events:none !important; z-index:1001 !important;
+      transition:transform 240ms cubic-bezier(.4,0,.6,1),opacity 140ms ease !important;
+    }
+    [data-g4a-player-waveform="true"] .g4a-island-open [data-g4a-island-controls="true"],
+    [data-g4a-player-waveform="true"] [data-g4a-island-controls="true"]:focus-within {
+      opacity:1 !important; pointer-events:auto !important; transform:translate(-50%,0) scale(1) !important;
+      transition:transform 420ms cubic-bezier(.18,1.2,.3,1),opacity 140ms ease !important;
+    }
+    [data-g4a-player-waveform="true"] [data-g4a-island-controls="true"] button {
+      opacity:0; transform:translateY(11px) scale(.88);
+      transition:transform 160ms cubic-bezier(.4,0,.7,1),opacity 100ms ease;
+    }
+    [data-g4a-player-waveform="true"] .g4a-island-open [data-g4a-island-controls="true"] button,
+    [data-g4a-player-waveform="true"] [data-g4a-island-controls="true"]:focus-within button {
+      opacity:1; transform:translateY(0) scale(1);
+      transition:transform 380ms cubic-bezier(.16,1.3,.3,1) var(--g4a-enter-delay,30ms),opacity 160ms ease var(--g4a-enter-delay,30ms);
+    }
+    [data-g4a-player-waveform="true"] [data-g4a-island-controls="true"] button:focus-visible { outline:2px solid #fff; outline-offset:4px; border-radius:50%; }
+    @media (max-width:900px) {
+      .g4a-waveform-player { gap:9px; }
+      .g4a-waveform-meta { width:80px; min-width:80px; }
+      .g4a-meta-time { font-size:11px; }
+      .g4a-waveform-status { max-width:100%; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+    }
+    @media (prefers-reduced-motion:reduce) {
+      .g4a-waveform-tooltip,[data-g4a-player-waveform="true"] [data-g4a-island-controls="true"],
+      [data-g4a-player-waveform="true"] [data-g4a-island-controls="true"] button { transition-duration:.01ms !important; transition-delay:0ms !important; }
+    }
   `;
   document.head.append(style);
 
@@ -4347,8 +4553,10 @@ async function startGenre4all() {
 
   function isFullWidthCell(c) {
     if (!c || c.nodeType !== 1) return false;
-    return c.hasAttribute('aria-colspan')
-      || c.matches('[class*="trackListRowFullWidthCell"],[class*="FullWidthCell"],[class*="fullWidth"],[data-testid="tracklist-row-full-width"],.PoSfoROJK6lwVe6ZtR0U');
+    if (c.hasAttribute('aria-colspan')) return true;
+    const cls = typeof c.className === 'string' ? c.className : '';
+    if (!cls.includes('FullWidth') && !cls.includes('fullWidth') && !cls.includes('PoSfoROJK6lwVe6ZtR0U') && !c.hasAttribute('data-testid')) return false;
+    return c.matches('[class*="trackListRowFullWidthCell"],[class*="FullWidthCell"],[class*="fullWidth"],[data-testid="tracklist-row-full-width"],.PoSfoROJK6lwVe6ZtR0U');
   }
   function cells(container, checkComputed = false) {
     return [...container.children].filter(c => {
@@ -4627,6 +4835,18 @@ async function startGenre4all() {
       state = { shell, label, sep, host, prevSep: null, prevHost: null, positions: new Set(), root, appliedKey: null };
       layouts.set(container, state);
     }
+    if (!header && state.appliedKey && rootState.measured && state.appliedKey === rootState.measured.key
+      && state.shell.parentElement === container
+      && container.childElementCount === state.appliedChildCount
+      && (container.style.gridTemplateColumns || '') === state.appliedInlineGrid
+      && container.classList.contains('g4a-row')
+      && container.hasAttribute('data-g4a-row')
+      && container.style.getPropertyValue('--g4a-tracks') === rootState.measured.template
+      && state.firstCell?.parentElement === container
+      && state.firstCell.style.getPropertyValue('--g4a-position') === '1') {
+      rootState.maxTotal = Math.max(rootState.maxTotal || 0, rootState.measured.total);
+      return;
+    }
     const isNativeLayout = root.hasAttribute('data-sp-native-layout');
     const foreign = cells(container, header || isNativeLayout || !rootState.measured);
     if (!foreign.length) return;
@@ -4738,6 +4958,9 @@ async function startGenre4all() {
     if (!container.classList.contains('g4a-row')) container.classList.add('g4a-row');
     if (!container.hasAttribute('data-g4a-row')) container.setAttribute('data-g4a-row', '');
     state.appliedKey = measureKey;
+    state.appliedChildCount = container.childElementCount;
+    state.appliedInlineGrid = inlineGrid;
+    state.firstCell = all[0] || null;
   }
 
   function columnMenu(menu) {

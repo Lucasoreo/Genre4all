@@ -2,7 +2,19 @@
 
 Extensão independente do [Spicetify](https://spicetify.app/) que adiciona uma coluna de gêneros e estilos às listas de faixas do Spotify Desktop. O arquivo instalável é [Genre4all.js](Genre4all.js), e contém todo o código necessário para executar a extensão.
 
-**Versão atual: 1.0.0.** A validação automatizada está descrita abaixo; a compatibilidade com cada versão do Spotify Desktop depende de teste no próprio cliente.
+**Versão atual: 1.14.0.** A validação automatizada está descrita abaixo; a compatibilidade com cada versão do Spotify Desktop depende de teste no próprio cliente.
+
+## Player e visual na versão 1.14.0
+
+Ative **Player Waveform** nas configurações do Genre4all. O desenho usa branco para o trecho reproduzido e cinza para o restante. O envelope utiliza 1024 pontos derivados do início, pico e fim dos segmentos da análise de áudio; o corpo representa energia integrada e os picos preservam ataques. Divisões discretas marcam as seções fornecidas pela análise, com tempo, número do trecho e variação de energia no hover.
+
+Essas informações ajudam a localizar contrastes de intensidade, crescendos e pausas. Não são identificação garantida de kicks, drops ou builds, nem uma waveform PCM do áudio completo. A estrutura dos dados é documentada na [referência de análise de áudio do Spotify](https://developer.spotify.com/documentation/web-api/reference/get-audio-analysis). Quando a análise não está disponível, aparece uma linha neutra com esse aviso; clique, arraste e controles continuam funcionando. A extensão não apresenta um arranjo inventado como se pertencesse à música.
+
+A ilha fica 24 px acima da posição anterior, com entrada dos botões de baixo para cima, começando pelo botão central. Os botões continuam sendo os elementos nativos do Spotify. Hover e foco de teclado revelam a ilha; Escape devolve o foco à waveform. Setas avançam/recuam 5 segundos, Shift + setas 10 segundos, Home/End vão ao início/fim.
+
+As camadas da onda são desenhadas uma vez por faixa/tamanho e reaproveitadas. A atualização acompanha o deslocamento visível do cursor, sem loop contínuo de frames no hover. Não há leitura de geometria a cada movimento global do mouse. O desenho pausa em documento oculto, retorna quando visível e libera eventos ao desligar/remontar. A densidade do canvas é limitada a 2x e o cache de análise contém no máximo 64 faixas compactadas. Animações respeitam movimento reduzido.
+
+Etiquetas preservam suas cores e bordas por fonte, com sombras menores. As preferências receberam contornos de foco e espaçamento visual mais consistente. A versão do cabeçalho do bundle é derivada de `package.json`.
 
 ## História do projeto
 
@@ -26,11 +38,14 @@ O resultado mantém o escopo do pedido original: **mostrar gêneros e estilos po
 - Pipeline de layout e resolução otimizado para playlists grandes (medição de grid cacheada por lista, cache O(1) de identidade por linha e persistência assíncrona não-bloqueante).
 - Nenhum ícone adicional na barra do Sort Play. O ícone e as ações dele continuam pertencendo a ele.
 - Banco IndexedDB `Genre4allDB`, configurações e CSS exclusivos. Não lê nem escreve no cache ou nas preferências do Sort Play.
-- Catálogo de validação incorporado; nenhuma importação remota, chave de API ou processo auxiliar.
+- Catálogo de validação incorporado. Spotify funciona sem chave adicional; Discogs aceita token pessoal ou chave/segredo nas configurações.
+- Fontes Discogs, MusicBrainz e Spotify, com identificação visual da origem de cada etiqueta.
+- Fixação de um gênero/estilo como principal por clique no leque, persistida por faixa.
+- Player waveform opcional, com navegação por clique/arraste, BPM, tom musical e controles nativos em ilha flutuante.
 
 ## Como funciona
 
-Ao abrir uma lista de faixas, o Genre4all identifica a URI de cada música e adiciona a coluna. Para as linhas visíveis, consulta os conceitos associados à faixa pelo serviço interno `MetadataService` do Spotify. Os resultados passam pelas regras de validação e pelo catálogo de nomes antes de aparecerem como etiquetas.
+Ao abrir uma lista de faixas, o Genre4all identifica a URI de cada música e adiciona a coluna. Para as linhas visíveis, consulta as fontes habilitadas. Na ordem padrão, Discogs tem prioridade; um resultado do MusicBrainz pode ser complementado por Spotify. O transporte do Spotify usa o serviço interno `MetadataService`. Os resultados passam pelas regras de validação e pelo catálogo de nomes antes de aparecerem como etiquetas.
 
 O serviço mantém um cache próprio, compartilha consultas repetidas e limita o trabalho simultâneo. Quando o Spotify reutiliza uma linha para mostrar outra música, a identidade da faixa é conferida antes de preencher a célula, para evitar que uma resposta antiga seja exibida na música seguinte. Quando um registro expira após inatividade, o recarregamento é enfileirado automaticamente.
 
@@ -38,9 +53,10 @@ O serviço mantém um cache próprio, compartilha consultas repetidas e limita o
 | --- | --- |
 | `Genre4all.js` | Arquivo único para instalar no Spicetify; gerado a partir dos fontes. |
 | `src/genre-service.js` | Resolução de gêneros, cache, concorrência e cancelamento. |
-| `src/genre-transport.js` | Acesso ao MetadataService e armazenamento IndexedDB próprio. |
+| `src/genre-transport.js` | Adaptadores Discogs, MusicBrainz e MetadataService, cache IndexedDB e TXT compacto. |
 | `src/genre-column.js` | Etiquetas, estados de carregamento e recarregamento automático na expiração. |
 | `src/genre-catalog.js` | Aliases, famílias de gêneros, nomes canônicos e validação. |
+| `src/player-waveform.js` | Envelope da análise de áudio, seções, seek e ciclo de vida da ilha do player. |
 | `src/runtime.js` | Inicialização independente, identificação das faixas, menu, reordenação de colunas e layout. |
 | `scripts/build.cjs` | Geração reproduzível do arquivo instalável. |
 | `scripts/verify-provenance.cjs` | Confere os hashes dos auxiliares originais de teste. |
@@ -80,14 +96,15 @@ O arquivo distribuído contém todo o código necessário. **O Sort Play 2 não 
 
 ## Fonte dos gêneros e limites do teste
 
-Os dados vêm do `MetadataService` interno do Spotify, por URI exata da faixa. O catálogo, os aliases e as regras de validação foram extraídos do Sort Play 2 sob licença MIT. Conceitos de humor, países, valores numéricos e rótulos com confiança muito baixa são filtrados. A extensão não substitui uma faixa por outra nem usa os gêneros do artista como se fossem da faixa.
+O Spotify fornece conceitos por URI exata via `MetadataService`. Discogs usa correspondência de artista/título/lançamento; MusicBrainz procura gravações e pode aproveitar tags relacionadas. As fontes externas não garantem correspondência exata de cada remix/edição. O catálogo, os aliases e as regras de validação foram extraídos do Sort Play 2 sob licença MIT. Conceitos de humor, países, valores numéricos e rótulos com confiança muito baixa são filtrados. A proveniência fica registrada nas etiquetas e nas resoluções.
 
 Algumas faixas não possuem esses metadados: nesse caso aparece **Sem gêneros**. Arquivos locais aparecem como **Indisponível**. O Spotify pode alterar suas APIs e a estrutura do menu; a versão instalada na máquina do usuário precisa ser validada.
 
 ### Validação feita
 
-- 17 testes de catálogo, decodificação, cache, expiração automática, cancelamento e concorrência.
+- 38 testes de catálogo, serviço, decodificação, cache, expiração, cancelamento, concorrência e análise da waveform.
 - Integração em Chromium com o transporte Spotify simulado e o **arquivo final completo**.
+- Suíte do player com seek, teclado, animação, seções, falta de análise, respostas atrasadas, visibilidade, remontagem, desligamento e largura compacta.
 - Menu com opção marcada por padrão, ocultar/reativar, reordenação por arraste de colunas nativas e de gênero, cache, atualização manual, janela estreita, identidade de linhas reutilizadas, estados vazios/erro/local, contêineres aninhados, persistência, carregamento repetido e limpeza.
 - Convivência usando as funções originais de layout do Sort Play 2 no commit de origem, nas duas ordens de carregamento, com zero/uma/duas colunas extras e com os dois renderizadores de gênero ativos.
 
@@ -106,7 +123,7 @@ npm test
 
 Os testes de navegador usam Playwright: instale Chromium com `npx playwright install chromium`, se necessário. Os auxiliares originais do Sort Play 2 estão incluídos em `tests/fixtures/sort-play-2/`, portanto o teste de convivência não exige outro checkout. Para investigar outra versão, `SORT_PLAY_SOURCE` pode apontar para um checkout externo. Essa opção existe somente nos testes.
 
-O servidor HTTP em `127.0.0.1` criado pelo teste serve a página simulada do Spotify durante a execução automatizada. Ele não faz parte da extensão e não precisa ser iniciado para usar o Genre4all.
+As suítes de navegador interceptam `http://genre4all.test/` e fornecem uma página local simulada, sem servidor ou conta Spotify. As capturas do player são geradas em `test-results/` e não são distribuídas na extensão.
 
 Diagnóstico no console do Spotify: `Genre4all.diagnostics()`. Para reexaminar as linhas: `Genre4all.sync()`. Para ocultar: `Genre4all.setVisible(false)`.
 
@@ -162,19 +179,19 @@ O layout identifica as células existentes, mede o grid apenas uma vez por lista
 
 ### Serviço: identidade, resultados e cache
 
-`Genre4allGenres.identityFor()` forma uma identidade cacheada em `WeakMap` a partir da URI e dos metadados disponíveis, incluindo título, artistas, duração, álbum, ISRC e indicação de versão. O caminho ativo de consulta utiliza a URI exata do catálogo Spotify. Remixes e edições não são resolvidos por busca aproximada nesta extensão.
+`Genre4allGenres.identityFor()` forma uma identidade cacheada em `WeakMap` a partir da URI e dos metadados disponíveis, incluindo título, artistas, duração, álbum, ISRC e indicação de versão. O adaptador Spotify utiliza a URI exata; os adaptadores externos também usam os metadados disponíveis para buscar correspondências.
 
 `resolve()` consulta o cache e compartilha uma operação em andamento entre consumidores da mesma identidade. Cada consumidor tem seu próprio cancelamento; a operação compartilhada só é abortada quando o último consumidor deixa de utilizá-la. Mudanças de configuração incrementam uma revisão e invalidam resoluções incompatíveis.
 
 | Parâmetro | Valor nesta versão |
 | --- | --- |
-| Provedor | `spotify` |
-| Validade do cache | 1 hora |
+| Provedores | `discogs`, `musicbrainz`, `spotify` |
+| Validade do cache | Spotify: 1 hora; Discogs/MusicBrainz: 30 dias |
 | Limite de entradas de cache do provedor | 2000 |
 | Limite de resoluções em memória | 2000 |
 | Espaçamento mínimo entre consultas no limitador | 25 ms |
 | Limite da fila do serviço Spotify | 256 |
-| Tarefas simultâneas iniciadas pela apresentação | 8 |
+| Tarefas simultâneas iniciadas pela apresentação | 24 |
 | Margem de pré-carregamento da área visível | 112 px |
 
 Quando o tempo de validade do cache expira, o serviço e o controlador de coluna reenfileiram automaticamente as faixas visíveis para recarregamento transparente.
@@ -208,6 +225,9 @@ A resposta é conferida para não preencher uma faixa com dados de outra URI. Au
 | `localStorage`, chave `genre4all-column-order-v1` | Ordem personalizada de todas as colunas intermediárias. |
 | IndexedDB `Genre4allDB`, área `settings` | Exibição de gêneros principais, estilos e cores. |
 | IndexedDB `Genre4allDB`, área `cache` | Resultados e expiração das consultas por faixa. |
+| `localStorage`, chave `genre4all-player-waveform-v1` | Ativação opcional do player waveform. |
+| `localStorage`, chave `genre4all-pinned-genres-v1` | Gêneros fixados por faixa; sincronizados com as configurações locais. |
+| `localStorage`, chave `genre4all-cache-txt-v11` | Cache compacto limitado a 2000 registros. |
 | Memória da instância | Fila, consumidores, células, tarefas e cache temporário. |
 
 ## Manutenção e diagnóstico

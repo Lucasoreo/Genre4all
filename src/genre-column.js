@@ -123,12 +123,12 @@ const Genre4allColumn = (() => {
   const CSS = `
     .g4a-genre-gridcell { min-width:0 !important; overflow:visible !important; }
     .g4a-genre-host { display:flex !important; align-items:center; justify-content:flex-start; width:100%; min-width:0; max-width:100%; height:100%; padding:0 3px; box-sizing:border-box; overflow:visible; font:12px/1.2 var(--font-family,CircularSp,sans-serif); }
-    .g4a-genre-chip { display:inline-block; flex:0 1 auto; min-width:0; max-width:100%; height:22px; box-sizing:border-box; border:none; border-radius:5px; padding:0 8px; font:700 12px/22px var(--font-family,CircularSp,sans-serif); letter-spacing:0.01em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; vertical-align:middle; color:var(--g4a-genre-ink,${INK}) !important; background:var(--g4a-genre-color,#ddd5e5); text-shadow:none; user-select:none; transition:box-shadow .5s ease,transform .18s cubic-bezier(.22,1,.36,1),filter .18s ease; }
+    .g4a-genre-chip { display:inline-block; flex:0 1 auto; min-width:0; max-width:100%; height:22px; box-sizing:border-box; border:none; border-radius:5px; padding:0 8px; font:700 12px/22px var(--font-family,CircularSp,sans-serif); letter-spacing:0.01em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; vertical-align:middle; color:var(--g4a-genre-ink,${INK}) !important; background:var(--g4a-genre-color,#ddd5e5); text-shadow:none; user-select:none; transition:transform .18s cubic-bezier(.22,1,.36,1),filter .18s ease; }
     .g4a-genre-chip[data-contrast="light"] { text-shadow:0 1px 1px rgba(0,0,0,.25); }
-    .g4a-genre-chip[data-provider="discogs"],.g4a-genre-fan .g4a-genre-chip[data-provider="discogs"] { border:1.5px solid rgb(255,255,255); line-height:19px; box-shadow:0 0 10px rgba(255,255,255,.78),0 0 3px rgba(255,255,255,.95); }
-    .g4a-genre-chip[data-provider="discogs"]:hover,.g4a-genre-chip[data-provider="discogs"]:focus-visible,.g4a-genre-fan .g4a-genre-chip[data-provider="discogs"]:hover { box-shadow:0 0 4px rgb(255,255,255),0 0 12px rgb(255,255,255),0 0 24px rgba(255,255,255,.92),0 0 44px rgba(255,255,255,.75); }
-    .g4a-genre-chip[data-provider="musicbrainz"],.g4a-genre-fan .g4a-genre-chip[data-provider="musicbrainz"] { border:1.5px solid transparent; line-height:19px; background:linear-gradient(var(--g4a-genre-color,#ddd5e5),var(--g4a-genre-color,#ddd5e5)) padding-box,linear-gradient(135deg,rgb(168,85,247) 0%,rgb(168,85,247) 48%,rgb(255,122,0) 52%,rgb(255,122,0) 100%) border-box; box-shadow:-2px -2px 9px rgba(168,85,247,.85),2px 2px 9px rgba(255,122,0,.85); }
-    .g4a-genre-chip[data-provider="musicbrainz"]:hover,.g4a-genre-chip[data-provider="musicbrainz"]:focus-visible,.g4a-genre-fan .g4a-genre-chip[data-provider="musicbrainz"]:hover { box-shadow:-1px -1px 4px rgb(168,85,247),-3px -3px 12px rgb(168,85,247),-5px -5px 24px rgba(168,85,247,.92),-8px -8px 42px rgba(168,85,247,.72),1px 1px 4px rgb(255,122,0),3px 3px 12px rgb(255,122,0),5px 5px 24px rgba(255,122,0,.92),8px 8px 42px rgba(255,122,0,.72); }
+    .g4a-genre-chip[data-provider="discogs"],.g4a-genre-fan .g4a-genre-chip[data-provider="discogs"] { border:1.5px solid rgb(255,255,255); line-height:19px; box-shadow:0 1px 4px rgba(0,0,0,.24); }
+    .g4a-genre-chip[data-provider="discogs"]:hover,.g4a-genre-chip[data-provider="discogs"]:focus-visible,.g4a-genre-fan .g4a-genre-chip[data-provider="discogs"]:hover { box-shadow:0 0 0 1px #ffffff50,0 2px 8px #0005; }
+    .g4a-genre-chip[data-provider="musicbrainz"],.g4a-genre-fan .g4a-genre-chip[data-provider="musicbrainz"] { border:1.5px solid transparent; line-height:19px; background:linear-gradient(var(--g4a-genre-color,#ddd5e5),var(--g4a-genre-color,#ddd5e5)) padding-box,linear-gradient(135deg,rgb(168,85,247) 0%,rgb(168,85,247) 48%,rgb(255,122,0) 52%,rgb(255,122,0) 100%) border-box; box-shadow:0 1px 4px rgba(0,0,0,.24); }
+    .g4a-genre-chip[data-provider="musicbrainz"]:hover,.g4a-genre-chip[data-provider="musicbrainz"]:focus-visible,.g4a-genre-fan .g4a-genre-chip[data-provider="musicbrainz"]:hover { box-shadow:-1px -1px 5px #a855f740,1px 1px 5px #ff7a0040; }
     .g4a-genre-primary[data-has-more="true"] { cursor:pointer; }
     .g4a-genre-primary:hover { filter:brightness(1.06); }
     .g4a-genre-state { color:var(--spice-subtext,#ddd); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:12px; }
@@ -136,7 +136,8 @@ const Genre4allColumn = (() => {
     .g4a-genre-host :focus-visible { outline:2px solid #7850a0; outline-offset:-2px; }
     .g4a-genre-fan { position:fixed; z-index:9999; display:flex; flex-direction:column; align-items:flex-start; gap:6px; margin:0; padding:4px 6px; list-style:none; pointer-events:auto; }
     .g4a-genre-fan[data-direction="up"] { flex-direction:column-reverse; }
-    .g4a-genre-fan .g4a-genre-chip { flex:none; width:max-content; max-width:min(320px,calc(100vw - 24px)); transform-origin:top left; will-change:transform,opacity; animation:g4a-domino-down var(--g4a-dur,320ms) cubic-bezier(.42,0,.2,1) both; animation-delay:var(--g4a-delay,0ms); }
+    .g4a-genre-fan .g4a-genre-chip { flex:none; width:max-content; max-width:min(320px,calc(100vw - 24px)); cursor:pointer; transform-origin:top left; animation:g4a-domino-down var(--g4a-dur,320ms) cubic-bezier(.42,0,.2,1) both; animation-delay:var(--g4a-delay,0ms); }
+    .g4a-genre-fan .g4a-genre-chip:hover,.g4a-genre-fan .g4a-genre-chip:focus-visible { filter:brightness(1.1); transform:translate3d(2px,0,0) scale(1.03); }
     .g4a-genre-fan .g4a-genre-chip[data-provider="spotify"] { box-shadow:0 8px 20px rgba(0,0,0,.48),0 2px 6px rgba(0,0,0,.32),inset 0 0 0 1px rgba(255,255,255,.14); }
     .g4a-genre-fan[data-direction="up"] .g4a-genre-chip { transform-origin:bottom left; animation-name:g4a-domino-up; }
     .g4a-genre-fan.g4a-genre-fan-closing .g4a-genre-chip { animation:g4a-domino-out 130ms cubic-bezier(.4,0,1,1) both; }
@@ -156,6 +157,7 @@ const Genre4allColumn = (() => {
       0% { opacity:1; transform:translate3d(0,0,0) scale(1); }
       100% { opacity:0; transform:translate3d(-2px,-8px,0) scale(.94); }
     }
+    @media (prefers-reduced-motion:reduce) { .g4a-genre-chip,.g4a-genre-fan .g4a-genre-chip { animation-duration:.01ms !important; animation-delay:0ms !important; transition-duration:.01ms !important; } }
     @media (forced-colors:active) { .g4a-genre-chip { forced-color-adjust:none; background:Canvas; color:CanvasText !important; border:1px solid CanvasText; } .g4a-genre-host :focus-visible { outline:2px solid Highlight; box-shadow:none; } }
   `;
   function createController(service, options) {
@@ -237,11 +239,43 @@ const Genre4allColumn = (() => {
       extra.forEach((label, i) => {
         const item = chip(label, 'li', defaultProvider, useColors);
         item.classList.add('g4a-genre-fan-chip');
+        item.tabIndex = 0;
+        item.title = 'Clique para fixar este gênero como principal';
+        item.setAttribute('aria-label', `Fixar ${label.label} como gênero principal`);
         const dur = Math.max(190, Math.round(320 * Math.pow(0.88, i)));
         item.style.setProperty('--g4a-i', String(i));
         item.style.setProperty('--g4a-delay', `${delay}ms`);
         item.style.setProperty('--g4a-dur', `${dur}ms`);
         delay += Math.max(24, Math.round(68 * Math.pow(0.78, i)));
+        const selectGenre = e => {
+          e.preventDefault();
+          e.stopPropagation();
+          for (const rec of records.values()) {
+            if ((rec.identityKey === r.identityKey || (r.uri && rec.uri === r.uri)) && Array.isArray(rec.result?.labels)) {
+              const idx = rec.result.labels.findIndex(l => l.key === label.key);
+              if (idx >= 0) {
+                const nextLabels = rec.result.labels.map((l, k) => {
+                  if (k === idx) return { ...l, pinned: true };
+                  if (l.pinned) { const copy = { ...l }; delete copy.pinned; return copy; }
+                  return l;
+                });
+                if (idx > 0) {
+                  const [picked] = nextLabels.splice(idx, 1);
+                  nextLabels.unshift(picked);
+                }
+                rec.result = { ...rec.result, labels: nextLabels };
+                render(rec);
+              }
+            }
+          }
+          closeFan(false);
+          service.pinGenre?.(r.track, label)?.catch?.(() => {});
+        };
+        item.addEventListener('click', selectGenre);
+        item.addEventListener('keydown', e => {
+          if (e.key === 'Enter' || e.key === ' ') selectGenre(e);
+          else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeFan(true); }
+        });
         fan.append(item);
       });
       const rect = anchor.getBoundingClientRect();
@@ -381,6 +415,10 @@ const Genre4allColumn = (() => {
           desired.add(cell);
           const previous = records.get(cell);
           if (previous && !closed && previous.revision === rev && previous.row === row && previous.context === context && previous.uri === uri && previous.cell.firstChild && options.isEnabled(cell, row)) {
+            if (uri.startsWith('spotify:track:') && (previous.track?.name || previous.track?.title || previous.state === 'success')) {
+              if (isExpired(previous)) expire(previous);
+              continue;
+            }
             const currentTrack = options.getTrack(row);
             if (currentTrack === previous.track || service.identityFor(currentTrack).key === previous.identityKey) {
               if (isExpired(previous)) expire(previous);

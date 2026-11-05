@@ -19,7 +19,7 @@ async function startGenre4all() {
   } catch { /* Session preference still works. */ }
   const context = () => globalThis.Spicetify?.Platform?.History?.location?.pathname || location.pathname;
   const api = {
-    version: '1.13.0',
+    version: '1.14.0',
     get visible() { return visible; },
     get orderOffset() { return orderOffset; },
     get columnOrder() { return [...columnOrder]; },
@@ -53,7 +53,7 @@ async function startGenre4all() {
   style.textContent = `
     /* Role lives in ElementInternals: other extensions' [role=gridcell] scans ignore our shell. */
     .g4a-root :is(.g4a-row,[data-g4a-row],:has(> genre4all-column)):not([data-g4a-measure]) { grid-template-columns:var(--g4a-tracks) !important; min-width:var(--g4a-total) !important; }
-    .g4a-root :is(.g4a-row,[data-g4a-row],:has(> genre4all-column)):not([data-g4a-measure]) > :not([aria-colspan]):not([class*="FullWidthCell"]):not([class*="trackListRowFullWidthCell"]):not(.PoSfoROJK6lwVe6ZtR0U) { grid-column:auto !important; grid-row:1 !important; min-width:0; }
+    .g4a-root :is(.g4a-row,[data-g4a-row],:has(> genre4all-column)):not([data-g4a-measure]) > :not([data-g4a-position]):not([aria-colspan]):not([class*="FullWidthCell"]):not([class*="trackListRowFullWidthCell"]):not(.PoSfoROJK6lwVe6ZtR0U) { grid-column:auto !important; grid-row:1 !important; min-width:0; }
     .g4a-root :is(.g4a-row,[data-g4a-row],:has(> genre4all-column)):not([data-g4a-measure]) > [data-g4a-position] { grid-column:var(--g4a-position,auto) !important; grid-row:1 !important; min-width:0; }
     .g4a-root :is(.g4a-row,[data-g4a-row],:has(> genre4all-column)):not([data-g4a-measure]) > :is([aria-colspan],[class*="FullWidthCell"],[class*="trackListRowFullWidthCell"],.PoSfoROJK6lwVe6ZtR0U) { grid-column:1 / -1 !important; grid-row:auto !important; width:100% !important; min-width:0 !important; }
     .g4a-root :is(.main-trackList-trackListHeader,.rrn0EjHTu7eCxn9G0Rrc,[class*="trackListHeader"]):is(.main-trackList-trackListHeaderStuck,.iPo4a2lbrsxW9Iedav3h,[class*="trackListHeaderStuck"]) { background-color:var(--spice-main,var(--background-base,#121212)) !important; }
@@ -81,8 +81,9 @@ async function startGenre4all() {
     .g4a-menu-button:hover,.g4a-menu-button:focus-visible,.g4a-profile-button:hover,.g4a-profile-button:focus-visible { background:#ffffff1a; outline-offset:-2px; }
     .g4a-menu-button[aria-checked=true] { color:var(--text-positive,#1ed760); }
     .g4a-menu-button svg,.g4a-profile-button svg { width:16px; height:16px; flex:none; fill:currentColor; }
-    .g4a-preferences { position:fixed; inset:0; margin:auto; padding:24px; max-width:460px; width:calc(100vw - 40px); max-height:calc(100vh - 40px); overflow-y:auto; box-sizing:border-box; border:1px solid #555; border-radius:10px; color:var(--spice-text,#fff); background:var(--spice-main,#181818); font:14px/1.45 sans-serif; box-shadow:0 20px 50px rgba(0,0,0,.65); }
+    .g4a-preferences { position:fixed; inset:0; margin:auto; padding:24px; max-width:460px; width:calc(100vw - 40px); max-height:calc(100vh - 40px); overflow-y:auto; box-sizing:border-box; border:1px solid #ffffff20; border-radius:16px; color:var(--spice-text,#fff); background:var(--spice-main,#181818); font:14px/1.45 sans-serif; box-shadow:0 20px 50px rgba(0,0,0,.65); }
     .g4a-preferences::backdrop { background:#000a; }
+    .g4a-preferences :focus-visible { outline:2px solid #fff; outline-offset:3px; }
     .g4a-preferences h2 { margin:0 0 14px; font:700 18px/1.3 sans-serif; display:flex; align-items:center; justify-content:space-between; }
     .g4a-preferences h3 { margin:16px 0 8px; font:600 12px/1.2 sans-serif; text-transform:uppercase; letter-spacing:.06em; color:var(--spice-subtext,#b3b3b3); }
     .g4a-preferences label { display:flex; gap:10px; margin:10px 0; align-items:center; cursor:pointer; }
@@ -92,26 +93,66 @@ async function startGenre4all() {
     .g4a-preferences-input { width:100%; box-sizing:border-box; padding:8px 10px; border:1px solid #555; border-radius:5px; background:#121212; color:var(--spice-text,#fff); font:13px/1.3 monospace,sans-serif; }
     .g4a-preferences-input:focus { border-color:#1ed760; outline:none; }
     .g4a-preferences-actions { display:flex; flex-wrap:wrap; gap:10px; margin-top:18px; justify-content:flex-end; }
-    .g4a-preferences button { padding:8px 14px; color:inherit; background:transparent; border:1px solid #aaa; border-radius:4px; cursor:pointer; font:inherit; }
+    .g4a-preferences button { padding:9px 15px; color:inherit; background:#ffffff08; border:1px solid #ffffff30; border-radius:8px; cursor:pointer; font:inherit; }
     .g4a-preferences button:hover { background:#ffffff14; }
 
-    /* Player Waveform & Apple-style Dynamic Island */
-    .g4a-waveform-player { display:flex; align-items:center; gap:12px; width:100%; height:46px; position:relative; user-select:none; box-sizing:border-box; }
-    .g4a-waveform-meta { display:flex; flex-direction:column; justify-content:center; width:86px; min-width:86px; flex-shrink:0; font-family:var(--font-family,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif); line-height:1.35; text-align:left; user-select:none; }
-    .g4a-meta-time { font-size:11px; font-weight:700; color:var(--spice-text,#ffffff); font-variant-numeric:tabular-nums; letter-spacing:-0.01em; }
-    .g4a-meta-bpm { font-size:11px; font-weight:500; color:var(--spice-subtext,rgba(255,255,255,0.72)); white-space:nowrap; }
-    .g4a-meta-key { font-size:11px; font-weight:500; color:var(--spice-subtext,rgba(255,255,255,0.72)); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-    .g4a-waveform-track { position:relative; flex:1; height:42px; min-width:120px; cursor:pointer; display:flex; align-items:center; }
-    .g4a-waveform-canvas { width:100%; height:100%; display:block; }
-    .g4a-waveform-tooltip { position:absolute; top:-26px; transform:translateX(-50%); background:rgba(18,18,18,0.92); color:#fff; padding:2px 7px; border-radius:4px; font-size:10.5px; font-weight:600; pointer-events:none; white-space:nowrap; box-shadow:0 4px 12px rgba(0,0,0,0.4); border:1px solid rgba(255,255,255,0.15); font-variant-numeric:tabular-nums; opacity:0; transition:opacity 0.15s ease; z-index:100; }
-    .g4a-waveform-tooltip.visible { opacity:1; }
-    .g4a-badge-experimental { font-size:10px; font-weight:700; padding:2px 6px; border-radius:10px; background:#e91429; color:#fff; letter-spacing:0.04em; }
-
+    /* Monochrome waveform and a raised, compositor-animated transport island. */
+    .g4a-waveform-player { display:flex; align-items:center; gap:14px; width:100%; height:62px; min-height:62px; min-width:0; position:relative; user-select:none; box-sizing:border-box; }
+    .g4a-waveform-meta { display:flex; flex-direction:column; justify-content:center; gap:2px; width:94px; min-width:94px; font-family:var(--font-family,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif); line-height:1.3; text-align:left; }
+    .g4a-meta-time { font-size:12px; font-variant-numeric:tabular-nums; letter-spacing:-.015em; white-space:nowrap; }
+    .g4a-meta-time-current { font-weight:650; color:#fff; }
+    .g4a-meta-time-total { font-weight:400; color:#a7a7a7; }
+    .g4a-meta-bpm,.g4a-meta-key { font-size:11px; font-weight:500; color:#b3b3b3; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .g4a-waveform-track { position:relative; flex:1; height:58px; min-height:58px; min-width:0; cursor:crosshair; touch-action:none; border-radius:4px; }
+    .g4a-waveform-track:focus-visible { outline:2px solid #fff; outline-offset:4px; }
+    .g4a-waveform-canvas { width:100%; height:100%; display:block; pointer-events:none; }
+    .g4a-waveform-status { position:absolute; top:3px; right:0; color:#a7a7a7; font-size:10px; line-height:16px; pointer-events:none; }
+    .g4a-waveform-status:empty { display:none; }
+    .g4a-waveform-tooltip { position:absolute; bottom:calc(100% + 8px); transform:translateX(var(--g4a-tip-shift,-50%)) translateY(3px); background:#242424; color:#fff; padding:6px 9px; border-radius:8px; font-size:11px; font-weight:500; line-height:1.3; pointer-events:none; white-space:nowrap; max-width:min(360px,80vw); box-shadow:0 6px 18px #0006; border:1px solid #ffffff1f; font-variant-numeric:tabular-nums; opacity:0; transition:opacity 120ms ease,transform 160ms ease; z-index:1002; }
+    .g4a-waveform-tooltip.visible { opacity:1; transform:translateX(var(--g4a-tip-shift,-50%)) translateY(0); }
+    .g4a-badge-experimental { font-size:10px; font-weight:600; padding:3px 7px; border-radius:6px; background:#ffffff14; color:#b3b3b3; letter-spacing:.03em; }
     [data-g4a-player-waveform="true"] .playback-bar > :is([data-testid="playback-position"],[data-testid="playback-duration"],.EwWvIxEwsX4OCTm8USco) { display:none !important; }
     [data-g4a-player-waveform="true"] .playback-bar :is([data-testid="progress-bar"],.progress-bar,.x-progressBar-progressBar) { display:none !important; }
-    [data-g4a-player-waveform="true"] .main-nowPlayingBar-center { position:relative !important; display:flex !important; flex-direction:column !important; justify-content:center !important; overflow:visible !important; }
-    [data-g4a-player-waveform="true"] .player-controls { position:absolute !important; left:50% !important; bottom:calc(100% + 8px) !important; transform:translateX(-50%) translateY(8px) scale(0.92) !important; opacity:0 !important; pointer-events:none !important; background:rgba(22,22,24,0.88) !important; backdrop-filter:blur(24px) saturate(190%) !important; -webkit-backdrop-filter:blur(24px) saturate(190%) !important; border:1px solid rgba(255,255,255,0.14) !important; border-radius:9999px !important; padding:4px 14px !important; margin-bottom:0 !important; box-shadow:0 16px 36px rgba(0,0,0,0.65), 0 2px 10px rgba(0,0,0,0.4) !important; z-index:1000 !important; transition:transform 0.42s cubic-bezier(0.16,1,0.3,1), opacity 0.32s cubic-bezier(0.16,1,0.3,1), box-shadow 0.42s ease !important; }
-    [data-g4a-player-waveform="true"] .main-nowPlayingBar-center:hover .player-controls, [data-g4a-player-waveform="true"] .main-nowPlayingBar-center:focus-within .player-controls, [data-g4a-player-waveform="true"] .main-nowPlayingBar-center.g4a-island-pinned .player-controls { opacity:1 !important; pointer-events:auto !important; transform:translateX(-50%) translateY(0) scale(1) !important; box-shadow:0 20px 45px rgba(0,0,0,0.75), 0 4px 14px rgba(0,0,0,0.5) !important; }
+    [data-g4a-player-waveform="true"] .playback-bar { width:100% !important; min-height:62px !important; height:62px !important; display:flex !important; align-items:center !important; overflow:visible !important; }
+    [data-g4a-player-waveform="true"] .main-nowPlayingBar-center,[data-g4a-player-waveform="true"] [data-g4a-island-center="true"] { position:relative !important; display:flex !important; flex-direction:column !important; justify-content:center !important; width:100% !important; min-width:0 !important; max-width:920px !important; flex:1 1 auto !important; overflow:visible !important; }
+    [data-g4a-player-waveform="true"] [data-g4a-island-host="true"] { position:relative !important; display:flex !important; flex-direction:column !important; justify-content:center !important; width:100% !important; overflow:visible !important; }
+    [data-g4a-player-waveform="true"] .g4a-island-sensor { position:absolute; left:50%; bottom:calc(100% - 7px); transform:translateX(-50%); width:min(280px,100%); height:34px; z-index:999; background:transparent; }
+    [data-g4a-player-waveform="true"] [data-g4a-island-controls="true"] {
+      position:absolute !important; left:50% !important; bottom:calc(100% + 14px) !important;
+      width:max-content !important; max-width:calc(100vw - 32px) !important; flex:0 0 auto !important;
+      display:inline-flex !important; align-items:center !important; justify-content:center !important;
+      gap:10px !important; margin:0 !important; padding:9px 18px !important;
+      background:linear-gradient(180deg,#252525,#161616) !important; border:1px solid #ffffff20 !important;
+      border-radius:999px !important; box-shadow:0 8px 26px #0008,inset 0 1px 0 #ffffff0d !important;
+      transform-origin:50% 100% !important; transform:translate(-50%,12px) scale(.94,.82) !important;
+      opacity:0 !important; pointer-events:none !important; z-index:1001 !important;
+      transition:transform 240ms cubic-bezier(.4,0,.6,1),opacity 140ms ease !important;
+    }
+    [data-g4a-player-waveform="true"] .g4a-island-open [data-g4a-island-controls="true"],
+    [data-g4a-player-waveform="true"] [data-g4a-island-controls="true"]:focus-within {
+      opacity:1 !important; pointer-events:auto !important; transform:translate(-50%,0) scale(1) !important;
+      transition:transform 420ms cubic-bezier(.18,1.2,.3,1),opacity 140ms ease !important;
+    }
+    [data-g4a-player-waveform="true"] [data-g4a-island-controls="true"] button {
+      opacity:0; transform:translateY(11px) scale(.88);
+      transition:transform 160ms cubic-bezier(.4,0,.7,1),opacity 100ms ease;
+    }
+    [data-g4a-player-waveform="true"] .g4a-island-open [data-g4a-island-controls="true"] button,
+    [data-g4a-player-waveform="true"] [data-g4a-island-controls="true"]:focus-within button {
+      opacity:1; transform:translateY(0) scale(1);
+      transition:transform 380ms cubic-bezier(.16,1.3,.3,1) var(--g4a-enter-delay,30ms),opacity 160ms ease var(--g4a-enter-delay,30ms);
+    }
+    [data-g4a-player-waveform="true"] [data-g4a-island-controls="true"] button:focus-visible { outline:2px solid #fff; outline-offset:4px; border-radius:50%; }
+    @media (max-width:900px) {
+      .g4a-waveform-player { gap:9px; }
+      .g4a-waveform-meta { width:80px; min-width:80px; }
+      .g4a-meta-time { font-size:11px; }
+      .g4a-waveform-status { max-width:100%; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+    }
+    @media (prefers-reduced-motion:reduce) {
+      .g4a-waveform-tooltip,[data-g4a-player-waveform="true"] [data-g4a-island-controls="true"],
+      [data-g4a-player-waveform="true"] [data-g4a-island-controls="true"] button { transition-duration:.01ms !important; transition-delay:0ms !important; }
+    }
   `;
   document.head.append(style);
 
@@ -473,8 +514,10 @@ async function startGenre4all() {
 
   function isFullWidthCell(c) {
     if (!c || c.nodeType !== 1) return false;
-    return c.hasAttribute('aria-colspan')
-      || c.matches('[class*="trackListRowFullWidthCell"],[class*="FullWidthCell"],[class*="fullWidth"],[data-testid="tracklist-row-full-width"],.PoSfoROJK6lwVe6ZtR0U');
+    if (c.hasAttribute('aria-colspan')) return true;
+    const cls = typeof c.className === 'string' ? c.className : '';
+    if (!cls.includes('FullWidth') && !cls.includes('fullWidth') && !cls.includes('PoSfoROJK6lwVe6ZtR0U') && !c.hasAttribute('data-testid')) return false;
+    return c.matches('[class*="trackListRowFullWidthCell"],[class*="FullWidthCell"],[class*="fullWidth"],[data-testid="tracklist-row-full-width"],.PoSfoROJK6lwVe6ZtR0U');
   }
   function cells(container, checkComputed = false) {
     return [...container.children].filter(c => {
@@ -753,6 +796,18 @@ async function startGenre4all() {
       state = { shell, label, sep, host, prevSep: null, prevHost: null, positions: new Set(), root, appliedKey: null };
       layouts.set(container, state);
     }
+    if (!header && state.appliedKey && rootState.measured && state.appliedKey === rootState.measured.key
+      && state.shell.parentElement === container
+      && container.childElementCount === state.appliedChildCount
+      && (container.style.gridTemplateColumns || '') === state.appliedInlineGrid
+      && container.classList.contains('g4a-row')
+      && container.hasAttribute('data-g4a-row')
+      && container.style.getPropertyValue('--g4a-tracks') === rootState.measured.template
+      && state.firstCell?.parentElement === container
+      && state.firstCell.style.getPropertyValue('--g4a-position') === '1') {
+      rootState.maxTotal = Math.max(rootState.maxTotal || 0, rootState.measured.total);
+      return;
+    }
     const isNativeLayout = root.hasAttribute('data-sp-native-layout');
     const foreign = cells(container, header || isNativeLayout || !rootState.measured);
     if (!foreign.length) return;
@@ -864,6 +919,9 @@ async function startGenre4all() {
     if (!container.classList.contains('g4a-row')) container.classList.add('g4a-row');
     if (!container.hasAttribute('data-g4a-row')) container.setAttribute('data-g4a-row', '');
     state.appliedKey = measureKey;
+    state.appliedChildCount = container.childElementCount;
+    state.appliedInlineGrid = inlineGrid;
+    state.firstCell = all[0] || null;
   }
 
   function columnMenu(menu) {

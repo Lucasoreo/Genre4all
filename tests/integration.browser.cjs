@@ -3,8 +3,6 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const http = require('node:http');
-const { once } = require('node:events');
 const { chromium } = require('playwright');
 const root = path.resolve(__dirname, '..');
 const sourceRoot = process.env.SORT_PLAY_SOURCE || path.join(__dirname,'fixtures/sort-play-2');
@@ -32,12 +30,12 @@ body{background:#121212;color:#eee;font:14px sans-serif;margin:20px}main{width:1
 [role=menu]{position:absolute;right:20px;top:90px;background:#282828;padding:8px;list-style:none;width:220px}
 </style><body><main></main></body></html>`;
 (async()=>{
-  const server=http.createServer((req,res)=>{res.setHeader('Content-Type','text/html');res.end(html);});server.listen(0,'127.0.0.1');await once(server,'listening');
   const browser=await chromium.launch({headless:true,...(browserExecutable?{executablePath:browserExecutable}:{}),args:['--no-sandbox']});
   try{
     const page=await browser.newPage({viewport:{width:1200,height:720}});page.setDefaultTimeout(6000);
     const errors=[];page.on('pageerror',e=>errors.push(e.message));page.on('console',m=>{if(m.type()==='error')errors.push(m.text());});
-    await page.goto(`http://127.0.0.1:${server.address().port}`);
+    await page.route('http://genre4all.test/**', route => route.fulfill({ contentType:'text/html', body:html }));
+    await page.goto('http://genre4all.test/');
     await page.evaluate(()=>{
       window.calls=[];window.discogsCalls=[];window.mbCalls=[];window.pending=new Map();window.path='/playlist/fixture';window.sortPlayClicks=0;window.dynamicGenre='electro house';
       window.mockDiscogsResults=[];window.mockMbRecordings=[];
@@ -91,7 +89,7 @@ body{background:#121212;color:#eee;font:14px sans-serif;margin:20px}main{width:1
     });
     await page.addScriptTag({path:path.join(root,'Genre4all.js')});
     await page.locator('.g4a-data[data-genre-state=success]').waitFor();
-    assert.equal(await page.evaluate(()=>Genre4all.version),'1.12.1');
+    assert.equal(await page.evaluate(()=>Genre4all.version),require('../package.json').version);
     assert.equal(await page.locator('genre4all-column[data-kind=header]').count(),1);
     assert.equal(await page.locator('.g4a-genre-chip').filter({hasText:'happy'}).count(),0);
     assert.ok(await page.locator('.g4a-genre-chip').filter({hasText:'electro house'}).count());
@@ -330,5 +328,5 @@ body{background:#121212;color:#eee;font:14px sans-serif;margin:20px}main{width:1
     await page.evaluate(()=>Genre4all.close());assert.equal(await page.locator('[id^=genre4all],genre4all-column,.g4a-row').count(),0);
     assert.deepEqual(errors,[]);
     console.log('Browser integration passed: standalone bundle, MetadataService wire format, native menu, column drag reordering, refresh, original Sort Play extra columns, overflow, virtualization, statuses, nested rows, reload and cleanup. Mocked Spotify; not Spotify Desktop.');
-  }finally{await browser.close();server.closeAllConnections();await new Promise(r=>server.close(r))}
+  }finally{await browser.close()}
 })().catch(error=>{console.error(error);process.exitCode=1});
